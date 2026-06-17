@@ -1,0 +1,13 @@
+[package]
+name = "oracle-domain"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Core domain types for the worldcup-oracle prediction engine (pure, no I/O)"
+
+[dependencies]
+serde.workspace = true
+chrono.workspace = true
