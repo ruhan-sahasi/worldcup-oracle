@@ -11,6 +11,7 @@ description = "Pluggable data ingestion (live API / replay / simulation) for wor
 [dependencies]
 oracle-domain.workspace = true
 oracle-model.workspace = true
+oracle-ratings.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 chrono.workspace = true

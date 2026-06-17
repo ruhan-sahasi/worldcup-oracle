@@ -21,5 +21,5 @@ pub mod poisson;
 
 pub use calibration::{score, CalibrationReport};
 pub use dixon_coles::{DixonColesConfig, GoalModel, Observation};
-pub use ensemble::Ensemble;
-pub use live::{live_probabilities, live_score_grid, LiveConfig, LiveState};
+pub use ensemble::{Ensemble, EnsembleFitConfig};
+pub use live::{live_probabilities, live_score_grid, remaining_rates, LiveConfig, LiveState};

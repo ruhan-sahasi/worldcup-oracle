@@ -19,7 +19,8 @@ use chrono::{TimeZone, Utc};
 use oracle_domain::{
     Confederation, Group, Match, MatchId, MatchStatus, Scoreline, Stage, Team, TeamId, Tournament,
 };
-use oracle_model::{DixonColesConfig, GoalModel, Observation};
+use oracle_model::{DixonColesConfig, Ensemble, GoalModel, Observation};
+use oracle_ratings::RatingStore;
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 use rand_distr::{Distribution, Poisson};
@@ -211,11 +212,60 @@ pub fn synthetic_history(n_matches: usize, seed: u64) -> Vec<Observation> {
     out
 }
 
-/// Fit a Dixon-Coles goal model on the synthetic history — the offline baseline used
-/// by the simulator and CLI when no live training data is available.
+/// The offline-fitted baseline: a goal model, Elo seeds, and a **learned** ensemble.
+pub struct Baseline {
+    pub model: GoalModel,
+    pub elo_seeds: Vec<(TeamId, f64)>,
+    pub ensemble: Ensemble,
+}
+
+/// Fit the full baseline on synthetic history with a proper train→validation split:
+/// Dixon-Coles and Elo are fit on the older 70%, then the ensemble weights +
+/// temperature are *learned* on the held-out 30%. This is what makes the shipped
+/// ensemble provably no worse than its best member (no more hardcoded weights).
+pub fn fit_baseline(seed: u64) -> Baseline {
+    let mut history = synthetic_history(4000, seed);
+    // Oldest first, so we train on the past and validate on more recent matches.
+    history.sort_by(|a, b| {
+        b.age_days
+            .partial_cmp(&a.age_days)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    let split = history.len() * 7 / 10;
+    let (train, validation) = history.split_at(split);
+
+    let model = GoalModel::fit(train, DixonColesConfig::default());
+
+    let elo_seeds = team_strengths();
+    let mut ratings = RatingStore::with_defaults();
+    for &(team, rating) in &elo_seeds {
+        ratings.seed(team, rating);
+    }
+    for obs in train {
+        ratings.record(obs.home, obs.away, obs.score, true);
+    }
+
+    // Member predictions on the validation slice: [Dixon-Coles, Elo].
+    let mut member_preds = Vec::with_capacity(validation.len());
+    let mut actuals = Vec::with_capacity(validation.len());
+    for obs in validation {
+        let dc = model.outcome_probabilities(obs.home, obs.away, true);
+        let elo = ratings.win_probabilities(obs.home, obs.away, true);
+        member_preds.push(vec![dc, elo]);
+        actuals.push(obs.score.outcome());
+    }
+    let ensemble = Ensemble::fit(&member_preds, &actuals, 2);
+
+    Baseline {
+        model,
+        elo_seeds,
+        ensemble,
+    }
+}
+
+/// Convenience: just the goal model from [`fit_baseline`].
 pub fn fit_baseline_model(seed: u64) -> GoalModel {
-    let history = synthetic_history(3000, seed);
-    GoalModel::fit(&history, DixonColesConfig::default())
+    fit_baseline(seed).model
 }
 
 #[cfg(test)]

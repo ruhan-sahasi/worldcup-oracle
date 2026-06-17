@@ -1231,6 +1231,7 @@ dependencies = [
  "chrono",
  "oracle-domain",
  "oracle-model",
+ "oracle-ratings",
  "rand 0.8.6",
  "rand_distr",
  "reqwest",
