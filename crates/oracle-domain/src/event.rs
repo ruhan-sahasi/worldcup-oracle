@@ -53,6 +53,13 @@ pub enum EventKind {
     HalfTime,
     /// The match finished with a final `score`.
     FullTime { score: Scoreline },
+    /// An **authoritative** scoreline from the data source. The engine *sets* (rather
+    /// than increments) the live score, so the running tally self-heals even if a goal
+    /// event was dropped, duplicated, or arrived out of order from a polled feed.
+    ScoreSync { score: Scoreline },
+    /// Health of the data feed. Lets the engine surface staleness instead of serving a
+    /// stale snapshot that looks fresh. Not tied to a specific match.
+    SourceStatus { healthy: bool },
     /// Confirmed starting line-ups — a hook for per-player strength adjustments.
     Lineup {
         home: Vec<String>,
@@ -61,8 +68,12 @@ pub enum EventKind {
 }
 
 impl EventKind {
-    /// Goals and red cards are the events that move live win probabilities.
+    /// Events that change the believed score (and so should trigger a forecast
+    /// recompute): goals, red cards, and authoritative score corrections.
     pub fn is_material(&self) -> bool {
-        matches!(self, EventKind::Goal { .. } | EventKind::RedCard { .. })
+        matches!(
+            self,
+            EventKind::Goal { .. } | EventKind::RedCard { .. } | EventKind::ScoreSync { .. }
+        )
     }
 }

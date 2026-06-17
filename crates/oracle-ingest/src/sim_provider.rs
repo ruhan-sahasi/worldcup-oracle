@@ -151,6 +151,13 @@ impl DataProvider for SimProvider {
     }
 
     async fn run(&self, tx: Sender<MatchEvent>, cancel: CancellationToken) -> Result<()> {
+        // The simulated feed is always "healthy".
+        send(
+            &tx,
+            MatchEvent::new(MatchId(0), 0, EventKind::SourceStatus { healthy: true }),
+        )
+        .await?;
+
         // Play group-stage matches in scheduled order.
         let mut fixtures: Vec<_> = self
             .tournament
@@ -196,9 +203,14 @@ mod tests {
             tokio::spawn(async move { p.run(tx, cancel).await })
         };
 
-        // First event of the feed must be a kickoff.
+        // The feed opens with a health heartbeat, then the first match kicks off.
         let first = rx.recv().await.expect("at least one event");
-        assert!(matches!(first.kind, EventKind::KickOff));
+        assert!(matches!(
+            first.kind,
+            EventKind::SourceStatus { healthy: true }
+        ));
+        let second = rx.recv().await.expect("a second event");
+        assert!(matches!(second.kind, EventKind::KickOff));
 
         // Drain a few more, then cancel and ensure the task winds down.
         for _ in 0..20 {

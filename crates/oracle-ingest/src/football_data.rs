@@ -147,6 +147,7 @@ impl DataProvider for FootballDataProvider {
     async fn run(&self, tx: Sender<MatchEvent>, cancel: CancellationToken) -> Result<()> {
         // Track the last-seen status/score so we can diff into events.
         let mut last: HashMap<u32, (MatchStatus, Scoreline)> = HashMap::new();
+        let mut failures: u32 = 0;
 
         loop {
             if cancel.is_cancelled() {
@@ -154,6 +155,14 @@ impl DataProvider for FootballDataProvider {
             }
             match self.fetch_matches().await {
                 Ok(matches) => {
+                    failures = 0;
+                    let _ = tx
+                        .send(MatchEvent::new(
+                            HEARTBEAT,
+                            0,
+                            EventKind::SourceStatus { healthy: true },
+                        ))
+                        .await;
                     for m in &matches {
                         let Some(parsed) = m.to_domain() else {
                             continue;
@@ -176,19 +185,47 @@ impl DataProvider for FootballDataProvider {
                                 emit_diff(&tx, &parsed, *prev_status, *prev_score, minute).await;
                             }
                         }
+                        // Authoritative reconcile: the engine *sets* the live score to
+                        // this, so a dropped/duplicated goal event can't cause drift.
+                        if parsed.is_live() {
+                            let _ = tx
+                                .send(MatchEvent::new(
+                                    parsed.id,
+                                    minute,
+                                    EventKind::ScoreSync {
+                                        score: parsed.score,
+                                    },
+                                ))
+                                .await;
+                        }
                         last.insert(id, (parsed.status, parsed.score));
                     }
                 }
-                Err(e) => tracing::warn!(error = %e, "football-data poll failed; will retry"),
+                Err(e) => {
+                    failures = failures.saturating_add(1);
+                    tracing::warn!(error = %e, failures, "football-data poll failed; backing off");
+                    let _ = tx
+                        .send(MatchEvent::new(
+                            HEARTBEAT,
+                            0,
+                            EventKind::SourceStatus { healthy: false },
+                        ))
+                        .await;
+                }
             }
 
+            // Exponential backoff after consecutive failures (capped at 8× interval).
+            let wait = self.poll_interval * (1u32 << failures.min(3));
             tokio::select! {
                 _ = cancel.cancelled() => return Ok(()),
-                _ = sleep(self.poll_interval) => {}
+                _ = sleep(wait) => {}
             }
         }
     }
 }
+
+/// Sentinel match id for feed-level (non-match) events like [`EventKind::SourceStatus`].
+const HEARTBEAT: MatchId = MatchId(0);
 
 /// Emit the events implied by the change between a previous and current match state.
 async fn emit_diff(
@@ -236,11 +273,9 @@ async fn emit_diff(
                 EventKind::FullTime { score: cur.score },
             ))
             .await;
-    } else if cur.is_live() {
-        let _ = tx
-            .send(MatchEvent::new(cur.id, minute, EventKind::Tick))
-            .await;
     }
+    // Live matches get an authoritative `ScoreSync` from the caller, which also
+    // advances the minute, so no separate tick is emitted here.
 }
 
 // ----- football-data.org v4 response DTOs -----

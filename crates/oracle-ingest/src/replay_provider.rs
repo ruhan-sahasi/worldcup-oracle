@@ -9,7 +9,7 @@
 use crate::error::{IngestError, Result};
 use crate::provider::DataProvider;
 use async_trait::async_trait;
-use oracle_domain::{EventKind, Match, MatchEvent, Stage, Tournament};
+use oracle_domain::{EventKind, Match, MatchEvent, MatchId, Stage, Tournament};
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 use std::time::Duration;
@@ -99,6 +99,11 @@ impl DataProvider for ReplayProvider {
     }
 
     async fn run(&self, tx: Sender<MatchEvent>, cancel: CancellationToken) -> Result<()> {
+        send(
+            &tx,
+            MatchEvent::new(MatchId(0), 0, EventKind::SourceStatus { healthy: true }),
+        )
+        .await?;
         let mut fixtures: Vec<Match> = self
             .tournament
             .matches
