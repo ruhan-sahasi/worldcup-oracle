@@ -1,0 +1,16 @@
+[package]
+name = "oracle-model"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Dixon-Coles goal model, Bayesian in-match updating, and ensemble blending"
+
+[dependencies]
+oracle-domain.workspace = true
+serde.workspace = true
+
+[dev-dependencies]
+# (statistical tests use only std + domain)
