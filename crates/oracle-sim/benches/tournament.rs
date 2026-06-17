@@ -5,7 +5,9 @@
 //! refreshes champion odds live.
 
 use criterion::{criterion_group, criterion_main, BatchSize, Criterion};
-use oracle_domain::{Confederation, Group, Team, TeamId, Tournament};
+use oracle_domain::{
+    Confederation, Group, Match, MatchId, MatchStatus, Scoreline, Stage, Team, TeamId, Tournament,
+};
 use oracle_sim::{simulate, MatchSampler, SimConfig};
 
 struct RankSampler;
@@ -35,6 +37,24 @@ fn world_cup_shaped() -> Tournament {
             name: (b'A' + g as u8) as char,
             teams: (base..base + 4).map(TeamId).collect(),
         });
+    }
+    // A full round-robin of scheduled fixtures per group (the simulator now reads the
+    // fixture list rather than synthesizing pairings).
+    let pairs = [(0, 1), (2, 3), (0, 2), (1, 3), (0, 3), (1, 2)];
+    let mut id = 1u32;
+    for g in &t.groups.clone() {
+        for (i, j) in pairs {
+            t.matches.push(Match {
+                id: MatchId(id),
+                home: g.teams[i],
+                away: g.teams[j],
+                stage: Stage::Group(g.name),
+                kickoff: chrono::DateTime::from_timestamp(0, 0).unwrap(),
+                status: MatchStatus::Scheduled,
+                score: Scoreline::new(0, 0),
+            });
+            id += 1;
+        }
     }
     t
 }

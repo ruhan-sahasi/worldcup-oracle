@@ -19,19 +19,34 @@
 //! The 2026 format is the default target: 12 groups of four, top two plus the eight
 //! best third-placed teams advance to a 32-team single-elimination knockout.
 //!
-//! > Modelling choices: the knockout bracket uses a standard seeded single-elimination
-//! > template (group winners spread against runners-up/best-thirds) rather than FIFA's
-//! > exact slotting, and in-progress matches are re-sampled from scratch rather than
-//! > conditioned on their live scoreline. Both are documented limitations, not bugs.
+//! In-progress **group** matches are conditioned on their live score/minute/red-cards
+//! (see [`simulate_with_live`] / [`InProgress`]) so the tournament forecast tracks live
+//! results. Documented modelling choices: the knockout bracket uses a standard seeded
+//! single-elimination template (winners spread against runners-up/best-thirds) rather
+//! than FIFA's exact slotting, and in-progress *knockout* matches are still built fresh.
 #![forbid(unsafe_code)]
 
-use oracle_domain::{Stage, TeamForecast, TeamId, Tournament, TournamentForecast};
+use oracle_domain::{
+    MatchId, Scoreline, Stage, TeamForecast, TeamId, Tournament, TournamentForecast,
+};
+use oracle_model::{remaining_rates, LiveConfig, LiveState};
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 use rand_distr::{Distribution, Poisson};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+
+/// Live state of an in-progress match, supplied to [`simulate_with_live`] so the
+/// simulator samples the *remainder* of the match conditioned on what's already
+/// happened, instead of replaying it from 0-0.
+#[derive(Debug, Clone, Copy)]
+pub struct InProgress {
+    pub score: Scoreline,
+    pub minute: u16,
+    pub home_reds: u8,
+    pub away_reds: u8,
+}
 
 /// Supplies expected goals for a (neutral-venue) matchup. Implemented for the
 /// Dixon-Coles [`oracle_model::GoalModel`]; mockable in tests.
@@ -71,12 +86,35 @@ impl Default for SimConfig {
 }
 
 /// Run the Monte-Carlo simulation and return per-team stage probabilities.
+///
+/// Equivalent to [`simulate_with_live`] with no in-progress matches — every unfinished
+/// fixture is played from 0-0.
 pub fn simulate<S: MatchSampler>(
     tournament: &Tournament,
     sampler: &S,
     config: SimConfig,
 ) -> TournamentForecast {
-    let prep = Prepared::build(tournament, sampler, config);
+    simulate_with_live(
+        tournament,
+        sampler,
+        config,
+        &HashMap::new(),
+        LiveConfig::default(),
+    )
+}
+
+/// Like [`simulate`], but conditions any in-progress group match on its live state:
+/// instead of replaying from 0-0, it keeps the current score and samples only the
+/// remaining goals (scaled by time left and red cards). This is what keeps the live
+/// match odds and the tournament forecast coherent.
+pub fn simulate_with_live<S: MatchSampler>(
+    tournament: &Tournament,
+    sampler: &S,
+    config: SimConfig,
+    live: &HashMap<MatchId, InProgress>,
+    live_config: LiveConfig,
+) -> TournamentForecast {
+    let prep = Prepared::build(tournament, sampler, config, live, live_config);
     let n = prep.teams.len();
 
     // Fan out over iterations; each rayon task folds into its own tally, then we
@@ -124,12 +162,28 @@ struct Standing {
 
 struct GroupSim {
     members: Vec<usize>,
-    /// (home_ix, away_ix) for group matches not yet finished.
-    remaining: Vec<(usize, usize)>,
+    /// Group matches not yet finished, with sampling rates pre-resolved.
+    remaining: Vec<RemainingMatch>,
+}
+
+/// A group fixture still to be decided. `rates` are the goal rates to sample (full-match
+/// xG for a not-yet-started match, or the *remaining* rates for an in-progress one), and
+/// `current` is the score already on the board (0-0 unless in progress).
+struct RemainingMatch {
+    home_ix: usize,
+    away_ix: usize,
+    rates: (f64, f64),
+    current: Scoreline,
 }
 
 impl Prepared {
-    fn build<S: MatchSampler>(tournament: &Tournament, sampler: &S, config: SimConfig) -> Self {
+    fn build<S: MatchSampler>(
+        tournament: &Tournament,
+        sampler: &S,
+        config: SimConfig,
+        live: &HashMap<MatchId, InProgress>,
+        live_config: LiveConfig,
+    ) -> Self {
         let teams: Vec<TeamId> = tournament.teams.iter().map(|t| t.id).collect();
         let n = teams.len();
         let index: HashMap<TeamId, usize> =
@@ -157,14 +211,8 @@ impl Prepared {
             apply_result_at(&mut base, h, a, m.score.home as i32, m.score.away as i32);
         }
 
-        // Group structure + remaining fixtures.
-        let finished: std::collections::HashSet<(usize, usize)> = tournament
-            .matches
-            .iter()
-            .filter(|m| matches!(m.stage, Stage::Group(_)) && m.is_finished())
-            .filter_map(|m| Some((*index.get(&m.home)?, *index.get(&m.away)?)))
-            .collect();
-
+        // Group structure + remaining fixtures, derived from the actual fixture list so
+        // each match keeps its id (for live lookup) and home/away orientation.
         let groups = tournament
             .groups
             .iter()
@@ -174,16 +222,40 @@ impl Prepared {
                     .iter()
                     .filter_map(|t| index.get(t).copied())
                     .collect();
-                // Round-robin among members; skip already-finished pairings.
-                let mut remaining = Vec::new();
-                for (a_pos, &a) in members.iter().enumerate() {
-                    for &b in &members[a_pos + 1..] {
-                        if finished.contains(&(a, b)) || finished.contains(&(b, a)) {
-                            continue;
-                        }
-                        remaining.push((a, b));
-                    }
-                }
+                let remaining: Vec<RemainingMatch> = tournament
+                    .matches
+                    .iter()
+                    .filter(|m| {
+                        matches!(m.stage, Stage::Group(c) if c == g.name) && !m.is_finished()
+                    })
+                    .filter_map(|m| {
+                        let h = *index.get(&m.home)?;
+                        let a = *index.get(&m.away)?;
+                        let full = eg[h * n + a];
+                        // In-progress matches keep their score and sample only the rest.
+                        let (rates, current) = match live.get(&m.id) {
+                            Some(ip) => {
+                                let state = LiveState {
+                                    current: ip.score,
+                                    minute: ip.minute,
+                                    home_red_cards: ip.home_reds,
+                                    away_red_cards: ip.away_reds,
+                                };
+                                (
+                                    remaining_rates(full.0, full.1, &state, &live_config),
+                                    ip.score,
+                                )
+                            }
+                            None => (full, Scoreline::new(0, 0)),
+                        };
+                        Some(RemainingMatch {
+                            home_ix: h,
+                            away_ix: a,
+                            rates,
+                            current,
+                        })
+                    })
+                    .collect();
                 GroupSim { members, remaining }
             })
             .collect::<Vec<GroupSim>>();
@@ -283,10 +355,11 @@ impl Prepared {
                 .collect();
             let mut standings: Vec<Standing> = table.iter().map(|(_, s)| *s).collect();
 
-            for &(h, a) in &group.remaining {
-                let gh = Self::sample_goals(rng, self.eg[h * self.n + a].0);
-                let ga = Self::sample_goals(rng, self.eg[h * self.n + a].1);
-                apply_result_at(&mut standings, pos[&h], pos[&a], gh, ga);
+            for rm in &group.remaining {
+                // Final goals = already scored (0 unless in progress) + sampled remainder.
+                let gh = i32::from(rm.current.home) + Self::sample_goals(rng, rm.rates.0);
+                let ga = i32::from(rm.current.away) + Self::sample_goals(rng, rm.rates.1);
+                apply_result_at(&mut standings, pos[&rm.home_ix], pos[&rm.away_ix], gh, ga);
             }
             for (i, (_, s)) in table.iter_mut().enumerate() {
                 *s = standings[i];
@@ -461,7 +534,7 @@ impl Tally {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use oracle_domain::{Confederation, Group, Match, MatchId, MatchStatus, Scoreline, Team};
+    use oracle_domain::{Confederation, Group, Match, MatchStatus, Team};
 
     /// A sampler where lower team-id = stronger (scores more, concedes less).
     struct RankSampler;
@@ -474,8 +547,12 @@ mod tests {
         }
     }
 
+    fn epoch() -> chrono::DateTime<chrono::Utc> {
+        chrono::DateTime::from_timestamp(0, 0).unwrap()
+    }
+
     fn tiny_tournament() -> Tournament {
-        // 8 teams, 2 groups of 4, no matches played yet.
+        // 8 teams, 2 groups of 4, with a full round-robin of scheduled fixtures.
         let mut t = Tournament::new("Test Cup");
         for i in 0..8u32 {
             t.teams.push(Team::new(
@@ -493,6 +570,22 @@ mod tests {
             name: 'B',
             teams: vec![TeamId(4), TeamId(5), TeamId(6), TeamId(7)],
         });
+        let pairs = [(0, 1), (2, 3), (0, 2), (1, 3), (0, 3), (1, 2)];
+        let mut id = 1u32;
+        for g in &t.groups.clone() {
+            for (i, j) in pairs {
+                t.matches.push(Match {
+                    id: MatchId(id),
+                    home: g.teams[i],
+                    away: g.teams[j],
+                    stage: Stage::Group(g.name),
+                    kickoff: epoch(),
+                    status: MatchStatus::Scheduled,
+                    score: Scoreline::new(0, 0),
+                });
+                id += 1;
+            }
+        }
         t
     }
 
@@ -563,20 +656,19 @@ mod tests {
 
     #[test]
     fn finished_results_are_respected() {
-        // Give team 3 (normally weak) three big wins so it tops group A.
+        // Mark team 3's (normally weak) group-A matches as big wins so it tops the group.
         let mut t = tiny_tournament();
-        let mk = |id, h, a, sh, sa| Match {
-            id: MatchId(id),
-            home: TeamId(h),
-            away: TeamId(a),
-            stage: Stage::Group('A'),
-            kickoff: chrono::DateTime::from_timestamp(0, 0).unwrap(),
-            status: MatchStatus::Finished,
-            score: Scoreline::new(sh, sa),
-        };
-        t.matches.push(mk(1, 3, 0, 5, 0));
-        t.matches.push(mk(2, 3, 1, 5, 0));
-        t.matches.push(mk(3, 3, 2, 5, 0));
+        for m in &mut t.matches {
+            if matches!(m.stage, Stage::Group('A')) && (m.home == TeamId(3) || m.away == TeamId(3))
+            {
+                m.status = MatchStatus::Finished;
+                m.score = if m.home == TeamId(3) {
+                    Scoreline::new(5, 0)
+                } else {
+                    Scoreline::new(0, 5)
+                };
+            }
+        }
         let f = simulate(
             &t,
             &RankSampler,
@@ -587,5 +679,48 @@ mod tests {
         );
         let p3 = f.teams.iter().find(|x| x.team == TeamId(3)).unwrap();
         assert!(p3.p_advance_group > 0.9, "team 3 already has 9 points");
+    }
+
+    #[test]
+    fn in_progress_lead_lifts_advance_probability() {
+        let t = tiny_tournament();
+        let cfg = SimConfig {
+            iterations: 6000,
+            seed: 7,
+            ..Default::default()
+        };
+        let fresh = simulate(&t, &RankSampler, cfg);
+
+        // Weak team 3 is away and leading 0-3 at the 85th minute of its match vs team 0.
+        let m = t
+            .matches
+            .iter()
+            .find(|m| m.home == TeamId(0) && m.away == TeamId(3))
+            .unwrap();
+        let mut live = HashMap::new();
+        live.insert(
+            m.id,
+            InProgress {
+                score: Scoreline::new(0, 3),
+                minute: 85,
+                home_reds: 0,
+                away_reds: 0,
+            },
+        );
+        let conditioned = simulate_with_live(&t, &RankSampler, cfg, &live, LiveConfig::default());
+
+        let advance = |f: &TournamentForecast, team: u32| {
+            f.teams
+                .iter()
+                .find(|x| x.team == TeamId(team))
+                .unwrap()
+                .p_advance_group
+        };
+        assert!(
+            advance(&conditioned, 3) > advance(&fresh, 3) + 0.05,
+            "a 0-3 lead at 85' should lift team 3's advance odds (fresh {:.3} -> live {:.3})",
+            advance(&fresh, 3),
+            advance(&conditioned, 3),
+        );
     }
 }

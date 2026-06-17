@@ -59,7 +59,10 @@ impl LiveState {
 }
 
 /// Expected goals each side will *still* score, given the time left and red cards.
-fn remaining_rates(
+///
+/// Exposed because the Monte-Carlo simulator reuses it to sample the *remainder* of an
+/// in-progress match (rather than re-playing it from 0-0).
+pub fn remaining_rates(
     base_lambda: f64,
     base_mu: f64,
     state: &LiveState,
