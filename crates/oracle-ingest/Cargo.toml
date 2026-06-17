@@ -1,0 +1,27 @@
+[package]
+name = "oracle-ingest"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Pluggable data ingestion (live API / replay / simulation) for worldcup-oracle"
+
+[dependencies]
+oracle-domain.workspace = true
+oracle-model.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+chrono.workspace = true
+thiserror.workspace = true
+async-trait.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+reqwest.workspace = true
+rand.workspace = true
+rand_distr.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tokio = { version = "1", features = ["test-util", "macros", "rt-multi-thread", "time"] }
