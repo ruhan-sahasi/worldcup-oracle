@@ -49,6 +49,10 @@ pub struct Snapshot {
     pub generated_at: DateTime<Utc>,
     pub tournament: String,
     pub provider: String,
+    /// Whether the data feed is currently healthy. `false` ⇒ the figures may be stale.
+    pub source_healthy: bool,
+    /// When the engine last processed an event from the feed (staleness signal).
+    pub last_update: DateTime<Utc>,
     pub matches: Vec<MatchPrediction>,
     pub forecast: TournamentForecast,
     pub ratings: Vec<RatingEntry>,

@@ -91,14 +91,14 @@ async fn main() -> anyhow::Result<()> {
     }
 }
 
-/// Fit the baseline goal model and strength-seeded Elo store.
-fn baseline() -> (GoalModel, RatingStore) {
-    let model = data::fit_baseline_model(7);
+/// Fit the baseline goal model, strength-seeded Elo store, and the learned ensemble.
+fn baseline() -> (GoalModel, RatingStore, Ensemble) {
+    let b = data::fit_baseline(7);
     let mut ratings = RatingStore::with_defaults();
-    for (team, rating) in data::team_strengths() {
-        ratings.seed(team, rating);
+    for (team, rating) in &b.elo_seeds {
+        ratings.seed(*team, *rating);
     }
-    (model, ratings)
+    (b.model, ratings, b.ensemble)
 }
 
 fn resolve_team(query: &str, teams: &[Team]) -> Option<TeamId> {
@@ -170,21 +170,21 @@ fn cmd_predict(home_q: &str, away_q: &str) -> anyhow::Result<()> {
         resolve_team(away_q, &teams).ok_or_else(|| anyhow::anyhow!("unknown team: {away_q}"))?;
     let name = |id: TeamId| teams.iter().find(|t| t.id == id).unwrap().name.clone();
 
-    let (model, ratings) = baseline();
+    let (model, ratings, ensemble) = baseline();
     let grid = model.score_grid(home, away, true);
     let dc = grid.outcome_probabilities();
     let elo = ratings.win_probabilities(home, away, true);
-    let ensemble = Ensemble::default().blend(&[dc, elo]);
+    let blended = ensemble.blend(&[dc, elo]);
     let (lambda, mu) = model.expected_goals(home, away, true);
 
     println!("\n  {}  vs  {}   (neutral venue)\n", name(home), name(away));
     println!(
         "  Ensemble :  {:<11} {:>5.1}%    Draw {:>5.1}%    {:<11} {:>5.1}%",
         name(home),
-        ensemble.home_win * 100.0,
-        ensemble.draw * 100.0,
+        blended.home_win * 100.0,
+        blended.draw * 100.0,
         name(away),
-        ensemble.away_win * 100.0,
+        blended.away_win * 100.0,
     );
     println!(
         "    Dixon-Coles:  {:>5.1}% / {:>4.1}% / {:>5.1}%      Elo:  {:>5.1}% / {:>4.1}% / {:>5.1}%",
@@ -227,14 +227,19 @@ fn cmd_backtest(n_matches: usize, seed: u64) -> anyhow::Result<()> {
     use oracle_model::{score, DixonColesConfig};
 
     let mut history = data::synthetic_history(n_matches, seed);
-    // Temporal split: train on the older 80%, test on the most recent 20%.
+    // Three-way temporal split: fit models on the oldest 60%, *learn the ensemble
+    // weights* on the next 20% (validation), and report on the most recent 20% (test).
     history.sort_by(|a, b| {
         b.age_days
             .partial_cmp(&a.age_days)
             .unwrap_or(std::cmp::Ordering::Equal)
     });
-    let split = history.len() * 4 / 5;
-    let (train, test) = history.split_at(split);
+    let n = history.len();
+    let train_end = n * 6 / 10;
+    let val_end = n * 8 / 10;
+    let train = &history[..train_end];
+    let validation = &history[train_end..val_end];
+    let test = &history[val_end..];
 
     // Fit the goal model, and build Elo by replaying the training results.
     let model = GoalModel::fit(train, DixonColesConfig::default());
@@ -242,29 +247,42 @@ fn cmd_backtest(n_matches: usize, seed: u64) -> anyhow::Result<()> {
     for (team, rating) in data::team_strengths() {
         ratings.seed(team, rating);
     }
-    for obs in train.iter().rev() {
+    for obs in train {
         ratings.record(obs.home, obs.away, obs.score, true);
     }
 
-    let ensemble = Ensemble::default();
+    // Learn the ensemble weights + temperature on the validation split.
+    let mut val_preds = Vec::new();
+    let mut val_actuals = Vec::new();
+    for obs in validation {
+        val_preds.push(vec![
+            model.outcome_probabilities(obs.home, obs.away, true),
+            ratings.win_probabilities(obs.home, obs.away, true),
+        ]);
+        val_actuals.push(obs.score.outcome());
+    }
+    let ensemble = Ensemble::fit(&val_preds, &val_actuals, 2);
+
+    // Evaluate Dixon-Coles, Elo, and the learned ensemble on the held-out test split.
     let mut dc_preds = Vec::new();
+    let mut elo_preds = Vec::new();
     let mut ens_preds = Vec::new();
     for obs in test {
         let actual = obs.score.outcome();
         let dc = model.outcome_probabilities(obs.home, obs.away, true);
         let elo = ratings.win_probabilities(obs.home, obs.away, true);
         dc_preds.push((dc, actual));
+        elo_preds.push((elo, actual));
         ens_preds.push((ensemble.blend(&[dc, elo]), actual));
     }
 
     let baseline = oracle_model::CalibrationReport::uniform_baseline(test.len());
-    let dc_report = score(&dc_preds);
-    let ens_report = score(&ens_preds);
 
     println!(
-        "\nBacktest on {} synthetic matches  (train {} / test {})\n",
+        "\nBacktest on {} synthetic matches  (train {} / val {} / test {})\n",
         n_matches,
         train.len(),
+        validation.len(),
         test.len()
     );
     println!(
@@ -282,9 +300,17 @@ fn cmd_backtest(n_matches: usize, seed: u64) -> anyhow::Result<()> {
         );
     };
     row("Uniform baseline", baseline);
-    row("Dixon-Coles", dc_report);
-    row("Ensemble (+Elo)", ens_report);
-    println!("\n  (lower Brier / log-loss is better)\n");
+    row("Dixon-Coles", score(&dc_preds));
+    row("Elo", score(&elo_preds));
+    row("Ensemble (learned)", score(&ens_preds));
+    let wsum: f64 = ensemble.weights.iter().sum();
+    println!(
+        "\n  learned weights: Dixon-Coles {:.2} / Elo {:.2}   temperature {:.2}",
+        ensemble.weights.first().copied().unwrap_or(0.0) / wsum,
+        ensemble.weights.get(1).copied().unwrap_or(0.0) / wsum,
+        ensemble.temperature,
+    );
+    println!("  (lower Brier / log-loss is better)\n");
     Ok(())
 }
 

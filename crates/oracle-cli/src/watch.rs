@@ -63,13 +63,19 @@ fn ui(frame: &mut Frame, snap: &Snapshot, engine: &Engine) {
     .split(frame.area());
 
     let m = engine.metrics();
+    let health = if snap.source_healthy {
+        String::new()
+    } else {
+        "    ⚠ STALE FEED".to_string()
+    };
     let header = Paragraph::new(format!(
-        " {}    provider: {}    events: {}    goals: {}    updated: {}",
+        " {}    provider: {}    events: {}    goals: {}    updated: {}{}",
         snap.tournament,
         snap.provider,
         m.events_processed.load(Ordering::Relaxed),
         m.goals_seen.load(Ordering::Relaxed),
         snap.generated_at.format("%H:%M:%S"),
+        health,
     ))
     .block(Block::bordered().title(" worldcup-oracle · LIVE "));
     frame.render_widget(header, chunks[0]);

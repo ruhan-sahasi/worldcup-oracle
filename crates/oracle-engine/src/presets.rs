@@ -7,26 +7,31 @@ use oracle_ingest::{data, FootballDataProvider, ReplayProvider, SimProvider};
 use std::sync::Arc;
 use std::time::Duration;
 
-/// Deterministic simulation over the embedded 2026 World Cup, with the baseline
-/// goal model and strength-seeded Elo. No network, no keys.
+/// Apply the offline-fitted baseline (goal model, Elo seeds, **learned** ensemble) to
+/// a set of deps.
+fn with_baseline(deps: EngineDeps) -> EngineDeps {
+    let baseline = data::fit_baseline(7);
+    deps.with_model(baseline.model)
+        .with_elo_seeds(baseline.elo_seeds)
+        .with_ensemble(baseline.ensemble)
+}
+
+/// Deterministic simulation over the embedded 2026 World Cup, with the fitted baseline
+/// models. No network, no keys.
 pub fn simulated() -> EngineDeps {
-    EngineDeps::new(Arc::new(SimProvider::new()))
-        .with_model(data::fit_baseline_model(7))
-        .with_elo_seeds(data::team_strengths())
+    with_baseline(EngineDeps::new(Arc::new(SimProvider::new())))
 }
 
 /// Like [`simulated`] but with a custom match clock speed.
 pub fn simulated_with_speed(minute_delay: Duration) -> EngineDeps {
-    EngineDeps::new(Arc::new(SimProvider::new().with_minute_delay(minute_delay)))
-        .with_model(data::fit_baseline_model(7))
-        .with_elo_seeds(data::team_strengths())
+    with_baseline(EngineDeps::new(Arc::new(
+        SimProvider::new().with_minute_delay(minute_delay),
+    )))
 }
 
 /// Replay a completed tournament event-by-event.
 pub fn replay(tournament: Tournament) -> EngineDeps {
-    EngineDeps::new(Arc::new(ReplayProvider::new(tournament)))
-        .with_model(data::fit_baseline_model(7))
-        .with_elo_seeds(data::team_strengths())
+    with_baseline(EngineDeps::new(Arc::new(ReplayProvider::new(tournament))))
 }
 
 /// Use the live football-data.org feed when `FOOTBALL_DATA_API_KEY` is set; fall

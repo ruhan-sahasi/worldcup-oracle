@@ -19,7 +19,7 @@ a lock-free event-driven core, parallel Monte-Carlo, back-pressured ingestion, a
 REST + WebSocket API, and a live terminal dashboard.
 
 It is timed for the **2026 World Cup** and can follow the real tournament via a free
-API — but it also ships a deterministic simulator and a replay engine, so it runs
+API, but it also ships a deterministic simulator and a replay engine, so it runs
 fully offline with **zero keys and zero network**.
 
 ---
@@ -44,9 +44,9 @@ fully offline with **zero keys and zero network**.
 |-------|---------------------|
 | **Dixon-Coles** bivariate Poisson, MLE-fit with time decay | full exact-score distribution per matchup |
 | **Elo** with home edge + margin-of-victory scaling | a complementary strength signal |
-| **Log-opinion-pool ensemble** | a single, sharper blended forecast |
+| **Log-opinion-pool ensemble** (weights + temperature **learned by stacking**) | a single, sharper blended forecast that's provably ≥ its best member |
 | **Bayesian live updater** | conditions on score + minute + red cards for live odds |
-| **Monte-Carlo** (rayon-parallel) | tournament-level champion odds |
+| **Monte-Carlo** (rayon-parallel, **conditions in-progress matches** on their live score) | tournament-level champion odds that move with live results |
 
 Calibration is measured with proper scoring rules (Brier, log-loss) and regression-
 tested against a baseline. The maths are written up in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
@@ -74,14 +74,14 @@ flowchart LR
 
 | Crate | Responsibility |
 |-------|----------------|
-| `oracle-domain` | pure types (teams, matches, events, probabilities) — no I/O |
+| `oracle-domain` | pure types (teams, matches, events, probabilities); no I/O |
 | `oracle-ratings` | Elo rating system |
 | `oracle-model` | Dixon-Coles, Bayesian live model, ensemble, calibration |
 | `oracle-sim` | parallel Monte-Carlo tournament simulator |
 | `oracle-ingest` | `DataProvider` trait + sim / replay / live adapters, rate-limit + cache |
 | `oracle-engine` | event-driven orchestrator, pub/sub, snapshot cache, metrics |
 | `oracle-api` | axum REST + WebSocket server (`oracle-server`) |
-| `oracle-cli` | `wc-oracle` — CLI commands + live TUI |
+| `oracle-cli` | `wc-oracle`: CLI commands + live TUI |
 
 See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for diagrams and the model maths.
 
@@ -100,11 +100,11 @@ cargo run --release -p oracle-cli -- simulate --iters 50000
 ```text
   #  Team                Champ    Final     Semi    Quart      R16
 --------------------------------------------------------------------
-  1  France              12.4%    19.4%    28.7%    43.1%    67.8%
-  2  Argentina            7.6%    12.5%    20.1%    32.8%    53.8%
-  3  Spain                6.1%    10.7%    18.3%    32.6%    54.9%
+  1  France              12.3%    18.9%    27.9%    42.7%    67.3%
+  2  Argentina            7.6%    12.7%    20.3%    33.2%    54.7%
+  3  Spain                6.7%    11.7%    19.1%    33.9%    55.9%
   ...
-50000 simulations in 1.01s  (19748 tournaments/sec)
+50000 simulations in 1.0s  (~50k tournaments/sec)
 ```
 
 ```bash
@@ -115,12 +115,12 @@ cargo run --release -p oracle-cli -- predict --home Brazil --away Argentina
 ```text
   Brazil  vs  Argentina   (neutral venue)
 
-  Ensemble :  Brazil       28.8%    Draw  25.8%    Argentina    45.4%
-    Dixon-Coles:   29.2% / 23.7% /  47.1%      Elo:   27.8% / 30.1% /  42.1%
+  Ensemble :  Brazil       31.8%    Draw  28.0%    Argentina    40.2%
+    Dixon-Coles:   32.7% / 23.5% /  43.8%      Elo:   27.8% / 30.1% /  42.1%
 
-  Expected goals : 1.30 – 1.71
-  Most likely    : 1–1  (11.0%)
-  Over 2.5 goals : 58.1%      Both teams to score : 59.8%
+  Expected goals : 1.40 – 1.65
+  Most likely    : 1–1  (10.8%)
+  Over 2.5 goals : 58.7%      Both teams to score : 60.6%
 ```
 
 ```bash
@@ -135,9 +135,16 @@ cargo run --release -p oracle-cli -- backtest
   Model                   Brier   LogLoss      Acc
   ------------------------------------------------
   Uniform baseline       0.6667    1.0986    33.3%
-  Dixon-Coles            0.6344    1.0535    45.0%
-  Ensemble (+Elo)        0.6366    1.0594    46.2%
+  Dixon-Coles            0.6350    1.0544    45.0%
+  Elo                    0.6758    1.1278    45.0%
+  Ensemble (learned)     0.6346    1.0525    46.0%
+
+  learned weights: Dixon-Coles 0.74 / Elo 0.26   temperature 0.71
 ```
+
+The learned ensemble beats every individual member out-of-sample: stacking discovers
+that Elo is the weaker signal here and down-weights it, then a temperature below 1
+corrects the models' overconfidence.
 
 ### Run the server
 
@@ -156,7 +163,7 @@ curl localhost:8080/predict/match/1
 | `GET` | `/predict/match/{id}` | one match: live odds + exact-score grid |
 | `GET` | `/predict/tournament` | champion-odds table |
 | `GET` | `/metrics` | Prometheus metrics |
-| `GET` | `/live` | **WebSocket** — pushes a compact live view on every update |
+| `GET` | `/live` | **WebSocket**: pushes a compact live view on every update |
 
 ### Go live (optional)
 
@@ -167,7 +174,7 @@ real 2026 World Cup feed automatically:
 FOOTBALL_DATA_API_KEY=your_key   # from football-data.org
 ```
 
-No key? It runs the deterministic simulation — every command above works unchanged.
+No key? It runs the deterministic simulation, and every command above works unchanged.
 
 ### Docker
 
@@ -177,18 +184,21 @@ docker compose up --build         # serves on :8080
 
 ## 🛠️ What this project demonstrates
 
-- **Workspace architecture & dependency inversion** — a pure domain core with a
+- **Workspace architecture & dependency inversion** -> a pure domain core with a
   trait-based data seam (`DataProvider`) and transport layers as thin shells.
-- **Async, event-driven concurrency** — `tokio` mpsc ingestion with back-pressure,
+- **Async, event-driven concurrency** -> `tokio` mpsc ingestion with back-pressure,
   `broadcast` fan-out pub/sub, **single-writer state with lock-free `arc-swap` reads**,
   graceful cancellation.
-- **Data-parallelism** — `rayon`-parallel Monte-Carlo with deterministic per-iteration
-  seeding; ~20k full tournament simulations/second.
-- **Applied statistics** — Dixon-Coles MLE with time decay, Elo, Bayesian conditioning,
-  log-opinion-pool ensembling, and **proper scoring rules** for honest evaluation.
-- **Production hygiene** — a hand-rolled token-bucket rate limiter + TTL cache around
-  the live API, structured `tracing`, Prometheus metrics, `#![forbid(unsafe_code)]`,
-  unit + property + integration tests, Criterion benchmarks, CI, and Docker.
+- **Data-parallelism** -> `rayon`-parallel Monte-Carlo with deterministic per-iteration
+  seeding; ~50k full tournament simulations/second.
+- **Applied statistics** -> Dixon-Coles MLE with time decay, Elo, Bayesian conditioning,
+  a **stacked** ensemble (weights + temperature learned to minimize held-out log-loss),
+  and **proper scoring rules** for honest evaluation.
+- **Resilient ingestion** -> an authoritative `ScoreSync` reconciliation (so a dropped or
+  duplicated poll can't corrupt the score), a feed-health signal with exponential
+  backoff, a hand-rolled token-bucket rate limiter + TTL cache, structured `tracing`,
+  Prometheus metrics, `#![forbid(unsafe_code)]`, unit + property + integration tests,
+  Criterion benchmarks, CI, and Docker.
 
 ## 🧪 Tests & benchmarks
 
@@ -204,10 +214,13 @@ cargo bench -p oracle-sim       # Monte-Carlo throughput
   official draw; the live adapter pulls the real teams, fixtures, and results.
 - Offline training data is **synthetic but reproducible** (drawn from team-strength
   priors) so the fit and backtest run without a network; supply an API key for real data.
-- The knockout simulator uses a standard seeded single-elimination bracket rather than
-  FIFA's exact slotting, and re-samples in-progress matches rather than conditioning on
-  their live score. Both are documented in the code.
+  The backtest beating the baseline therefore validates the *machinery*, not real-world
+  skill; that needs real historical results.
+- In-progress **group** matches are conditioned on their live score, but the knockout
+  simulator still builds a fresh bracket each run (a standard seeded single-elimination
+  template, not FIFA's exact slotting); conditioning live *knockout* matches is future
+  work. All documented in the code.
 
 ## 📄 License
 
-MIT © Ruhan Sahasi — see [LICENSE](LICENSE).
+MIT © Ruhan Sahasi. See [LICENSE](LICENSE).

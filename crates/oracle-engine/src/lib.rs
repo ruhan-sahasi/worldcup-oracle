@@ -33,7 +33,7 @@ use oracle_domain::{
 use oracle_ingest::DataProvider;
 use oracle_model::{live_score_grid, Ensemble, GoalModel, LiveConfig, LiveState};
 use oracle_ratings::{EloConfig, RatingStore};
-use oracle_sim::{simulate, SimConfig};
+use oracle_sim::{simulate_with_live, InProgress, SimConfig};
 use std::collections::HashMap;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
@@ -83,6 +83,11 @@ impl EngineDeps {
 
     pub fn with_sim_config(mut self, cfg: SimConfig) -> Self {
         self.sim_config = cfg;
+        self
+    }
+
+    pub fn with_ensemble(mut self, ensemble: Ensemble) -> Self {
+        self.ensemble = ensemble;
         self
     }
 }
@@ -222,9 +227,11 @@ async fn event_loop(
             msg = rx.recv() => match msg {
                 None => break, // feed exhausted
                 Some(event) => {
-                    let result_landed = state.apply_event(&event, &engine.metrics);
+                    let landed = state.apply_event(&event, &engine.metrics);
                     engine.metrics.events_processed.fetch_add(1, Ordering::Relaxed);
-                    if result_landed {
+                    // Recompute when a result lands OR a score-changing event arrives, so
+                    // the tournament forecast reflects live scores, not just full time.
+                    if landed || event.kind.is_material() {
                         state.recompute_forecast();
                         engine.metrics.forecasts_computed.fetch_add(1, Ordering::Relaxed);
                     }
@@ -284,6 +291,10 @@ struct EngineState {
     sim_config: SimConfig,
     live: HashMap<MatchId, LiveMatch>,
     last_forecast: oracle_domain::TournamentForecast,
+    /// Whether the data feed is currently healthy (updated by `SourceStatus` events).
+    source_healthy: bool,
+    /// Wall-clock time the last event was processed — surfaces feed staleness.
+    last_update: chrono::DateTime<chrono::Utc>,
 }
 
 impl EngineState {
@@ -317,12 +328,20 @@ impl EngineState {
                 iterations: 0,
                 teams: Vec::new(),
             },
+            source_healthy: true,
+            last_update: chrono::Utc::now(),
         }
     }
 
     /// Apply an event to mutable state. Returns `true` when a result landed (the
     /// tournament forecast should be recomputed).
     fn apply_event(&mut self, event: &MatchEvent, metrics: &Metrics) -> bool {
+        self.last_update = chrono::Utc::now();
+        // Feed-health heartbeats aren't tied to a match — handle before the lookup.
+        if let EventKind::SourceStatus { healthy } = event.kind {
+            self.source_healthy = healthy;
+            return false;
+        }
         let Some(&pos) = self.match_index.get(&event.match_id) else {
             return false;
         };
@@ -372,7 +391,19 @@ impl EngineState {
                     lm.minute = 90;
                     final_score = Some(*score);
                 }
-                EventKind::HalfTime | EventKind::YellowCard { .. } | EventKind::Lineup { .. } => {}
+                EventKind::ScoreSync { score } => {
+                    // Authoritative correction: set, don't increment (self-heals drift).
+                    lm.score = *score;
+                    lm.status = MatchStatus::Live {
+                        minute: event.minute,
+                    };
+                    lm.minute = event.minute;
+                }
+                // SourceStatus is handled above the match lookup; the rest are no-ops.
+                EventKind::SourceStatus { .. }
+                | EventKind::HalfTime
+                | EventKind::YellowCard { .. }
+                | EventKind::Lineup { .. } => {}
             }
         }
 
@@ -387,7 +418,31 @@ impl EngineState {
     }
 
     fn recompute_forecast(&mut self) {
-        self.last_forecast = simulate(&self.tournament, &self.model, self.sim_config);
+        // Condition any in-progress match on its live state, so the tournament forecast
+        // tracks live scores instead of treating every unfinished match as 0-0.
+        let live: HashMap<MatchId, InProgress> = self
+            .live
+            .iter()
+            .filter(|(_, lm)| matches!(lm.status, MatchStatus::Live { .. }))
+            .map(|(&id, lm)| {
+                (
+                    id,
+                    InProgress {
+                        score: lm.score,
+                        minute: lm.minute,
+                        home_reds: lm.home_reds,
+                        away_reds: lm.away_reds,
+                    },
+                )
+            })
+            .collect();
+        self.last_forecast = simulate_with_live(
+            &self.tournament,
+            &self.model,
+            self.sim_config,
+            &live,
+            self.live_config,
+        );
     }
 
     fn name_of(&self, id: TeamId) -> String {
@@ -475,6 +530,8 @@ impl EngineState {
             generated_at: chrono::Utc::now(),
             tournament: self.tournament.name.clone(),
             provider: provider_name.to_string(),
+            source_healthy: self.source_healthy,
+            last_update: self.last_update,
             matches,
             forecast: self.last_forecast.clone(),
             ratings,
@@ -542,5 +599,66 @@ mod tests {
 
         cancel.cancel();
         let _ = join.await;
+    }
+
+    fn fresh_state() -> EngineState {
+        let deps = EngineDeps::new(Arc::new(SimProvider::new()));
+        EngineState::new(data::world_cup_2026(), deps)
+    }
+
+    #[test]
+    fn score_sync_authoritatively_corrects_drift() {
+        let mut state = fresh_state();
+        let metrics = Metrics::default();
+        let m = state.tournament.matches[0].clone();
+
+        // A goal nudges the running tally to 1-0…
+        state.apply_event(
+            &MatchEvent::new(
+                m.id,
+                10,
+                EventKind::Goal {
+                    team: m.home,
+                    scorer: None,
+                },
+            ),
+            &metrics,
+        );
+        // …but the authoritative feed says it's actually 0-3 (we missed events).
+        state.apply_event(
+            &MatchEvent::new(
+                m.id,
+                70,
+                EventKind::ScoreSync {
+                    score: Scoreline::new(0, 3),
+                },
+            ),
+            &metrics,
+        );
+
+        assert_eq!(
+            state.live.get(&m.id).expect("live state").score,
+            Scoreline::new(0, 3),
+            "ScoreSync should set, not add to, the score"
+        );
+    }
+
+    #[test]
+    fn source_status_toggles_health() {
+        let mut state = fresh_state();
+        let metrics = Metrics::default();
+        assert!(state.source_healthy, "feed starts healthy");
+
+        state.apply_event(
+            &MatchEvent::new(MatchId(0), 0, EventKind::SourceStatus { healthy: false }),
+            &metrics,
+        );
+        assert!(!state.source_healthy, "an outage marks the feed unhealthy");
+
+        state.apply_event(
+            &MatchEvent::new(MatchId(0), 0, EventKind::SourceStatus { healthy: true }),
+            &metrics,
+        );
+        assert!(state.source_healthy, "recovery marks it healthy again");
     }
 }

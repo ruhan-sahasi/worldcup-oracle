@@ -74,10 +74,13 @@ async fn health() -> &'static str {
 }
 
 async fn index(State(engine): State<Arc<Engine>>) -> Json<serde_json::Value> {
+    let snap = engine.snapshot();
     Json(serde_json::json!({
         "service": "worldcup-oracle",
         "tournament": engine.tournament_name(),
         "provider": engine.provider_name(),
+        "source_healthy": snap.source_healthy,
+        "last_update": snap.last_update.to_rfc3339(),
         "endpoints": [
             "/health", "/teams", "/matches",
             "/predict/match/{id}", "/predict/tournament",
@@ -263,6 +266,10 @@ impl TournamentView {
 #[derive(Debug, Clone, Serialize)]
 pub struct LiveView {
     pub generated_at: String,
+    /// Whether the data feed is healthy; `false` means these figures may be stale.
+    pub source_healthy: bool,
+    /// When the engine last processed an event from the feed.
+    pub last_update: String,
     pub live_matches: Vec<MatchSummary>,
     pub top_contenders: Vec<ForecastRow>,
 }
@@ -282,6 +289,8 @@ impl LiveView {
             .collect();
         Self {
             generated_at: snap.generated_at.to_rfc3339(),
+            source_healthy: snap.source_healthy,
+            last_update: snap.last_update.to_rfc3339(),
             live_matches,
             top_contenders,
         }
