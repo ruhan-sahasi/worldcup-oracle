@@ -9,11 +9,11 @@
 //! and transport layers evolve around it.
 //!
 //! ## Module map
-//! - [`team`] — teams, confederations, identifiers
-//! - [`fixture`] — matches, scorelines, stages, live status
-//! - [`event`] — the live event stream ([`MatchEvent`])
-//! - [`probability`] — outcomes, win/draw/win probabilities, exact-score grids
-//! - [`tournament`] — groups, the tournament container, and forecast outputs
+//! - [`team`] - teams, confederations, identifiers
+//! - [`fixture`] - matches, scorelines, stages, live status
+//! - [`event`] - the live event stream ([`MatchEvent`])
+//! - [`probability`] - outcomes, win/draw/win probabilities, exact-score grids
+//! - [`tournament`] - groups, the tournament container, and forecast outputs
 #![forbid(unsafe_code)]
 
 pub mod event;

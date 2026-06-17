@@ -25,7 +25,7 @@ pub struct MatchPrediction {
     pub status: MatchStatus,
     pub score: Scoreline,
     pub minute: u16,
-    /// Current win/draw/win — live (Bayesian) if in play, else the pre-match ensemble.
+    /// Current win/draw/win - live (Bayesian) if in play, else the pre-match ensemble.
     pub probabilities: Probabilities,
     /// The exact-score distribution (omitted once the match is finished).
     #[serde(skip_serializing_if = "Option::is_none")]

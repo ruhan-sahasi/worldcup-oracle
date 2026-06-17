@@ -1,6 +1,6 @@
-//! Ensemble blending of independent predictors — with **learned** weights.
+//! Ensemble blending of independent predictors - with **learned** weights.
 //!
-//! The engine produces two pre-match signals for every match — the Dixon-Coles goal
+//! The engine produces two pre-match signals for every match - the Dixon-Coles goal
 //! model and the Elo rating model. We combine them with a **logarithmic opinion
 //! pool** (a temperature-scaled weighted geometric mean):
 //!
@@ -11,7 +11,7 @@
 //! - the **mixture weights** `a_k` decide which member to trust, and
 //! - the **temperature** `τ` fixes systematic under/over-confidence (`τ > 1` sharpens).
 //!
-//! Both are fit by **stacking** — [`Ensemble::fit`] minimizes out-of-sample log-loss
+//! Both are fit by **stacking** - [`Ensemble::fit`] minimizes out-of-sample log-loss
 //! on a held-out validation set. Because `a = [1, 0], τ = 1` recovers a single member
 //! exactly, a fitted ensemble can never be worse than its best member on the fit set:
 //! this is the guard that stops the ensemble from degrading the Dixon-Coles forecast

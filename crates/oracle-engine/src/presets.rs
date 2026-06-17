@@ -40,11 +40,11 @@ pub fn replay(tournament: Tournament) -> EngineDeps {
 pub fn auto() -> EngineDeps {
     match FootballDataProvider::from_env() {
         Ok(provider) => {
-            tracing::info!("FOOTBALL_DATA_API_KEY found — using the live feed");
+            tracing::info!("FOOTBALL_DATA_API_KEY found - using the live feed");
             EngineDeps::new(Arc::new(provider))
         }
         Err(_) => {
-            tracing::info!("no API key — using the deterministic simulation feed");
+            tracing::info!("no API key - using the deterministic simulation feed");
             simulated()
         }
     }

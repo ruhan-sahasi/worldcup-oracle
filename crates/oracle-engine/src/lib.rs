@@ -279,7 +279,7 @@ impl LiveMatch {
     }
 }
 
-/// All mutable engine state — owned exclusively by the event loop.
+/// All mutable engine state - owned exclusively by the event loop.
 struct EngineState {
     tournament: Tournament,
     names: HashMap<TeamId, String>,
@@ -293,7 +293,7 @@ struct EngineState {
     last_forecast: oracle_domain::TournamentForecast,
     /// Whether the data feed is currently healthy (updated by `SourceStatus` events).
     source_healthy: bool,
-    /// Wall-clock time the last event was processed — surfaces feed staleness.
+    /// Wall-clock time the last event was processed - surfaces feed staleness.
     last_update: chrono::DateTime<chrono::Utc>,
 }
 
@@ -337,7 +337,7 @@ impl EngineState {
     /// tournament forecast should be recomputed).
     fn apply_event(&mut self, event: &MatchEvent, metrics: &Metrics) -> bool {
         self.last_update = chrono::Utc::now();
-        // Feed-health heartbeats aren't tied to a match — handle before the lookup.
+        // Feed-health heartbeats aren't tied to a match - handle before the lookup.
         if let EventKind::SourceStatus { healthy } = event.kind {
             self.source_healthy = healthy;
             return false;
@@ -612,7 +612,7 @@ mod tests {
         let metrics = Metrics::default();
         let m = state.tournament.matches[0].clone();
 
-        // A goal nudges the running tally to 1-0…
+        // A goal nudges the running tally to 1-0...
         state.apply_event(
             &MatchEvent::new(
                 m.id,
@@ -624,7 +624,7 @@ mod tests {
             ),
             &metrics,
         );
-        // …but the authoritative feed says it's actually 0-3 (we missed events).
+        // ...but the authoritative feed says it's actually 0-3 (we missed events).
         state.apply_event(
             &MatchEvent::new(
                 m.id,

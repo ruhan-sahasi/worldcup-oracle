@@ -1,7 +1,7 @@
 //! # oracle-ingest
 //!
-//! The data layer. It defines the [`DataProvider`] seam — the single abstraction the
-//! rest of the system talks to — and ships three implementations spanning the full
+//! The data layer. It defines the [`DataProvider`] seam - the single abstraction the
+//! rest of the system talks to - and ships three implementations spanning the full
 //! spectrum from "works on a plane with no key" to "live off the real World Cup":
 //!
 //! | Provider | Source | Network | Key |

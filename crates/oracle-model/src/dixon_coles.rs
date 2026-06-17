@@ -17,8 +17,8 @@
 //! Parameters are fit by **maximum likelihood** on historical results, with each
 //! match down-weighted by `exp(−ξ · age_days)` so recent form counts for more
 //! (the Dixon-Coles time-decay trick). We ascend the time-weighted Poisson
-//! log-likelihood analytically for the attack/defense/intercept/home terms — the
-//! Poisson score equations reduce neatly to `(observed − expected) goals` — and fit
+//! log-likelihood analytically for the attack/defense/intercept/home terms - the
+//! Poisson score equations reduce neatly to `(observed − expected) goals` - and fit
 //! `ρ` with a one-dimensional search over the full corrected likelihood.
 
 use crate::poisson::poisson_pmf;

@@ -1,4 +1,4 @@
-//! A deterministic synthetic data feed — the default, key-free way to run the engine.
+//! A deterministic synthetic data feed - the default, key-free way to run the engine.
 //!
 //! `SimProvider` owns a tournament and a fitted goal model, then plays the group
 //! stage forward in (accelerated) wall-clock time, emitting a realistic stream of

@@ -1,4 +1,4 @@
-//! `wc-oracle watch` — a live terminal dashboard.
+//! `wc-oracle watch` - a live terminal dashboard.
 //!
 //! Boots the engine over the simulation feed in-process, then renders a [`ratatui`]
 //! dashboard that refreshes ~8×/second from the engine's lock-free snapshot: live
@@ -111,7 +111,7 @@ fn render_live(frame: &mut Frame, area: Rect, snap: &Snapshot) {
 
     if items.is_empty() {
         items.push(ListItem::new(
-            "  (no matches in play — waiting for kickoff…)",
+            "  (no matches in play - waiting for kickoff...)",
         ));
         let finished: Vec<_> = snap
             .matches

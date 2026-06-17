@@ -1,15 +1,15 @@
 //! Embedded, offline-friendly tournament data.
 //!
-//! So the engine runs with **zero external dependencies** — no API key, no network —
+//! So the engine runs with **zero external dependencies** - no API key, no network -
 //! this module ships:
 //!
-//! - [`world_cup_2026`] — a 48-team, 12-group tournament in the 2026 format, with a
+//! - [`world_cup_2026`] - a 48-team, 12-group tournament in the 2026 format, with a
 //!   balanced snake-seeded draw and a generated group-stage fixture list.
-//! - [`team_strengths`] — approximate strength ratings used to seed Elo.
-//! - [`synthetic_history`] — a reproducible set of plausible past international
+//! - [`team_strengths`] - approximate strength ratings used to seed Elo.
+//! - [`synthetic_history`] - a reproducible set of plausible past international
 //!   results (drawn from the ratings via a Poisson model) so the Dixon-Coles fit and
 //!   the backtest have realistic, deterministic training data offline.
-//! - [`fit_baseline_model`] — convenience: fit a goal model on the synthetic history.
+//! - [`fit_baseline_model`] - convenience: fit a goal model on the synthetic history.
 //!
 //! > The roster and draw are a representative sample for demonstration, not the
 //! > official FIFA draw. Point the [`crate::FootballDataProvider`] at the live API

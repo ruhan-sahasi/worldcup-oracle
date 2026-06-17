@@ -6,12 +6,12 @@
 //!
 //! Two refinements over textbook Elo make it credible for football:
 //!
-//! 1. **Margin-of-victory scaling** — a 4-0 win shifts ratings more than a 1-0 win,
+//! 1. **Margin-of-victory scaling** - a 4-0 win shifts ratings more than a 1-0 win,
 //!    using the well-known World Football Elo goal-difference index `G`, while
 //!    dampening the effect for already-lopsided matchups (so favourites can't farm
 //!    rating points). See [`EloConfig`] and [`RatingStore::record`].
 //!
-//! 2. **Three-way outcome conversion** — raw Elo yields an *expected score*
+//! 2. **Three-way outcome conversion** - raw Elo yields an *expected score*
 //!    `E ∈ [0,1]` that merges wins and draws. Football needs an explicit draw
 //!    probability, so [`RatingStore::win_probabilities`] models the draw mass as a
 //!    Gaussian in the rating gap and splits `E` into home/draw/away while preserving

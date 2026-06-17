@@ -51,7 +51,7 @@ impl Tournament {
             .map(|g| g.name)
     }
 
-    /// Matches that have not yet finished — the set the simulator must resolve.
+    /// Matches that have not yet finished - the set the simulator must resolve.
     pub fn remaining_matches(&self) -> impl Iterator<Item = &Match> {
         self.matches.iter().filter(|m| !m.is_finished())
     }

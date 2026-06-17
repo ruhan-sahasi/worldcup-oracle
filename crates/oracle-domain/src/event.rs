@@ -3,7 +3,7 @@
 //! Data providers (live API, replay, or simulation) all emit a uniform stream of
 //! [`MatchEvent`]s. The engine consumes these to mutate match state and trigger a
 //! recomputation of probabilities. Keeping a single normalized event type means a
-//! new data source only has to translate *into* this shape — nothing downstream
+//! new data source only has to translate *into* this shape - nothing downstream
 //! changes.
 
 use crate::fixture::{MatchId, Scoreline};
@@ -36,8 +36,8 @@ impl MatchEvent {
 pub enum EventKind {
     /// The match started.
     KickOff,
-    /// A clock progression with no incident. Carries no data of its own — the
-    /// containing [`MatchEvent::minute`] is the signal — but it lets the engine
+    /// A clock progression with no incident. Carries no data of its own - the
+    /// containing [`MatchEvent::minute`] is the signal - but it lets the engine
     /// advance the live model's time (win probabilities drift as the clock runs).
     Tick,
     /// A goal was scored by `team`.
@@ -45,7 +45,7 @@ pub enum EventKind {
         team: TeamId,
         scorer: Option<String>,
     },
-    /// A red card was shown — reduces that team's scoring intensity in the live model.
+    /// A red card was shown - reduces that team's scoring intensity in the live model.
     RedCard { team: TeamId },
     /// A yellow card (carried for completeness / future discipline modelling).
     YellowCard { team: TeamId },
@@ -60,7 +60,7 @@ pub enum EventKind {
     /// Health of the data feed. Lets the engine surface staleness instead of serving a
     /// stale snapshot that looks fresh. Not tied to a specific match.
     SourceStatus { healthy: bool },
-    /// Confirmed starting line-ups — a hook for per-player strength adjustments.
+    /// Confirmed starting line-ups - a hook for per-player strength adjustments.
     Lineup {
         home: Vec<String>,
         away: Vec<String>,

@@ -120,7 +120,7 @@ fn cmd_simulate(iters: u64, seed: u64, top: usize) -> anyhow::Result<()> {
         .collect();
 
     println!(
-        "Simulating {} — {} iterations (seed {})…\n",
+        "Simulating {} - {} iterations (seed {})...\n",
         tournament.name, iters, seed
     );
     let start = Instant::now();

@@ -1,8 +1,8 @@
 //! Integration test: the fitted goal model must beat a naive baseline out-of-sample.
 //!
 //! This is the regression guard for model quality. We fit Dixon-Coles on the older
-//! 80% of the synthetic history and score it on the most recent 20% — a proper
-//! temporal split — then assert it beats the uniform (⅓,⅓,⅓) baseline on both
+//! 80% of the synthetic history and score it on the most recent 20% - a proper
+//! temporal split - then assert it beats the uniform (⅓,⅓,⅓) baseline on both
 //! proper scoring rules. If a change to the model or fit silently degrades accuracy,
 //! this test fails.
 

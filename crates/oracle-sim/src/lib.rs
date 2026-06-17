@@ -4,13 +4,13 @@
 //! state (finished results stay fixed, everything else is uncertain) and a
 //! [`MatchSampler`] that supplies expected goals for any matchup, it plays the rest
 //! of the competition out tens of thousands of times and aggregates how often each
-//! team reaches each stage — the headline "champion odds".
+//! team reaches each stage - the headline "champion odds".
 //!
 //! ## Design notes
 //! - **Embarrassingly parallel.** Each iteration is independent, so we fan out over
 //!   `rayon` and reduce per-thread tallies. Throughput scales with cores.
 //! - **Deterministic.** Each iteration's RNG is seeded from `base_seed + i`, so a
-//!   given `(seed, iterations)` reproduces exactly — essential for trustworthy demos
+//!   given `(seed, iterations)` reproduces exactly - essential for trustworthy demos
 //!   and tests.
 //! - **Precompute everything invariant.** Expected goals for every ordered team pair
 //!   and the base group standings (from already-played matches) are computed once;
@@ -87,7 +87,7 @@ impl Default for SimConfig {
 
 /// Run the Monte-Carlo simulation and return per-team stage probabilities.
 ///
-/// Equivalent to [`simulate_with_live`] with no in-progress matches — every unfinished
+/// Equivalent to [`simulate_with_live`] with no in-progress matches - every unfinished
 /// fixture is played from 0-0.
 pub fn simulate<S: MatchSampler>(
     tournament: &Tournament,
@@ -614,7 +614,7 @@ mod tests {
         assert!((total - 1.0).abs() < 0.02, "champion mass = {total}");
 
         for tf in &f.teams {
-            // Monotonic nesting: champion ⊆ final ⊆ … ⊆ advanced.
+            // Monotonic nesting: champion ⊆ final ⊆ ... ⊆ advanced.
             assert!(tf.p_champion <= tf.p_final + 1e-9);
             assert!(tf.p_final <= tf.p_semi_final + 1e-9);
             assert!(tf.p_semi_final <= tf.p_quarter_final + 1e-9);

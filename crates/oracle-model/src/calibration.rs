@@ -4,9 +4,9 @@
 //! standard proper scoring rules for probabilistic classification, plus plain
 //! accuracy as an intuition check:
 //!
-//! - **Brier score** — mean squared error between the predicted distribution and the
+//! - **Brier score** - mean squared error between the predicted distribution and the
 //!   one-hot actual outcome (lower is better; 0 is perfect, ~0.667 is the worst).
-//! - **Log loss** — mean negative log-probability assigned to the actual outcome
+//! - **Log loss** - mean negative log-probability assigned to the actual outcome
 //!   (lower is better; punishes confident wrong calls hard).
 //!
 //! These power the `backtest` CLI command and the integration test that guards
@@ -26,7 +26,7 @@ pub struct CalibrationReport {
 }
 
 impl CalibrationReport {
-    /// Brier/log-loss of a naive uniform (⅓, ⅓, ⅓) baseline — the bar any real
+    /// Brier/log-loss of a naive uniform (⅓, ⅓, ⅓) baseline - the bar any real
     /// model must clear. Handy for the backtest report.
     pub fn uniform_baseline(n: usize) -> Self {
         let third: f64 = 1.0 / 3.0;

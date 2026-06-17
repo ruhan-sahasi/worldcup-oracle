@@ -2,7 +2,7 @@
 //!
 //! The live provider caches API responses for a short window so repeated polls
 //! don't burn the request budget on data that hasn't changed. The lock is only ever
-//! held for the map operation itself — never across an `.await` — so it can be a
+//! held for the map operation itself - never across an `.await` - so it can be a
 //! plain `std::sync::Mutex`.
 
 use std::collections::HashMap;

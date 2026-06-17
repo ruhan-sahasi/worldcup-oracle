@@ -6,7 +6,7 @@ license.workspace = true
 authors.workspace = true
 repository.workspace = true
 rust-version.workspace = true
-description = "wc-oracle — command line + live TUI for the worldcup-oracle engine"
+description = "wc-oracle - command line + live TUI for the worldcup-oracle engine"
 
 [[bin]]
 name = "wc-oracle"

@@ -56,7 +56,7 @@ flowchart LR
     B -- "push" --> T["TUI · wc-oracle watch"]
 ```
 
-A **single task** owns all mutable state and applies events serially — no locks on
+A **single task** owns all mutable state and applies events serially - no locks on
 the hot path, no data races. Readers never touch that state: they either load the
 lock-free `arc-swap` cell (REST) or subscribe to the broadcast channel (push).
 Expensive Monte-Carlo forecasts are recomputed on a throttle and whenever a result
@@ -118,7 +118,7 @@ arithmetic average washes out toward uniform.
 
 ### Monte-Carlo tournament sim (`oracle-sim`)
 Plays the remaining group fixtures and the 32-team knockout out tens of thousands of
-times — sampling each scoreline from the goal model — to estimate every team's
+times - sampling each scoreline from the goal model - to estimate every team's
 probability of advancing, reaching each round, and winning the cup. Iterations are
 independent, so it fans out over `rayon`; per-iteration RNG seeds make a given
 `(seed, iterations)` perfectly reproducible.

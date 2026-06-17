@@ -1,7 +1,7 @@
 //! # oracle-api
 //!
 //! The transport layer: an [`axum`] application exposing the engine over HTTP and
-//! WebSocket. It is a thin shell — every handler just reads an immutable
+//! WebSocket. It is a thin shell - every handler just reads an immutable
 //! [`Snapshot`](oracle_engine::Snapshot) from the engine (lock-free) or relays the
 //! broadcast stream. No prediction logic lives here.
 //!

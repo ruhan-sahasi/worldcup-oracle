@@ -1,8 +1,8 @@
 //! Replays a *completed* tournament event-by-event.
 //!
 //! Where [`crate::SimProvider`] invents results, `ReplayProvider` takes a tournament
-//! whose matches already have final scores — a past competition, or one captured
-//! from the live API — and re-emits it as a live stream: kickoff, goals scattered
+//! whose matches already have final scores - a past competition, or one captured
+//! from the live API - and re-emits it as a live stream: kickoff, goals scattered
 //! across plausible minutes that add up to the real scoreline, then full-time. Handy
 //! for demos and for validating the engine against known outcomes.
 

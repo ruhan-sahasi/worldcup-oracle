@@ -1,8 +1,8 @@
 //! Bayesian in-match updating.
 //!
 //! Pre-match, the goal model gives full-90 scoring rates `(λ, μ)`. Once a match is
-//! live we *condition on what has already happened* — the current scoreline, the
-//! minute, and any red cards — and re-derive the distribution over the **final**
+//! live we *condition on what has already happened* - the current scoreline, the
+//! minute, and any red cards - and re-derive the distribution over the **final**
 //! result.
 //!
 //! The remaining goals for each side are modelled as independent Poisson processes
@@ -10,7 +10,7 @@
 //! the match still to play. Red cards perturb the live intensities (a team down to
 //! ten men scores less and concedes more). Combining the "goals already in" with the
 //! posterior over "goals still to come" yields live win/draw/win probabilities that
-//! update event-by-event — the engine recomputes these every time a material event
+//! update event-by-event - the engine recomputes these every time a material event
 //! arrives.
 
 use crate::poisson::poisson_pmf;
