@@ -1,0 +1,29 @@
+[package]
+name = "oracle-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "wc-oracle — command line + live TUI for the worldcup-oracle engine"
+
+[[bin]]
+name = "wc-oracle"
+path = "src/main.rs"
+
+[dependencies]
+oracle-domain.workspace = true
+oracle-ratings.workspace = true
+oracle-model.workspace = true
+oracle-sim.workspace = true
+oracle-ingest.workspace = true
+oracle-engine.workspace = true
+oracle-api.workspace = true
+clap.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+ratatui.workspace = true
+crossterm.workspace = true
+anyhow.workspace = true
+tracing-subscriber.workspace = true
