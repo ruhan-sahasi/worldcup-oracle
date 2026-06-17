@@ -1,0 +1,12 @@
+services:
+  oracle:
+    build: .
+    image: worldcup-oracle:latest
+    ports:
+      - "8080:8080"
+    environment:
+      ORACLE_ADDR: 0.0.0.0:8080
+      RUST_LOG: info
+      # Set FOOTBALL_DATA_API_KEY in a .env file to use the live feed.
+      FOOTBALL_DATA_API_KEY: ${FOOTBALL_DATA_API_KEY:-}
+    restart: unless-stopped
