@@ -1,7 +1,7 @@
 <h1 align="center">⚽ worldcup-oracle</h1>
 
 <p align="center">
-  <em>A live, ensemble World Cup prediction engine — in Rust.</em>
+  <em>A live, ensemble World Cup prediction engine in Rust.</em>
 </p>
 
 <p align="center">
@@ -11,9 +11,9 @@
   <img alt="unsafe forbidden" src="https://img.shields.io/badge/unsafe-forbidden-success.svg">
 </p>
 
-`worldcup-oracle` ingests live match events — results, goals, red cards, the running
-clock — and **continuously re-computes** every team's odds of winning each match and
-lifting the trophy. It pairs a genuinely sophisticated statistical model with the
+`worldcup-oracle` ingests live match events including results, goals, red cards, the running
+clock, and **continuously re-computes** every team's odds of winning each match and
+lifting the trophy. It pairs a sophisticated statistical model with the
 kind of systems engineering a backend role cares about: a modular crate workspace,
 a lock-free event-driven core, parallel Monte-Carlo, back-pressured ingestion, a
 REST + WebSocket API, and a live terminal dashboard.
@@ -26,17 +26,17 @@ fully offline with **zero keys and zero network**.
 
 ## ✨ What it does
 
-- **Ensemble predictions** — a Dixon-Coles bivariate-Poisson goal model + Elo ratings,
+- **Ensemble predictions** -> a Dixon-Coles bivariate-Poisson goal model + Elo ratings,
   blended in log-space, with **Bayesian in-match updating** that shifts the odds as a
   match plays out.
-- **Champion odds** — a parallel Monte-Carlo simulator plays the rest of the
+- **Champion odds** -> a parallel Monte-Carlo simulator plays the rest of the
   tournament tens of thousands of times to estimate each team's chance of advancing,
   reaching each round, and winning it all.
-- **Live, event-driven** — an async engine consumes a stream of match events and
+- **Live, event-driven** -> an async engine consumes a stream of match events and
   pushes fresh forecasts to subscribers in real time.
-- **Three pluggable data sources** behind one trait — deterministic simulation,
+- **Three pluggable data sources** behind one trait -> deterministic simulation,
   replay of a finished tournament, or the live [football-data.org](https://www.football-data.org) feed.
-- **Multiple surfaces** — a REST API, a WebSocket live stream, and a polished CLI/TUI.
+- **Multiple surfaces** -> a REST API, a WebSocket live stream, and a polished CLI/TUI.
 
 ## 🧠 The model (in one breath)
 
