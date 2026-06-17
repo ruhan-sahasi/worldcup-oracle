@@ -1,0 +1,591 @@
+//! # oracle-sim
+//!
+//! A parallel **Monte-Carlo tournament simulator**. Given the current tournament
+//! state (finished results stay fixed, everything else is uncertain) and a
+//! [`MatchSampler`] that supplies expected goals for any matchup, it plays the rest
+//! of the competition out tens of thousands of times and aggregates how often each
+//! team reaches each stage — the headline "champion odds".
+//!
+//! ## Design notes
+//! - **Embarrassingly parallel.** Each iteration is independent, so we fan out over
+//!   `rayon` and reduce per-thread tallies. Throughput scales with cores.
+//! - **Deterministic.** Each iteration's RNG is seeded from `base_seed + i`, so a
+//!   given `(seed, iterations)` reproduces exactly — essential for trustworthy demos
+//!   and tests.
+//! - **Precompute everything invariant.** Expected goals for every ordered team pair
+//!   and the base group standings (from already-played matches) are computed once;
+//!   each iteration then does nothing but sample and tally.
+//!
+//! The 2026 format is the default target: 12 groups of four, top two plus the eight
+//! best third-placed teams advance to a 32-team single-elimination knockout.
+//!
+//! > Modelling choices: the knockout bracket uses a standard seeded single-elimination
+//! > template (group winners spread against runners-up/best-thirds) rather than FIFA's
+//! > exact slotting, and in-progress matches are re-sampled from scratch rather than
+//! > conditioned on their live scoreline. Both are documented limitations, not bugs.
+#![forbid(unsafe_code)]
+
+use oracle_domain::{Stage, TeamForecast, TeamId, Tournament, TournamentForecast};
+use rand::rngs::StdRng;
+use rand::{Rng, SeedableRng};
+use rand_distr::{Distribution, Poisson};
+use rayon::prelude::*;
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+
+/// Supplies expected goals for a (neutral-venue) matchup. Implemented for the
+/// Dixon-Coles [`oracle_model::GoalModel`]; mockable in tests.
+pub trait MatchSampler: Sync {
+    /// Expected goals `(home_xg, away_xg)` for `home` vs `away` at a neutral site.
+    fn xg(&self, home: TeamId, away: TeamId) -> (f64, f64);
+}
+
+impl MatchSampler for oracle_model::GoalModel {
+    fn xg(&self, home: TeamId, away: TeamId) -> (f64, f64) {
+        // World Cup matches are played at neutral venues.
+        self.expected_goals(home, away, true)
+    }
+}
+
+/// Simulation parameters.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct SimConfig {
+    pub iterations: u64,
+    /// Base RNG seed; the run is fully reproducible for a fixed `(seed, iterations)`.
+    pub seed: u64,
+    /// Teams advancing directly from each group (2 in the 2026 format).
+    pub advance_per_group: usize,
+    /// Best third-placed teams that also advance (8 in the 2026 format).
+    pub best_thirds: usize,
+}
+
+impl Default for SimConfig {
+    fn default() -> Self {
+        Self {
+            iterations: 50_000,
+            seed: 0,
+            advance_per_group: 2,
+            best_thirds: 8,
+        }
+    }
+}
+
+/// Run the Monte-Carlo simulation and return per-team stage probabilities.
+pub fn simulate<S: MatchSampler>(
+    tournament: &Tournament,
+    sampler: &S,
+    config: SimConfig,
+) -> TournamentForecast {
+    let prep = Prepared::build(tournament, sampler, config);
+    let n = prep.teams.len();
+
+    // Fan out over iterations; each rayon task folds into its own tally, then we
+    // reduce the per-thread tallies into one.
+    let tally = (0..config.iterations)
+        .into_par_iter()
+        .fold(
+            || Tally::new(n, prep.required),
+            |mut acc, i| {
+                let mut rng = StdRng::seed_from_u64(config.seed.wrapping_add(i).wrapping_add(1));
+                let wins = prep.simulate_once(&mut rng);
+                acc.add(&wins);
+                acc
+            },
+        )
+        .reduce(|| Tally::new(n, prep.required), Tally::merge);
+
+    tally.into_forecast(&prep.teams, config.iterations)
+}
+
+/// Immutable, precomputed state shared (by reference) across all iterations.
+struct Prepared {
+    teams: Vec<TeamId>,
+    /// Expected goals for every ordered pair, indexed `eg[home_ix * n + away_ix]`.
+    eg: Vec<(f64, f64)>,
+    /// Points/goal-diff/goals-for already secured from finished group matches.
+    base: Vec<Standing>,
+    groups: Vec<GroupSim>,
+    advance_per_group: usize,
+    best_thirds: usize,
+    n: usize,
+    /// Knockout wins required to be credited with reaching each forecast stage:
+    /// `[advanced, R16, QF, SF, Final, Champion]`. Derived from the bracket depth so
+    /// the stages line up with the real 32-team format and degrade gracefully for
+    /// smaller test brackets.
+    required: [i64; 6],
+}
+
+#[derive(Clone, Copy, Default)]
+struct Standing {
+    points: i32,
+    gd: i32,
+    gf: i32,
+}
+
+struct GroupSim {
+    members: Vec<usize>,
+    /// (home_ix, away_ix) for group matches not yet finished.
+    remaining: Vec<(usize, usize)>,
+}
+
+impl Prepared {
+    fn build<S: MatchSampler>(tournament: &Tournament, sampler: &S, config: SimConfig) -> Self {
+        let teams: Vec<TeamId> = tournament.teams.iter().map(|t| t.id).collect();
+        let n = teams.len();
+        let index: HashMap<TeamId, usize> =
+            teams.iter().enumerate().map(|(i, &t)| (t, i)).collect();
+
+        // Expected-goals matrix (computed once, reused every iteration).
+        let mut eg = vec![(0.0, 0.0); n * n];
+        for (i, &home) in teams.iter().enumerate() {
+            for (j, &away) in teams.iter().enumerate() {
+                if i != j {
+                    eg[i * n + j] = sampler.xg(home, away);
+                }
+            }
+        }
+
+        // Base standings from already-played group matches.
+        let mut base = vec![Standing::default(); n];
+        for m in &tournament.matches {
+            if !matches!(m.stage, Stage::Group(_)) || !m.is_finished() {
+                continue;
+            }
+            let (Some(&h), Some(&a)) = (index.get(&m.home), index.get(&m.away)) else {
+                continue;
+            };
+            apply_result_at(&mut base, h, a, m.score.home as i32, m.score.away as i32);
+        }
+
+        // Group structure + remaining fixtures.
+        let finished: std::collections::HashSet<(usize, usize)> = tournament
+            .matches
+            .iter()
+            .filter(|m| matches!(m.stage, Stage::Group(_)) && m.is_finished())
+            .filter_map(|m| Some((*index.get(&m.home)?, *index.get(&m.away)?)))
+            .collect();
+
+        let groups = tournament
+            .groups
+            .iter()
+            .map(|g| {
+                let members: Vec<usize> = g
+                    .teams
+                    .iter()
+                    .filter_map(|t| index.get(t).copied())
+                    .collect();
+                // Round-robin among members; skip already-finished pairings.
+                let mut remaining = Vec::new();
+                for (a_pos, &a) in members.iter().enumerate() {
+                    for &b in &members[a_pos + 1..] {
+                        if finished.contains(&(a, b)) || finished.contains(&(b, a)) {
+                            continue;
+                        }
+                        remaining.push((a, b));
+                    }
+                }
+                GroupSim { members, remaining }
+            })
+            .collect::<Vec<GroupSim>>();
+
+        // How many teams qualify (fixed across iterations) → bracket size → depth.
+        let groups_with_third = groups
+            .iter()
+            .filter(|g| g.members.len() > config.advance_per_group)
+            .count();
+        let qualifier_count: usize = groups
+            .iter()
+            .map(|g| g.members.len().min(config.advance_per_group))
+            .sum::<usize>()
+            + config.best_thirds.min(groups_with_third);
+        let bracket = next_pow2(qualifier_count.max(2));
+        let total_rounds = bracket.trailing_zeros() as i64;
+        // Stage k is reached by winning `total_rounds - (5 - k)` knockout matches,
+        // i.e. counting back from the final. Clamped at 0; champion needs them all.
+        let required = [
+            0,
+            (total_rounds - 4).max(0),
+            (total_rounds - 3).max(0),
+            (total_rounds - 2).max(0),
+            (total_rounds - 1).max(0),
+            total_rounds,
+        ];
+
+        Self {
+            teams,
+            eg,
+            base,
+            groups,
+            advance_per_group: config.advance_per_group,
+            best_thirds: config.best_thirds,
+            n,
+            required,
+        }
+    }
+
+    /// Sample a single goal count from Poisson(λ).
+    fn sample_goals(rng: &mut StdRng, lambda: f64) -> i32 {
+        if lambda <= 1e-9 {
+            return 0;
+        }
+        match Poisson::new(lambda) {
+            Ok(dist) => (dist.sample(rng) as i32).min(20),
+            Err(_) => 0,
+        }
+    }
+
+    /// Sample the winner's team-index of a knockout tie (penalties break a draw,
+    /// weighted by relative strength).
+    fn sample_knockout(&self, rng: &mut StdRng, a: usize, b: usize) -> usize {
+        if a == BYE {
+            return b;
+        }
+        if b == BYE {
+            return a;
+        }
+        let (la, ma) = self.eg[a * self.n + b];
+        let gh = Self::sample_goals(rng, la);
+        let ga = Self::sample_goals(rng, ma);
+        match gh.cmp(&ga) {
+            std::cmp::Ordering::Greater => a,
+            std::cmp::Ordering::Less => b,
+            std::cmp::Ordering::Equal => {
+                // Shootout: probability team a wins ∝ its share of expected goals.
+                let p = if la + ma > 0.0 { la / (la + ma) } else { 0.5 };
+                if rng.gen::<f64>() < p {
+                    a
+                } else {
+                    b
+                }
+            }
+        }
+    }
+
+    /// Play one full tournament. Returns a per-team vector of knockout rounds won:
+    /// `-1` = did not qualify, `0` = qualified but lost first knockout match,
+    /// `total_rounds` = champion.
+    fn simulate_once(&self, rng: &mut StdRng) -> Vec<i64> {
+        let mut wins = vec![-1i64; self.n];
+
+        // ---- Group stage ----
+        let mut winners = Vec::new();
+        let mut runners = Vec::new();
+        let mut thirds: Vec<(usize, Standing)> = Vec::new();
+
+        for group in &self.groups {
+            let mut table: Vec<(usize, Standing)> =
+                group.members.iter().map(|&m| (m, self.base[m])).collect();
+            // Index within `table` by team-ix for quick mutation.
+            let pos: HashMap<usize, usize> = table
+                .iter()
+                .enumerate()
+                .map(|(i, (ix, _))| (*ix, i))
+                .collect();
+            let mut standings: Vec<Standing> = table.iter().map(|(_, s)| *s).collect();
+
+            for &(h, a) in &group.remaining {
+                let gh = Self::sample_goals(rng, self.eg[h * self.n + a].0);
+                let ga = Self::sample_goals(rng, self.eg[h * self.n + a].1);
+                apply_result_at(&mut standings, pos[&h], pos[&a], gh, ga);
+            }
+            for (i, (_, s)) in table.iter_mut().enumerate() {
+                *s = standings[i];
+            }
+            rank(&mut table);
+
+            for (rank_ix, (team_ix, standing)) in table.into_iter().enumerate() {
+                if rank_ix < self.advance_per_group {
+                    if rank_ix == 0 {
+                        winners.push(team_ix);
+                    } else {
+                        runners.push(team_ix);
+                    }
+                } else if rank_ix == self.advance_per_group {
+                    thirds.push((team_ix, standing));
+                }
+            }
+        }
+
+        // Best third-placed teams.
+        thirds.sort_by(|a, b| cmp_standing(&b.1, &a.1));
+        let qualified_thirds: Vec<usize> = thirds
+            .into_iter()
+            .take(self.best_thirds)
+            .map(|(ix, _)| ix)
+            .collect();
+
+        // ---- Seed the knockout bracket ----
+        // Order: winners, then best thirds, then runners-up; padded with byes to a
+        // power of two. Reflection pairing keeps strong winners away from each other.
+        let mut seed_order: Vec<usize> = Vec::new();
+        seed_order.extend(&winners);
+        seed_order.extend(&qualified_thirds);
+        seed_order.extend(&runners);
+        for &ix in &seed_order {
+            wins[ix] = 0; // qualified for the knockouts
+        }
+        let bracket = next_pow2(seed_order.len().max(2));
+        seed_order.resize(bracket, BYE);
+
+        // ---- Knockout: round 1 by reflection, then fold adjacent winners ----
+        let mut survivors: Vec<usize> = Vec::with_capacity(bracket / 2);
+        for i in 0..bracket / 2 {
+            let w = self.sample_knockout(rng, seed_order[i], seed_order[bracket - 1 - i]);
+            if w != BYE {
+                wins[w] += 1;
+            }
+            survivors.push(w);
+        }
+        while survivors.len() > 1 {
+            let mut next = Vec::with_capacity(survivors.len().div_ceil(2));
+            let mut k = 0;
+            while k + 1 < survivors.len() {
+                let w = self.sample_knockout(rng, survivors[k], survivors[k + 1]);
+                if w != BYE {
+                    wins[w] += 1;
+                }
+                next.push(w);
+                k += 2;
+            }
+            survivors = next;
+        }
+
+        wins
+    }
+}
+
+/// Sentinel team-index representing a bracket bye.
+const BYE: usize = usize::MAX;
+
+fn next_pow2(x: usize) -> usize {
+    let mut p = 1;
+    while p < x {
+        p <<= 1;
+    }
+    p
+}
+
+fn apply_result_at(table: &mut [Standing], h: usize, a: usize, gh: i32, ga: i32) {
+    table[h].gf += gh;
+    table[h].gd += gh - ga;
+    table[a].gf += ga;
+    table[a].gd += ga - gh;
+    match gh.cmp(&ga) {
+        std::cmp::Ordering::Greater => table[h].points += 3,
+        std::cmp::Ordering::Less => table[a].points += 3,
+        std::cmp::Ordering::Equal => {
+            table[h].points += 1;
+            table[a].points += 1;
+        }
+    }
+}
+
+fn cmp_standing(a: &Standing, b: &Standing) -> std::cmp::Ordering {
+    a.points
+        .cmp(&b.points)
+        .then(a.gd.cmp(&b.gd))
+        .then(a.gf.cmp(&b.gf))
+}
+
+/// Rank a group table best-first (points, then goal difference, then goals for,
+/// with team-index as a deterministic final tie-break).
+fn rank(table: &mut [(usize, Standing)]) {
+    table.sort_by(|(ia, a), (ib, b)| {
+        cmp_standing(b, a).then(ia.cmp(ib)) // descending standing, ascending index
+    });
+}
+
+/// Per-team cumulative counts of reaching each stage.
+struct Tally {
+    /// `counts[team_ix]` = [advanced, R16, QF, SF, Final, Champion].
+    counts: Vec<[u64; 6]>,
+    /// Knockout wins required for each stage (see [`Prepared::required`]).
+    required: [i64; 6],
+}
+
+impl Tally {
+    fn new(n: usize, required: [i64; 6]) -> Self {
+        Self {
+            counts: vec![[0; 6]; n],
+            required,
+        }
+    }
+
+    fn add(&mut self, wins: &[i64]) {
+        for (ix, &w) in wins.iter().enumerate() {
+            if w < 0 {
+                continue; // did not qualify
+            }
+            for (k, &need) in self.required.iter().enumerate() {
+                if w >= need {
+                    self.counts[ix][k] += 1;
+                }
+            }
+        }
+    }
+
+    fn merge(mut self, other: Self) -> Self {
+        for (a, b) in self.counts.iter_mut().zip(other.counts.iter()) {
+            for k in 0..6 {
+                a[k] += b[k];
+            }
+        }
+        self
+    }
+
+    fn into_forecast(self, teams: &[TeamId], iterations: u64) -> TournamentForecast {
+        let denom = iterations.max(1) as f64;
+        let team_forecasts = teams
+            .iter()
+            .enumerate()
+            .map(|(ix, &team)| {
+                let c = self.counts[ix];
+                TeamForecast {
+                    team,
+                    p_advance_group: c[0] as f64 / denom,
+                    p_round_of_16: c[1] as f64 / denom,
+                    p_quarter_final: c[2] as f64 / denom,
+                    p_semi_final: c[3] as f64 / denom,
+                    p_final: c[4] as f64 / denom,
+                    p_champion: c[5] as f64 / denom,
+                }
+            })
+            .collect();
+        TournamentForecast {
+            iterations,
+            teams: team_forecasts,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use oracle_domain::{Confederation, Group, Match, MatchId, MatchStatus, Scoreline, Team};
+
+    /// A sampler where lower team-id = stronger (scores more, concedes less).
+    struct RankSampler;
+    impl MatchSampler for RankSampler {
+        fn xg(&self, home: TeamId, away: TeamId) -> (f64, f64) {
+            let strength = |t: TeamId| 2.0 - 0.1 * t.0 as f64; // team 0 strongest
+            let h = (1.2 + strength(home) - strength(away)).max(0.2);
+            let a = (1.2 + strength(away) - strength(home)).max(0.2);
+            (h, a)
+        }
+    }
+
+    fn tiny_tournament() -> Tournament {
+        // 8 teams, 2 groups of 4, no matches played yet.
+        let mut t = Tournament::new("Test Cup");
+        for i in 0..8u32 {
+            t.teams.push(Team::new(
+                i,
+                format!("T{i}"),
+                format!("T{i}"),
+                Confederation::Uefa,
+            ));
+        }
+        t.groups.push(Group {
+            name: 'A',
+            teams: vec![TeamId(0), TeamId(1), TeamId(2), TeamId(3)],
+        });
+        t.groups.push(Group {
+            name: 'B',
+            teams: vec![TeamId(4), TeamId(5), TeamId(6), TeamId(7)],
+        });
+        t
+    }
+
+    fn champion_prob(f: &TournamentForecast, team: u32) -> f64 {
+        f.teams
+            .iter()
+            .find(|tf| tf.team == TeamId(team))
+            .map(|tf| tf.p_champion)
+            .unwrap()
+    }
+
+    #[test]
+    fn probabilities_are_coherent() {
+        let t = tiny_tournament();
+        let f = simulate(
+            &t,
+            &RankSampler,
+            SimConfig {
+                iterations: 4000,
+                ..Default::default()
+            },
+        );
+
+        // Champion probabilities across all teams sum to ~1.
+        let total: f64 = f.teams.iter().map(|tf| tf.p_champion).sum();
+        assert!((total - 1.0).abs() < 0.02, "champion mass = {total}");
+
+        for tf in &f.teams {
+            // Monotonic nesting: champion ⊆ final ⊆ … ⊆ advanced.
+            assert!(tf.p_champion <= tf.p_final + 1e-9);
+            assert!(tf.p_final <= tf.p_semi_final + 1e-9);
+            assert!(tf.p_semi_final <= tf.p_quarter_final + 1e-9);
+            assert!(tf.p_quarter_final <= tf.p_round_of_16 + 1e-9);
+            assert!(tf.p_round_of_16 <= tf.p_advance_group + 1e-9);
+            assert!(tf.p_advance_group <= 1.0 + 1e-9);
+        }
+    }
+
+    #[test]
+    fn stronger_team_wins_more_often() {
+        let t = tiny_tournament();
+        let f = simulate(
+            &t,
+            &RankSampler,
+            SimConfig {
+                iterations: 4000,
+                ..Default::default()
+            },
+        );
+        assert!(
+            champion_prob(&f, 0) > champion_prob(&f, 7),
+            "strongest team should out-win the weakest"
+        );
+    }
+
+    #[test]
+    fn deterministic_for_fixed_seed() {
+        let t = tiny_tournament();
+        let cfg = SimConfig {
+            iterations: 2000,
+            seed: 42,
+            ..Default::default()
+        };
+        let a = simulate(&t, &RankSampler, cfg);
+        let b = simulate(&t, &RankSampler, cfg);
+        assert_eq!(a.teams, b.teams, "same seed ⇒ identical forecast");
+    }
+
+    #[test]
+    fn finished_results_are_respected() {
+        // Give team 3 (normally weak) three big wins so it tops group A.
+        let mut t = tiny_tournament();
+        let mk = |id, h, a, sh, sa| Match {
+            id: MatchId(id),
+            home: TeamId(h),
+            away: TeamId(a),
+            stage: Stage::Group('A'),
+            kickoff: chrono::DateTime::from_timestamp(0, 0).unwrap(),
+            status: MatchStatus::Finished,
+            score: Scoreline::new(sh, sa),
+        };
+        t.matches.push(mk(1, 3, 0, 5, 0));
+        t.matches.push(mk(2, 3, 1, 5, 0));
+        t.matches.push(mk(3, 3, 2, 5, 0));
+        let f = simulate(
+            &t,
+            &RankSampler,
+            SimConfig {
+                iterations: 4000,
+                ..Default::default()
+            },
+        );
+        let p3 = f.teams.iter().find(|x| x.team == TeamId(3)).unwrap();
+        assert!(p3.p_advance_group > 0.9, "team 3 already has 9 points");
+    }
+}

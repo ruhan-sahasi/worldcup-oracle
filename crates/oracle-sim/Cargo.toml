@@ -1,0 +1,25 @@
+[package]
+name = "oracle-sim"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Parallel Monte-Carlo tournament simulator (group + knockout) for worldcup-oracle"
+
+[dependencies]
+oracle-domain.workspace = true
+oracle-model.workspace = true
+rand.workspace = true
+rand_distr.workspace = true
+rayon.workspace = true
+serde.workspace = true
+
+[dev-dependencies]
+criterion = "0.5"
+chrono.workspace = true
+
+[[bench]]
+name = "tournament"
+harness = false
