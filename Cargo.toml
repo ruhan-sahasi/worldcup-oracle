@@ -1,0 +1,64 @@
+[workspace]
+resolver = "2"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+authors = ["Ruhan Sahasi <ruhan@marlo.today>"]
+repository = "https://github.com/ruhan-sahasi/worldcup-oracle"
+rust-version = "1.80"
+description = "A live, ensemble World Cup prediction engine in Rust"
+
+[workspace.dependencies]
+# ---- internal crates ----
+oracle-domain = { path = "crates/oracle-domain", version = "0.1.0" }
+oracle-ratings = { path = "crates/oracle-ratings", version = "0.1.0" }
+oracle-model = { path = "crates/oracle-model", version = "0.1.0" }
+oracle-sim = { path = "crates/oracle-sim", version = "0.1.0" }
+oracle-ingest = { path = "crates/oracle-ingest", version = "0.1.0" }
+oracle-engine = { path = "crates/oracle-engine", version = "0.1.0" }
+oracle-api = { path = "crates/oracle-api", version = "0.1.0" }
+
+# ---- serialization / data ----
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+chrono = { version = "0.4", features = ["serde", "clock"] }
+
+# ---- errors ----
+thiserror = "1"
+anyhow = "1"
+
+# ---- async runtime / web ----
+tokio = { version = "1", features = ["full"] }
+tokio-util = "0.7"
+tokio-stream = "0.1"
+futures-util = "0.3"
+async-trait = "0.1"
+axum = { version = "0.7", features = ["ws"] }
+tower = "0.4"
+tower-http = { version = "0.5", features = ["trace", "cors"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+
+# ---- cli / tui ----
+clap = { version = "4", features = ["derive"] }
+ratatui = "0.28"
+crossterm = "0.28"
+
+# ---- math / concurrency ----
+rand = "0.8"
+rand_distr = "0.4"
+rayon = "1"
+arc-swap = "1"
+dashmap = "6"
+
+# ---- observability ----
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+panic = "abort"
