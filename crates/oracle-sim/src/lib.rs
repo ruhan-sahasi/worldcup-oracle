@@ -37,15 +37,21 @@ use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
-/// Live state of an in-progress match, supplied to [`simulate_with_live`] so the
-/// simulator samples the *remainder* of the match conditioned on what's already
-/// happened, instead of replaying it from 0-0.
-#[derive(Debug, Clone, Copy)]
+/// Live state of an in-progress (or lineup-announced) match, supplied to
+/// [`simulate_with_live`] so the simulator samples the *remainder* conditioned on what's
+/// already happened instead of replaying from 0-0. The `*_adj` fields are log-space
+/// attack/defense adjustments from a confirmed lineup (positive = stronger); a match with
+/// an announced lineup but not yet kicked off is passed as `minute 0` with these set.
+#[derive(Debug, Clone, Copy, Default)]
 pub struct InProgress {
     pub score: Scoreline,
     pub minute: u16,
     pub home_reds: u8,
     pub away_reds: u8,
+    pub home_attack_adj: f64,
+    pub home_defense_adj: f64,
+    pub away_attack_adj: f64,
+    pub away_defense_adj: f64,
 }
 
 /// Supplies expected goals for a (neutral-venue) matchup. Implemented for the
@@ -232,9 +238,14 @@ impl Prepared {
                         let h = *index.get(&m.home)?;
                         let a = *index.get(&m.away)?;
                         let full = eg[h * n + a];
-                        // In-progress matches keep their score and sample only the rest.
+                        // In-progress matches keep their score and sample only the rest;
+                        // a confirmed lineup adjusts the base goal rates first.
                         let (rates, current) = match live.get(&m.id) {
                             Some(ip) => {
+                                let adj_lambda =
+                                    full.0 * (ip.home_attack_adj - ip.away_defense_adj).exp();
+                                let adj_mu =
+                                    full.1 * (ip.away_attack_adj - ip.home_defense_adj).exp();
                                 let state = LiveState {
                                     current: ip.score,
                                     minute: ip.minute,
@@ -242,7 +253,7 @@ impl Prepared {
                                     away_red_cards: ip.away_reds,
                                 };
                                 (
-                                    remaining_rates(full.0, full.1, &state, &live_config),
+                                    remaining_rates(adj_lambda, adj_mu, &state, &live_config),
                                     ip.score,
                                 )
                             }
@@ -703,8 +714,7 @@ mod tests {
             InProgress {
                 score: Scoreline::new(0, 3),
                 minute: 85,
-                home_reds: 0,
-                away_reds: 0,
+                ..Default::default()
             },
         );
         let conditioned = simulate_with_live(&t, &RankSampler, cfg, &live, LiveConfig::default());

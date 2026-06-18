@@ -71,6 +71,23 @@ impl SimProvider {
         let mut rng = StdRng::seed_from_u64(self.seed ^ (u64::from(match_id.0) << 8));
         let mut score = Scoreline::new(0, 0);
 
+        // Announce confirmed lineups just before kickoff. Each side rests its star ~25% of
+        // the time, so the lineup-aware adjustment visibly moves the odds.
+        let drop_home_star = rng.gen_bool(0.25);
+        let drop_away_star = rng.gen_bool(0.25);
+        send(
+            tx,
+            MatchEvent::new(
+                match_id,
+                0,
+                EventKind::Lineup {
+                    home: data::starting_lineup(home, drop_home_star),
+                    away: data::starting_lineup(away, drop_away_star),
+                },
+            ),
+        )
+        .await?;
+
         send(tx, MatchEvent::new(match_id, 0, EventKind::KickOff)).await?;
 
         for minute in 1..=90u16 {
@@ -203,21 +220,30 @@ mod tests {
             tokio::spawn(async move { p.run(tx, cancel).await })
         };
 
-        // The feed opens with a health heartbeat, then the first match kicks off.
+        // The feed opens with a health heartbeat.
         let first = rx.recv().await.expect("at least one event");
         assert!(matches!(
             first.kind,
             EventKind::SourceStatus { healthy: true }
         ));
-        let second = rx.recv().await.expect("a second event");
-        assert!(matches!(second.kind, EventKind::KickOff));
-
-        // Drain a few more, then cancel and ensure the task winds down.
-        for _ in 0..20 {
-            if rx.recv().await.is_none() {
-                break;
+        // The first match announces a lineup, then kicks off.
+        let mut saw_lineup = false;
+        let mut saw_kickoff = false;
+        for _ in 0..30 {
+            match rx.recv().await {
+                Some(ev) => match ev.kind {
+                    EventKind::Lineup { .. } => saw_lineup = true,
+                    EventKind::KickOff => {
+                        saw_kickoff = true;
+                        break;
+                    }
+                    _ => {}
+                },
+                None => break,
             }
         }
+        assert!(saw_lineup, "expected a lineup announcement");
+        assert!(saw_kickoff, "expected a kickoff");
         cancel.cancel();
         while rx.recv().await.is_some() {}
         let _ = handle.await.unwrap();

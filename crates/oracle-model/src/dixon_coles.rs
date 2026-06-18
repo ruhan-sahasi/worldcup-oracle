@@ -214,20 +214,58 @@ impl GoalModel {
     /// Expected goals `(λ_home, μ_away)` for a matchup. `neutral` removes the home
     /// edge (the World Cup default).
     pub fn expected_goals(&self, home: TeamId, away: TeamId, neutral: bool) -> (f64, f64) {
+        self.expected_goals_adjusted(home, away, neutral, (0.0, 0.0), (0.0, 0.0))
+    }
+
+    /// Expected goals with per-team lineup adjustments, each `(attack_delta, defense_delta)`
+    /// in log space where positive means stronger. A confirmed lineup missing a key player
+    /// supplies a negative attack delta, which lowers that team's expected goals and raises
+    /// the opponent's. With zero adjustments this equals [`expected_goals`].
+    pub fn expected_goals_adjusted(
+        &self,
+        home: TeamId,
+        away: TeamId,
+        neutral: bool,
+        home_adj: (f64, f64),
+        away_adj: (f64, f64),
+    ) -> (f64, f64) {
         let adv = if neutral { 0.0 } else { self.home_advantage };
-        let lambda = (self.intercept + self.attack_of(home) - self.defense_of(away) + adv).exp();
-        let mu = (self.intercept + self.attack_of(away) - self.defense_of(home)).exp();
+        let (h_atk, h_def) = home_adj;
+        let (a_atk, a_def) = away_adj;
+        let lambda = (self.intercept + self.attack_of(home) - self.defense_of(away) + adv + h_atk
+            - a_def)
+            .exp();
+        let mu =
+            (self.intercept + self.attack_of(away) - self.defense_of(home) + a_atk - h_def).exp();
         (lambda, mu)
     }
 
-    /// The full joint score distribution with the Dixon-Coles low-score correction.
-    pub fn score_grid(&self, home: TeamId, away: TeamId, neutral: bool) -> ScoreGrid {
-        let (lambda, mu) = self.expected_goals(home, away, neutral);
+    /// Build the Dixon-Coles score grid from explicit goal rates.
+    fn grid_from(&self, lambda: f64, mu: f64) -> ScoreGrid {
         ScoreGrid::from_fn(self.max_goals, |h, a| {
             poisson_pmf(h as u32, lambda)
                 * poisson_pmf(a as u32, mu)
                 * tau(h, a, lambda, mu, self.rho)
         })
+    }
+
+    /// The full joint score distribution with the Dixon-Coles low-score correction.
+    pub fn score_grid(&self, home: TeamId, away: TeamId, neutral: bool) -> ScoreGrid {
+        let (lambda, mu) = self.expected_goals(home, away, neutral);
+        self.grid_from(lambda, mu)
+    }
+
+    /// As [`score_grid`], with per-team lineup adjustments applied to the goal rates.
+    pub fn score_grid_adjusted(
+        &self,
+        home: TeamId,
+        away: TeamId,
+        neutral: bool,
+        home_adj: (f64, f64),
+        away_adj: (f64, f64),
+    ) -> ScoreGrid {
+        let (lambda, mu) = self.expected_goals_adjusted(home, away, neutral, home_adj, away_adj);
+        self.grid_from(lambda, mu)
     }
 
     /// Pre-match win/draw/win probabilities for a matchup.
@@ -366,6 +404,29 @@ mod tests {
         assert!((p.sum() - 1.0).abs() < 1e-9);
         assert!(p.home_win > p.away_win);
         assert!(p.home_win > 0.5);
+    }
+
+    #[test]
+    fn lineup_penalty_lowers_expected_goals_and_win_prob() {
+        let model = GoalModel::fit(&synthetic_history(), DixonColesConfig::default());
+        let (base_lambda, _) = model.expected_goals(t(1), t(2), true);
+        // Home team fields a weakened attack (a missing key player).
+        let (weak_lambda, _) =
+            model.expected_goals_adjusted(t(1), t(2), true, (-0.4, 0.0), (0.0, 0.0));
+        assert!(
+            weak_lambda < base_lambda,
+            "a negative attack delta lowers home xG"
+        );
+
+        let base = model.outcome_probabilities(t(1), t(2), true);
+        let weak = model
+            .score_grid_adjusted(t(1), t(2), true, (-0.4, 0.0), (0.0, 0.0))
+            .outcome_probabilities();
+        assert!(
+            weak.home_win < base.home_win,
+            "weakened home team is less favoured"
+        );
+        assert!((weak.sum() - 1.0).abs() < 1e-9);
     }
 
     #[test]

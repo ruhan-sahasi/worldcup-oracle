@@ -229,9 +229,12 @@ async fn event_loop(
                 Some(event) => {
                     let landed = state.apply_event(&event, &engine.metrics);
                     engine.metrics.events_processed.fetch_add(1, Ordering::Relaxed);
-                    // Recompute when a result lands OR a score-changing event arrives, so
-                    // the tournament forecast reflects live scores, not just full time.
-                    if landed || event.kind.is_material() {
+                    // Recompute when a result lands, a score-changing event arrives, or a
+                    // lineup is confirmed, so the forecast reflects live scores and lineups.
+                    if landed
+                        || event.kind.is_material()
+                        || matches!(event.kind, EventKind::Lineup { .. })
+                    {
                         state.recompute_forecast();
                         engine.metrics.forecasts_computed.fetch_add(1, Ordering::Relaxed);
                     }
@@ -261,6 +264,12 @@ struct LiveMatch {
     minute: u16,
     home_reds: u8,
     away_reds: u8,
+    /// Log-space attack/defense adjustments from a confirmed lineup (positive = stronger).
+    /// All zero until a `Lineup` event arrives.
+    home_attack_adj: f64,
+    home_defense_adj: f64,
+    away_attack_adj: f64,
+    away_defense_adj: f64,
 }
 
 impl LiveMatch {
@@ -275,7 +284,26 @@ impl LiveMatch {
             minute,
             home_reds: 0,
             away_reds: 0,
+            home_attack_adj: 0.0,
+            home_defense_adj: 0.0,
+            away_attack_adj: 0.0,
+            away_defense_adj: 0.0,
         }
+    }
+
+    fn has_lineup(&self) -> bool {
+        self.home_attack_adj != 0.0
+            || self.home_defense_adj != 0.0
+            || self.away_attack_adj != 0.0
+            || self.away_defense_adj != 0.0
+    }
+
+    fn home_adj(&self) -> (f64, f64) {
+        (self.home_attack_adj, self.home_defense_adj)
+    }
+
+    fn away_adj(&self) -> (f64, f64) {
+        (self.away_attack_adj, self.away_defense_adj)
     }
 }
 
@@ -399,11 +427,22 @@ impl EngineState {
                     };
                     lm.minute = event.minute;
                 }
+                EventKind::Lineup {
+                    home: home_xi,
+                    away: away_xi,
+                } => {
+                    // A confirmed lineup adjusts each team's effective attack/defense.
+                    let (h_atk, h_def) = oracle_ingest::data::lineup_adjustment(home, home_xi);
+                    let (a_atk, a_def) = oracle_ingest::data::lineup_adjustment(away, away_xi);
+                    lm.home_attack_adj = h_atk;
+                    lm.home_defense_adj = h_def;
+                    lm.away_attack_adj = a_atk;
+                    lm.away_defense_adj = a_def;
+                }
                 // SourceStatus is handled above the match lookup; the rest are no-ops.
                 EventKind::SourceStatus { .. }
                 | EventKind::HalfTime
-                | EventKind::YellowCard { .. }
-                | EventKind::Lineup { .. } => {}
+                | EventKind::YellowCard { .. } => {}
             }
         }
 
@@ -418,12 +457,13 @@ impl EngineState {
     }
 
     fn recompute_forecast(&mut self) {
-        // Condition any in-progress match on its live state, so the tournament forecast
-        // tracks live scores instead of treating every unfinished match as 0-0.
+        // Condition the forecast on live state: matches in play (sample the remainder) and
+        // matches with a confirmed lineup (adjusted goal rates), instead of treating every
+        // unfinished match as a fresh, full-strength 0-0.
         let live: HashMap<MatchId, InProgress> = self
             .live
             .iter()
-            .filter(|(_, lm)| matches!(lm.status, MatchStatus::Live { .. }))
+            .filter(|(_, lm)| matches!(lm.status, MatchStatus::Live { .. }) || lm.has_lineup())
             .map(|(&id, lm)| {
                 (
                     id,
@@ -432,6 +472,10 @@ impl EngineState {
                         minute: lm.minute,
                         home_reds: lm.home_reds,
                         away_reds: lm.away_reds,
+                        home_attack_adj: lm.home_attack_adj,
+                        home_defense_adj: lm.home_defense_adj,
+                        away_attack_adj: lm.away_attack_adj,
+                        away_defense_adj: lm.away_defense_adj,
                     },
                 )
             })
@@ -459,7 +503,13 @@ impl EngineState {
             None => (m.status, m.score, 0, 0, 0),
         };
         const NEUTRAL: bool = true;
-        let (lambda, mu) = self.model.expected_goals(m.home, m.away, NEUTRAL);
+        // Apply any confirmed-lineup adjustment to this match's goal rates.
+        let (home_adj, away_adj) = lm
+            .map(|l| (l.home_adj(), l.away_adj()))
+            .unwrap_or(((0.0, 0.0), (0.0, 0.0)));
+        let (lambda, mu) = self
+            .model
+            .expected_goals_adjusted(m.home, m.away, NEUTRAL, home_adj, away_adj);
 
         let (probabilities, score_grid, most_likely_score) = match status {
             MatchStatus::Live { .. } => {
@@ -476,8 +526,10 @@ impl EngineState {
             }
             MatchStatus::Finished => (one_hot(score.outcome()), None, None),
             MatchStatus::Scheduled | MatchStatus::Postponed => {
-                // Pre-match: blend the Dixon-Coles grid with the Elo ratings.
-                let grid = self.model.score_grid(m.home, m.away, NEUTRAL);
+                // Pre-match: blend the (lineup-adjusted) Dixon-Coles grid with Elo.
+                let grid = self
+                    .model
+                    .score_grid_adjusted(m.home, m.away, NEUTRAL, home_adj, away_adj);
                 let dc = grid.outcome_probabilities();
                 let elo = self.ratings.win_probabilities(m.home, m.away, NEUTRAL);
                 let blended = self.ensemble.blend(&[dc, elo]);
@@ -660,5 +712,33 @@ mod tests {
             &metrics,
         );
         assert!(state.source_healthy, "recovery marks it healthy again");
+    }
+
+    #[test]
+    fn benching_the_star_lowers_a_teams_win_probability() {
+        let mut state = fresh_state();
+        let metrics = Metrics::default();
+        let m = state.tournament.matches[0].clone();
+
+        let baseline = state.predict_match(&m).probabilities.home_win;
+
+        // Confirmed lineup: the home side benches its star, the away side is full strength.
+        state.apply_event(
+            &MatchEvent::new(
+                m.id,
+                0,
+                EventKind::Lineup {
+                    home: data::starting_lineup(m.home, true),
+                    away: data::starting_lineup(m.away, false),
+                },
+            ),
+            &metrics,
+        );
+
+        let weakened = state.predict_match(&m).probabilities.home_win;
+        assert!(
+            weakened < baseline,
+            "benching the home star should lower home win probability ({baseline:.3} -> {weakened:.3})"
+        );
     }
 }

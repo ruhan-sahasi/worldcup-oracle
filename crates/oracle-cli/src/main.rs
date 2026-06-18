@@ -57,13 +57,17 @@ enum Command {
         #[arg(long)]
         away: String,
     },
-    /// Backtest the model on synthetic history and report calibration metrics.
+    /// Backtest the model and benchmark it against the bookmaker.
     Backtest {
-        /// Total synthetic matches (split 80/20 train/test by recency).
+        /// Total synthetic matches when no --data file is given.
         #[arg(long, default_value_t = 4000)]
         matches: usize,
         #[arg(long, default_value_t = 7)]
         seed: u64,
+        /// Path to a football-data.co.uk style results CSV (real data + odds). When set,
+        /// overrides the synthetic dataset.
+        #[arg(long)]
+        data: Option<std::path::PathBuf>,
     },
     /// Run the REST + WebSocket server.
     Serve {
@@ -85,7 +89,11 @@ async fn main() -> anyhow::Result<()> {
     match cli.command {
         Command::Simulate { iters, seed, top } => cmd_simulate(iters, seed, top),
         Command::Predict { home, away } => cmd_predict(&home, &away),
-        Command::Backtest { matches, seed } => cmd_backtest(matches, seed),
+        Command::Backtest {
+            matches,
+            seed,
+            data,
+        } => cmd_backtest(matches, seed, data),
         Command::Serve { addr } => cmd_serve(addr).await,
         Command::Watch { speed } => watch::run(speed).await,
     }
@@ -223,65 +231,91 @@ fn top_scorelines(grid: &ScoreGrid, n: usize) -> Vec<(usize, usize, f64)> {
     cells
 }
 
-fn cmd_backtest(n_matches: usize, seed: u64) -> anyhow::Result<()> {
-    use oracle_model::{score, DixonColesConfig};
+fn cmd_backtest(
+    n_matches: usize,
+    seed: u64,
+    data_path: Option<std::path::PathBuf>,
+) -> anyhow::Result<()> {
+    use oracle_model::{score, DixonColesConfig, Observation};
 
-    let mut history = data::synthetic_history(n_matches, seed);
-    // Three-way temporal split: fit models on the oldest 60%, *learn the ensemble
-    // weights* on the next 20% (validation), and report on the most recent 20% (test).
-    history.sort_by(|a, b| {
-        b.age_days
-            .partial_cmp(&a.age_days)
+    // Real CSV when --data is given, else synthetic history with a synthetic market line.
+    let (mut records, source, real_data) = match &data_path {
+        Some(p) => (data::load_results_csv(p)?, format!("{}", p.display()), true),
+        None => (
+            data::synthetic_history_with_market(n_matches, seed),
+            format!("{n_matches} synthetic matches"),
+            false,
+        ),
+    };
+    if records.len() < 50 {
+        anyhow::bail!(
+            "need at least 50 matches to backtest (got {})",
+            records.len()
+        );
+    }
+
+    // Three-way temporal split: fit on the oldest 60%, learn the ensemble weights on the
+    // next 20% (validation), report on the most recent 20% (test).
+    records.sort_by(|a, b| {
+        b.obs
+            .age_days
+            .partial_cmp(&a.obs.age_days)
             .unwrap_or(std::cmp::Ordering::Equal)
     });
-    let n = history.len();
+    let n = records.len();
     let train_end = n * 6 / 10;
     let val_end = n * 8 / 10;
-    let train = &history[..train_end];
-    let validation = &history[train_end..val_end];
-    let test = &history[val_end..];
+    let train_obs: Vec<Observation> = records[..train_end].iter().map(|r| r.obs).collect();
+    let validation = &records[train_end..val_end];
+    let test = &records[val_end..];
 
-    // Fit the goal model, and build Elo by replaying the training results.
-    let model = GoalModel::fit(train, DixonColesConfig::default());
+    // Fit the goal model and build Elo by replaying the training results. For synthetic
+    // data we can also seed Elo from known strengths; real CSV teams are interned, so Elo
+    // simply learns from the training matches.
+    let model = GoalModel::fit(&train_obs, DixonColesConfig::default());
     let mut ratings = RatingStore::with_defaults();
-    for (team, rating) in data::team_strengths() {
-        ratings.seed(team, rating);
+    if !real_data {
+        for (team, rating) in data::team_strengths() {
+            ratings.seed(team, rating);
+        }
     }
-    for obs in train {
-        ratings.record(obs.home, obs.away, obs.score, true);
+    for r in &records[..train_end] {
+        ratings.record(r.obs.home, r.obs.away, r.obs.score, true);
     }
 
     // Learn the ensemble weights + temperature on the validation split.
     let mut val_preds = Vec::new();
     let mut val_actuals = Vec::new();
-    for obs in validation {
+    for r in validation {
         val_preds.push(vec![
-            model.outcome_probabilities(obs.home, obs.away, true),
-            ratings.win_probabilities(obs.home, obs.away, true),
+            model.outcome_probabilities(r.obs.home, r.obs.away, true),
+            ratings.win_probabilities(r.obs.home, r.obs.away, true),
         ]);
-        val_actuals.push(obs.score.outcome());
+        val_actuals.push(r.obs.score.outcome());
     }
     let ensemble = Ensemble::fit(&val_preds, &val_actuals, 2);
 
-    // Evaluate Dixon-Coles, Elo, and the learned ensemble on the held-out test split.
+    // Evaluate everything (incl. the bookmaker) on the held-out test split.
     let mut dc_preds = Vec::new();
     let mut elo_preds = Vec::new();
     let mut ens_preds = Vec::new();
-    for obs in test {
-        let actual = obs.score.outcome();
-        let dc = model.outcome_probabilities(obs.home, obs.away, true);
-        let elo = ratings.win_probabilities(obs.home, obs.away, true);
+    let mut market_preds = Vec::new();
+    for r in test {
+        let actual = r.obs.score.outcome();
+        let dc = model.outcome_probabilities(r.obs.home, r.obs.away, true);
+        let elo = ratings.win_probabilities(r.obs.home, r.obs.away, true);
         dc_preds.push((dc, actual));
         elo_preds.push((elo, actual));
         ens_preds.push((ensemble.blend(&[dc, elo]), actual));
+        if let Some(market) = r.market {
+            market_preds.push((market, actual));
+        }
     }
 
-    let baseline = oracle_model::CalibrationReport::uniform_baseline(test.len());
-
     println!(
-        "\nBacktest on {} synthetic matches  (train {} / val {} / test {})\n",
-        n_matches,
-        train.len(),
+        "\nBacktest on {}  (train {} / val {} / test {})\n",
+        source,
+        train_obs.len(),
         validation.len(),
         test.len()
     );
@@ -299,10 +333,19 @@ fn cmd_backtest(n_matches: usize, seed: u64) -> anyhow::Result<()> {
             r.accuracy * 100.0
         );
     };
-    row("Uniform baseline", baseline);
+    row(
+        "Uniform baseline",
+        oracle_model::CalibrationReport::uniform_baseline(test.len()),
+    );
     row("Dixon-Coles", score(&dc_preds));
     row("Elo", score(&elo_preds));
     row("Ensemble (learned)", score(&ens_preds));
+    if market_preds.is_empty() {
+        println!("  Market (bookmaker)        (no odds in this dataset)");
+    } else {
+        row("Market (bookmaker)", score(&market_preds));
+    }
+
     let wsum: f64 = ensemble.weights.iter().sum();
     println!(
         "\n  learned weights: Dixon-Coles {:.2} / Elo {:.2}   temperature {:.2}",
@@ -310,7 +353,7 @@ fn cmd_backtest(n_matches: usize, seed: u64) -> anyhow::Result<()> {
         ensemble.weights.get(1).copied().unwrap_or(0.0) / wsum,
         ensemble.temperature,
     );
-    println!("  (lower Brier / log-loss is better)\n");
+    println!("  (lower Brier / log-loss is better; the market is the bar to beat)\n");
     Ok(())
 }
 

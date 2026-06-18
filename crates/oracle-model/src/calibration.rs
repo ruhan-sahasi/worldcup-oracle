@@ -40,6 +40,18 @@ impl CalibrationReport {
     }
 }
 
+/// Convert decimal odds into implied win/draw/win probabilities, normalizing out the
+/// bookmaker's overround (the "vig"). Each argument is the decimal payout, e.g. `2.50`.
+///
+/// The raw inverse odds `1/o` sum to more than 1 because the book bakes in a margin;
+/// dividing by their total recovers a proper probability distribution. This is the
+/// market baseline the engine is measured against in the backtest, and bookmaker
+/// implied probabilities are a notoriously hard bar to beat.
+pub fn implied_probabilities(home_odds: f64, draw_odds: f64, away_odds: f64) -> Probabilities {
+    let inv = |o: f64| if o > 1.0 { 1.0 / o } else { 0.0 };
+    Probabilities::new(inv(home_odds), inv(draw_odds), inv(away_odds))
+}
+
 /// Score a batch of `(prediction, actual outcome)` pairs.
 pub fn score(predictions: &[(Probabilities, Outcome)]) -> CalibrationReport {
     let n = predictions.len();
@@ -103,5 +115,18 @@ mod tests {
         let baseline = CalibrationReport::uniform_baseline(preds.len());
         assert!(model.brier < baseline.brier);
         assert!(model.log_loss < baseline.log_loss);
+    }
+
+    #[test]
+    fn implied_probabilities_remove_vig_and_rank_favourite() {
+        // Odds with a built-in margin (inverse sum > 1).
+        let p = implied_probabilities(2.0, 3.5, 4.0);
+        assert!((p.sum() - 1.0).abs() < 1e-9, "overround normalized away");
+        assert_eq!(
+            p.most_likely(),
+            Outcome::HomeWin,
+            "shortest odds = favourite"
+        );
+        assert!(p.home_win > p.draw && p.home_win > p.away_win);
     }
 }
