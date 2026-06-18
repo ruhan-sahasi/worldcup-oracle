@@ -158,31 +158,39 @@ pub fn squad(team: TeamId) -> Vec<Player> {
     let base = ((rating - 1500.0) / 400.0).clamp(0.1, 1.6);
     let mut rng = StdRng::seed_from_u64(0xF1FA_2026 ^ u64::from(team.0));
 
-    let mut players: Vec<Player> = (0..16)
-        .map(|i| {
-            let position = match i {
-                0..=1 => Position::Gk,
-                2..=7 => Position::Def,
-                8..=12 => Position::Mid,
-                _ => Position::Fwd,
-            };
-            let (atk_w, def_w) = match position {
-                Position::Gk => (0.05, 0.95),
-                Position::Def => (0.30, 0.85),
-                Position::Mid => (0.65, 0.55),
-                Position::Fwd => (0.95, 0.25),
-            };
-            let skill = (base + rng.gen_range(-0.30..0.30)).max(0.05);
+    // Names must be unique within a squad: lineups are matched by name, so a duplicate
+    // would let one present player count twice in `lineup_adjustment`.
+    let mut used = std::collections::HashSet::new();
+    let mut players: Vec<Player> = Vec::with_capacity(16);
+    for i in 0..16 {
+        let position = match i {
+            0..=1 => Position::Gk,
+            2..=7 => Position::Def,
+            8..=12 => Position::Mid,
+            _ => Position::Fwd,
+        };
+        let (atk_w, def_w) = match position {
+            Position::Gk => (0.05, 0.95),
+            Position::Def => (0.30, 0.85),
+            Position::Mid => (0.65, 0.55),
+            Position::Fwd => (0.95, 0.25),
+        };
+        let skill = (base + rng.gen_range(-0.30..0.30)).max(0.05);
+        let name = loop {
             let initial = (b'A' + rng.gen_range(0..26u8)) as char;
             let surname = SURNAMES[rng.gen_range(0..SURNAMES.len())];
-            Player {
-                name: format!("{initial}. {surname}"),
-                position,
-                attack: skill * atk_w,
-                defense: skill * def_w,
+            let candidate = format!("{initial}. {surname}");
+            if used.insert(candidate.clone()) {
+                break candidate;
             }
-        })
-        .collect();
+        };
+        players.push(Player {
+            name,
+            position,
+            attack: skill * atk_w,
+            defense: skill * def_w,
+        });
+    }
 
     // Give the team a clear talisman: boost the strongest outfield player's attack.
     if let Some(star) = players
@@ -619,6 +627,20 @@ mod tests {
         // Argentina (id 0, strongest) vs New Zealand (id 47, weakest).
         let p = model.outcome_probabilities(TeamId(0), TeamId(47), true);
         assert!(p.home_win > 0.6, "fit should rate Argentina well above NZ");
+    }
+
+    #[test]
+    fn squad_names_are_unique() {
+        for id in [0u32, 7, 23, 47] {
+            let mut seen = std::collections::HashSet::new();
+            for p in squad(TeamId(id)) {
+                assert!(
+                    seen.insert(p.name.clone()),
+                    "duplicate name {} in team {id}",
+                    p.name
+                );
+            }
+        }
     }
 
     #[test]

@@ -5,7 +5,7 @@
 //! ```text
 //! wc-oracle simulate   # Monte-Carlo champion odds for the 2026 World Cup
 //! wc-oracle predict    # one-off matchup prediction (ensemble + score grid)
-//! wc-oracle backtest   # model calibration vs a naive baseline
+//! wc-oracle backtest   # calibration + bookmaker benchmark (real or synthetic data)
 //! wc-oracle serve      # run the REST + WebSocket server
 //! wc-oracle watch      # live terminal dashboard (TUI)
 //! ```
@@ -176,7 +176,14 @@ fn cmd_predict(home_q: &str, away_q: &str) -> anyhow::Result<()> {
         resolve_team(home_q, &teams).ok_or_else(|| anyhow::anyhow!("unknown team: {home_q}"))?;
     let away =
         resolve_team(away_q, &teams).ok_or_else(|| anyhow::anyhow!("unknown team: {away_q}"))?;
-    let name = |id: TeamId| teams.iter().find(|t| t.id == id).unwrap().name.clone();
+    let name = |id: TeamId| {
+        teams
+            .iter()
+            .find(|t| t.id == id)
+            .expect("team id was resolved from this list")
+            .name
+            .clone()
+    };
 
     let (model, ratings, ensemble) = baseline();
     let grid = model.score_grid(home, away, true);

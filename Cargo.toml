@@ -62,4 +62,5 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 opt-level = 3
 lto = "thin"
 codegen-units = 1
-panic = "abort"
+# Keep unwinding (the default): a panic in one request handler should surface as a 500
+# rather than abort the whole long-running server process.
