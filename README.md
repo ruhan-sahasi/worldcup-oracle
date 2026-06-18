@@ -36,7 +36,10 @@ fully offline with **zero keys and zero network**.
   pushes fresh forecasts to subscribers in real time.
 - **Three pluggable data sources** behind one trait -> deterministic simulation,
   replay of a finished tournament, or the live [football-data.org](https://www.football-data.org) feed.
-- **Multiple surfaces** -> a REST API, a WebSocket live stream, and a polished CLI/TUI.
+- **Lineup aware** -> a confirmed starting XI adjusts a team's effective attack and
+  defense, so resting or losing a key player visibly moves that team's odds.
+- **Multiple surfaces** -> a REST API, a WebSocket live stream, a live web dashboard,
+  and a polished CLI/TUI.
 
 ## 🧠 The model (in one breath)
 
@@ -46,10 +49,12 @@ fully offline with **zero keys and zero network**.
 | **Elo** with home edge + margin-of-victory scaling | a complementary strength signal |
 | **Log-opinion-pool ensemble** (weights + temperature **learned by stacking**) | a single, sharper blended forecast that's provably ≥ its best member |
 | **Bayesian live updater** | conditions on score + minute + red cards for live odds |
+| **Lineup adjustment** | a confirmed XI shifts each team's attack and defense |
 | **Monte-Carlo** (rayon-parallel, **conditions in-progress matches** on their live score) | tournament-level champion odds that move with live results |
 
-Calibration is measured with proper scoring rules (Brier, log-loss) and regression-
-tested against a baseline. The maths are written up in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
+Calibration is measured with proper scoring rules (Brier, log-loss), benchmarked against
+the bookmaker's implied odds, and regression-tested. The maths are written up in
+[`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
 
 ## 🏗️ Architecture
 
@@ -127,36 +132,48 @@ cargo run --release -p oracle-cli -- predict --home Brazil --away Argentina
 # 4. Watch a tournament unfold live in your terminal:
 cargo run --release -p oracle-cli -- watch          # press q to quit
 
-# 5. Prove the model is calibrated (beats a naive baseline out-of-sample):
+# 5. Backtest and benchmark against the bookmaker (synthetic data, or --data a real CSV):
 cargo run --release -p oracle-cli -- backtest
+cargo run --release -p oracle-cli -- backtest --data path/to/football-data.csv
 ```
 
 ```text
   Model                   Brier   LogLoss      Acc
   ------------------------------------------------
   Uniform baseline       0.6667    1.0986    33.3%
-  Dixon-Coles            0.6350    1.0544    45.0%
-  Elo                    0.6758    1.1278    45.0%
-  Ensemble (learned)     0.6346    1.0525    46.0%
+  Dixon-Coles            0.6277    1.0415    47.6%
+  Elo                    0.6719    1.1273    46.4%
+  Ensemble (learned)     0.6354    1.0544    47.4%
+  Market (bookmaker)     0.6221    1.0339    49.2%
 
-  learned weights: Dixon-Coles 0.74 / Elo 0.26   temperature 0.71
+  learned weights: Dixon-Coles 0.65 / Elo 0.35   temperature 0.70
 ```
 
-The learned ensemble beats every individual member out-of-sample: stacking discovers
-that Elo is the weaker signal here and down-weights it, then a temperature below 1
-corrects the models' overconfidence.
+Stacking learns the member weights and a temperature on a held-out split, so the
+ensemble is provably no worse than its best member. The bookmaker's implied odds are the
+hard bar to beat: the engine approaches the market but does not (yet) clear it.
+`--data` runs the same three-way split on a real
+[football-data.co.uk](https://www.football-data.co.uk) results CSV with closing odds.
 
-### Run the server
+### Run the server and live dashboard
 
 ```bash
 cargo run --release -p oracle-cli -- serve         # or: cargo run -p oracle-api --bin oracle-server
-# then, in another shell:
+# open the live dashboard:
+open http://localhost:8080/
+# or hit the API directly:
 curl localhost:8080/predict/tournament | jq '.teams[:5]'
 curl localhost:8080/predict/match/1
 ```
 
+Visiting `/` serves a self-contained dashboard (no build step, no CDN) that subscribes to
+the `/live` WebSocket and renders live match win bars, a championship-odds leaderboard, a
+probability-over-time chart, and a feed-health indicator, all updating in real time.
+
 | Method | Path | Description |
 |--------|------|-------------|
+| `GET` | `/` | **live web dashboard** |
+| `GET` | `/api` | service info + endpoint list (JSON) |
 | `GET` | `/health` | liveness probe |
 | `GET` | `/teams` | current Elo ratings |
 | `GET` | `/matches` | all match predictions (compact) |
@@ -192,13 +209,16 @@ docker compose up --build         # serves on :8080
 - **Data-parallelism** -> `rayon`-parallel Monte-Carlo with deterministic per-iteration
   seeding; ~50k full tournament simulations/second.
 - **Applied statistics** -> Dixon-Coles MLE with time decay, Elo, Bayesian conditioning,
-  a **stacked** ensemble (weights + temperature learned to minimize held-out log-loss),
-  and **proper scoring rules** for honest evaluation.
+  lineup-aware attack/defense adjustments, a **stacked** ensemble (weights + temperature
+  learned to minimize held-out log-loss), and **proper scoring rules** measured against
+  the **bookmaker's implied odds** on real or synthetic data.
 - **Resilient ingestion** -> an authoritative `ScoreSync` reconciliation (so a dropped or
   duplicated poll can't corrupt the score), a feed-health signal with exponential
   backoff, a hand-rolled token-bucket rate limiter + TTL cache, structured `tracing`,
   Prometheus metrics, `#![forbid(unsafe_code)]`, unit + property + integration tests,
   Criterion benchmarks, CI, and Docker.
+- **Full-stack delivery** -> a dependency-free live web dashboard (vanilla JS + canvas)
+  served by the API and driven entirely off the `/live` WebSocket.
 
 ## 🧪 Tests & benchmarks
 
@@ -212,10 +232,13 @@ cargo bench -p oracle-sim       # Monte-Carlo throughput
 
 - The bundled roster/draw is a **representative sample** for offline use, not FIFA's
   official draw; the live adapter pulls the real teams, fixtures, and results.
-- Offline training data is **synthetic but reproducible** (drawn from team-strength
-  priors) so the fit and backtest run without a network; supply an API key for real data.
-  The backtest beating the baseline therefore validates the *machinery*, not real-world
-  skill; that needs real historical results.
+- Offline training data and the offline "bookmaker" line are **synthetic but
+  reproducible** (drawn from team-strength priors), so the fit, backtest, and market
+  benchmark run without a network. The synthetic backtest validates the *machinery*; for
+  a real skill measurement pass `backtest --data` a real results CSV with closing odds.
+- Squads are **synthetic** for offline use, so the lineup feature is fully demonstrable
+  via the simulation feed; the live football-data.org adapter does not yet ingest real
+  lineups, so it degrades gracefully to no adjustment.
 - In-progress **group** matches are conditioned on their live score, but the knockout
   simulator still builds a fresh bracket each run (a standard seeded single-elimination
   template, not FIFA's exact slotting); conditioning live *knockout* matches is future

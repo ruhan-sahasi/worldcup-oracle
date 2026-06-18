@@ -112,9 +112,23 @@ posterior over "goals still to come" gives live win/draw/win probabilities that 
 on every event.
 
 ### Ensemble (`oracle-model::ensemble`)
-A **logarithmic opinion pool** (weighted geometric mean) blends the Dixon-Coles and
-Elo forecasts: `p(o) ∝ Π_k p_k(o)^{w_k}`. Log-space pooling stays sharp where an
-arithmetic average washes out toward uniform.
+A temperature-scaled **logarithmic opinion pool** blends the Dixon-Coles and Elo
+forecasts: `q(o) ∝ exp(τ · Σ_k a_k · ln p_k(o))`. The mixture weights `a_k` and
+temperature `τ` are **learned by stacking** (gradient descent on held-out log loss in
+`Ensemble::fit`), so the blend is provably no worse than its best member.
+
+### Lineup adjustment (`oracle-ingest::data` + `oracle-model`)
+A confirmed starting XI is compared to the team's strongest available XI to produce a
+log-space `(attack, defense)` adjustment, applied to the goal rates via
+`GoalModel::expected_goals_adjusted`. A rested or missing key player lowers that team's
+expected goals and lifts the opponent's. Squads are synthetic for offline use; the live
+adapter would supply real lineups.
+
+### Market benchmark (`oracle-model::implied_probabilities`)
+Decimal odds are inverted and the overround normalized away to recover the bookmaker's
+implied probabilities. The `backtest` command scores the market on the held-out split
+beside the models, so "can we beat the book" is explicit. `load_results_csv` ingests real
+football-data.co.uk results with closing odds.
 
 ### Monte-Carlo tournament sim (`oracle-sim`)
 Plays the remaining group fixtures and the 32-team knockout out tens of thousands of
