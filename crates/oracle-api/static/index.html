@@ -1,0 +1,227 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>worldcup-oracle · live</title>
+<style>
+  :root {
+    --bg: #0b1020; --panel: #141b2e; --line: #233; --text: #e7ecf5;
+    --muted: #8aa0c0; --home: #3fb950; --draw: #6b7280; --away: #58a6ff;
+    --accent: #ffd24a; --danger: #f85149;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font: 14px/1.5 ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  }
+  header {
+    display: flex; align-items: center; gap: 16px; flex-wrap: wrap;
+    padding: 14px 20px; border-bottom: 1px solid var(--line); background: var(--panel);
+  }
+  header h1 { font-size: 18px; margin: 0; letter-spacing: .2px; }
+  header h1 .ball { margin-right: 6px; }
+  .pill {
+    font-size: 12px; font-weight: 600; padding: 3px 10px; border-radius: 999px;
+    background: #21304a; color: var(--muted);
+  }
+  .pill.live { background: rgba(63,185,80,.15); color: var(--home); }
+  .pill.stale { background: rgba(248,81,73,.15); color: var(--danger); }
+  .pill.down { background: rgba(248,81,73,.2); color: var(--danger); }
+  .spacer { flex: 1; }
+  .meta { color: var(--muted); font-size: 12px; }
+  main {
+    display: grid; grid-template-columns: 1.1fr 1fr; gap: 16px;
+    padding: 16px 20px; max-width: 1200px; margin: 0 auto;
+  }
+  .panel { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 14px 16px; }
+  .panel h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .08em; color: var(--muted); margin: 0 0 12px; }
+  .full { grid-column: 1 / -1; }
+  .match { padding: 10px 0; border-bottom: 1px solid var(--line); }
+  .match:last-child { border-bottom: 0; }
+  .match .top { display: flex; align-items: baseline; gap: 8px; }
+  .match .teams { font-weight: 600; }
+  .match .score { color: var(--accent); font-variant-numeric: tabular-nums; }
+  .match .minute { margin-left: auto; color: var(--muted); font-size: 12px; }
+  .bar { display: flex; height: 10px; border-radius: 6px; overflow: hidden; margin-top: 7px; background: #0d1424; }
+  .bar > span { display: block; height: 100%; transition: width .4s ease; }
+  .bar .h { background: var(--home); } .bar .d { background: var(--draw); } .bar .a { background: var(--away); }
+  .legend { display: flex; gap: 14px; font-size: 11px; color: var(--muted); margin-top: 6px; }
+  .legend i { display: inline-block; width: 9px; height: 9px; border-radius: 2px; margin-right: 4px; vertical-align: middle; }
+  .empty { color: var(--muted); padding: 20px 0; text-align: center; }
+  .odds-row { display: grid; grid-template-columns: 130px 1fr 52px; align-items: center; gap: 10px; padding: 5px 0; }
+  .odds-row .name { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .odds-bar { background: #0d1424; border-radius: 6px; height: 14px; overflow: hidden; }
+  .odds-bar > span { display: block; height: 100%; background: linear-gradient(90deg, #2a6f3a, var(--home)); transition: width .5s ease; }
+  .odds-row .pct { text-align: right; font-variant-numeric: tabular-nums; color: var(--accent); }
+  canvas { width: 100%; height: 220px; display: block; }
+  footer { text-align: center; color: var(--muted); font-size: 12px; padding: 10px 0 24px; }
+  a { color: var(--away); }
+</style>
+</head>
+<body>
+  <header>
+    <h1><span class="ball">⚽</span>worldcup-oracle</h1>
+    <span id="conn" class="pill">connecting…</span>
+    <span id="health" class="pill"></span>
+    <span class="spacer"></span>
+    <span class="meta" id="updated"></span>
+  </header>
+
+  <main>
+    <section class="panel">
+      <h2>Live matches</h2>
+      <div id="matches"><div class="empty">Waiting for kickoff…</div></div>
+      <div class="legend">
+        <span><i style="background:var(--home)"></i>home win</span>
+        <span><i style="background:var(--draw)"></i>draw</span>
+        <span><i style="background:var(--away)"></i>away win</span>
+      </div>
+    </section>
+
+    <section class="panel">
+      <h2>Championship odds</h2>
+      <div id="odds"><div class="empty">No forecast yet…</div></div>
+    </section>
+
+    <section class="panel full">
+      <h2>Championship probability over time</h2>
+      <canvas id="chart" width="1120" height="220"></canvas>
+    </section>
+  </main>
+
+  <footer>
+    live view over the <code>/live</code> WebSocket · REST at <a href="/api">/api</a>
+  </footer>
+
+<script>
+(() => {
+  const PALETTE = ["#ffd24a","#58a6ff","#3fb950","#f778ba","#bc8cff","#ff9f40"];
+  const history = new Map();   // team name -> [p_champion ...]
+  const order = [];            // stable team order for chart colors
+  const MAX_POINTS = 150;
+
+  const el = (id) => document.getElementById(id);
+  const pct = (x) => (100 * x).toFixed(1) + "%";
+
+  function setConn(state) {
+    const c = el("conn");
+    if (state === "open") { c.textContent = "connected"; c.className = "pill live"; }
+    else if (state === "down") { c.textContent = "disconnected"; c.className = "pill down"; }
+    else { c.textContent = "connecting…"; c.className = "pill"; }
+  }
+
+  function renderHeader(v) {
+    const h = el("health");
+    if (v.source_healthy) { h.textContent = "feed healthy"; h.className = "pill live"; }
+    else { h.textContent = "stale feed"; h.className = "pill stale"; }
+    if (v.last_update) {
+      const t = new Date(v.last_update);
+      el("updated").textContent = "updated " + (isNaN(t) ? v.last_update : t.toLocaleTimeString());
+    }
+  }
+
+  function renderMatches(matches) {
+    const box = el("matches");
+    if (!matches || matches.length === 0) {
+      box.innerHTML = '<div class="empty">No matches in play right now.</div>';
+      return;
+    }
+    box.innerHTML = matches.map((m) => {
+      const p = m.probabilities;
+      const minute = (m.status && m.status.minute != null) ? m.status.minute + "'" : "";
+      return `
+        <div class="match">
+          <div class="top">
+            <span class="teams">${esc(m.home_name)} <span class="score">${m.score.home}-${m.score.away}</span> ${esc(m.away_name)}</span>
+            <span class="minute">${minute}</span>
+          </div>
+          <div class="bar">
+            <span class="h" style="width:${100*p.home_win}%"></span>
+            <span class="d" style="width:${100*p.draw}%"></span>
+            <span class="a" style="width:${100*p.away_win}%"></span>
+          </div>
+          <div class="legend">
+            <span>${esc(m.home_name)} ${pct(p.home_win)}</span>
+            <span>draw ${pct(p.draw)}</span>
+            <span>${esc(m.away_name)} ${pct(p.away_win)}</span>
+          </div>
+        </div>`;
+    }).join("");
+  }
+
+  function renderOdds(teams) {
+    const box = el("odds");
+    if (!teams || teams.length === 0) { box.innerHTML = '<div class="empty">No forecast yet…</div>'; return; }
+    const max = Math.max(...teams.map(t => t.p_champion), 1e-6);
+    box.innerHTML = teams.map((t) => `
+      <div class="odds-row">
+        <span class="name">${esc(t.name)}</span>
+        <span class="odds-bar"><span style="width:${100 * t.p_champion / max}%"></span></span>
+        <span class="pct">${pct(t.p_champion)}</span>
+      </div>`).join("");
+  }
+
+  function recordHistory(teams) {
+    // Track the championship probability of the current top contenders over time.
+    teams.slice(0, PALETTE.length).forEach((t) => {
+      if (!history.has(t.name)) { history.set(t.name, []); order.push(t.name); }
+    });
+    for (const name of history.keys()) {
+      const found = teams.find(t => t.name === name);
+      const arr = history.get(name);
+      arr.push(found ? found.p_champion : (arr.length ? arr[arr.length - 1] : 0));
+      if (arr.length > MAX_POINTS) arr.shift();
+    }
+    drawChart();
+  }
+
+  function drawChart() {
+    const c = el("chart"), ctx = c.getContext("2d");
+    const W = c.width, H = c.height, pad = 28;
+    ctx.clearRect(0, 0, W, H);
+    let maxY = 0;
+    for (const arr of history.values()) maxY = Math.max(maxY, ...arr);
+    maxY = Math.max(maxY, 0.05);
+    // axes
+    ctx.strokeStyle = "#243"; ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.moveTo(pad, H - pad); ctx.lineTo(W - 4, H - pad); ctx.stroke();
+    ctx.fillStyle = "#8aa0c0"; ctx.font = "11px sans-serif";
+    ctx.fillText((100 * maxY).toFixed(0) + "%", 2, pad);
+    ctx.fillText("0%", 2, H - pad);
+    order.slice(0, PALETTE.length).forEach((name, i) => {
+      const arr = history.get(name); if (!arr || arr.length < 2) return;
+      ctx.strokeStyle = PALETTE[i]; ctx.lineWidth = 2; ctx.beginPath();
+      arr.forEach((y, x) => {
+        const px = pad + (W - pad - 6) * (x / Math.max(arr.length - 1, 1));
+        const py = (H - pad) - (H - 2 * pad) * (y / maxY);
+        x === 0 ? ctx.moveTo(px, py) : ctx.lineTo(px, py);
+      });
+      ctx.stroke();
+      // legend
+      ctx.fillStyle = PALETTE[i];
+      ctx.fillText(name, pad + 8 + i * 130, 14);
+    });
+  }
+
+  function esc(s) { return String(s).replace(/[&<>]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" }[c])); }
+
+  function connect() {
+    const proto = location.protocol === "https:" ? "wss" : "ws";
+    const ws = new WebSocket(`${proto}://${location.host}/live`);
+    ws.onopen = () => setConn("open");
+    ws.onclose = () => { setConn("down"); setTimeout(connect, 1500); };
+    ws.onerror = () => ws.close();
+    ws.onmessage = (ev) => {
+      let v; try { v = JSON.parse(ev.data); } catch { return; }
+      renderHeader(v);
+      renderMatches(v.live_matches);
+      renderOdds(v.top_contenders);
+      recordHistory(v.top_contenders || []);
+    };
+  }
+  connect();
+})();
+</script>
+</body>
+</html>

@@ -23,7 +23,7 @@ use axum::{
         Path, State,
     },
     http::StatusCode,
-    response::{IntoResponse, Json},
+    response::{Html, IntoResponse, Json},
     routing::get,
     Router,
 };
@@ -41,7 +41,8 @@ use tower_http::trace::TraceLayer;
 /// Build the application router with the engine as shared state.
 pub fn router(engine: Arc<Engine>) -> Router {
     Router::new()
-        .route("/", get(index))
+        .route("/", get(dashboard))
+        .route("/api", get(api_info))
         .route("/health", get(health))
         .route("/teams", get(teams))
         .route("/matches", get(matches))
@@ -73,7 +74,12 @@ async fn health() -> &'static str {
     "ok"
 }
 
-async fn index(State(engine): State<Arc<Engine>>) -> Json<serde_json::Value> {
+/// The live dashboard, a self-contained page that consumes the `/live` WebSocket.
+async fn dashboard() -> Html<&'static str> {
+    Html(include_str!("../static/index.html"))
+}
+
+async fn api_info(State(engine): State<Arc<Engine>>) -> Json<serde_json::Value> {
     let snap = engine.snapshot();
     Json(serde_json::json!({
         "service": "worldcup-oracle",
@@ -82,7 +88,7 @@ async fn index(State(engine): State<Arc<Engine>>) -> Json<serde_json::Value> {
         "source_healthy": snap.source_healthy,
         "last_update": snap.last_update.to_rfc3339(),
         "endpoints": [
-            "/health", "/teams", "/matches",
+            "/ (dashboard)", "/health", "/teams", "/matches",
             "/predict/match/{id}", "/predict/tournament",
             "/metrics", "/live (websocket)"
         ],
