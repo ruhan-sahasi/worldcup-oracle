@@ -105,6 +105,9 @@ equations reduce to `target − expected`); `ρ` is fit by a 1-D search over the
 fully-corrected likelihood. When **expected goals (xG)** are attached to an observation
 the fit regresses on them instead of the realized goals: xG is a much lower-noise signal
 (a team can dominate xG and lose), so the same estimating equation gives a sharper model.
+An **L2 (ridge)** penalty shrinks the coefficients toward the mean; because a data-rich
+team accumulates a larger gradient, sparse-data teams are shrunk more, which is the
+regularization a sparse, unbalanced international schedule needs.
 
 ### Bayesian in-match updating (`oracle-model::live`)
 Live, we condition on the current scoreline, minute, and red cards. Remaining goals
@@ -142,7 +145,19 @@ Plays the remaining group fixtures and the 32-team knockout out tens of thousand
 times - sampling each scoreline from the goal model - to estimate every team's
 probability of advancing, reaching each round, and winning the cup. Iterations are
 independent, so it fans out over `rayon`; per-iteration RNG seeds make a given
-`(seed, iterations)` perfectly reproducible.
+`(seed, iterations)` perfectly reproducible. Each probability carries a Monte-Carlo
+standard error `sqrt(p(1-p)/N)`, surfaced by `simulate`.
+
+### Calibration (`oracle-model::reliability`)
+Beyond Brier and log loss, `reliability` bins predictions by confidence and compares
+predicted vs empirical frequency, with an expected calibration error (ECE). `backtest`
+prints this so the ensemble's calibration is explicit, not assumed.
+
+### Durable event store (`oracle-engine::event_log`)
+With `EngineConfig.event_log` set, every consumed event is appended as one JSON line and
+the log is replayed on startup to rebuild state, so a restart mid-tournament recovers
+rather than starting cold. The earlier `ScoreSync`/`FullTime` reconciliation makes resume
+self-healing for a live feed that re-emits on restart.
 
 ## Quality gates
 - Unit + property-style tests in every crate (probabilities normalize, Elo is

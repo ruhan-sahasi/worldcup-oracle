@@ -104,13 +104,13 @@ cargo run --release -p oracle-cli -- simulate --iters 50000
 ```
 
 ```text
-  #  Team                Champ    Final     Semi    Quart      R16
---------------------------------------------------------------------
-  1  France               9.5%    15.0%    23.7%    37.5%    59.5%
-  2  Argentina            8.0%    13.5%    21.8%    34.5%    56.1%
-  3  Spain                7.1%    12.1%    20.0%    33.5%    54.1%
+  #  Team             Champ (±MC err)    Final     Semi    Quart      R16
+--------------------------------------------------------------------------
+  1  France              8.7% ± 0.2%    14.2%    22.8%    36.5%    57.9%
+  2  Argentina           7.5% ± 0.2%    12.2%    20.2%    32.5%    53.6%
+  3  Spain               6.7% ± 0.2%    11.3%    18.8%    31.7%    52.4%
   ...
-30000 simulations in 0.05s  (host advantage, altitude, and rest folded in)
+(host advantage, altitude, and rest folded in; ±MC err is the Monte-Carlo standard error)
 ```
 
 ```bash
@@ -150,12 +150,19 @@ cargo run --release -p oracle-cli -- backtest --data path/to/football-data.csv
   Market (bookmaker)     0.6197    1.0318    48.8%
 
   learned weights: DC 0.37 / Elo 0.22 / Market 0.41   temperature 0.77
+
+  Ensemble calibration (ECE 0.017):
+          bucket   predicted   empirical        n
+       0-20 %         18.3%      18.5%       54
+      20-40 %         29.6%      28.5%     1801
+      40-60 %         46.5%      50.2%      524
 ```
 
-Two levers are visible here. Fitting on **xG** beats fitting on goals (a lower-noise
-signal). And stacking learns to lean on the **market** (the heaviest weight), since the
+Three things are visible here. Fitting on **xG** beats fitting on goals (a lower-noise
+signal). Stacking learns to lean on the **market** (the heaviest weight), since the
 bookmaker's vig-free implied odds are the hard bar to beat: the engine approaches the
-market but does not clear it. `--data` runs the same three-way split on a real
+market but does not clear it. And the **reliability table + ECE** confirm the ensemble is
+well-calibrated (predicted ≈ empirical in every bucket). `--data` runs the same split on a real
 [football-data.co.uk](https://www.football-data.co.uk) CSV (with closing odds, and xG
 columns if present).
 
@@ -163,6 +170,8 @@ columns if present).
 
 ```bash
 cargo run --release -p oracle-cli -- serve         # or: cargo run -p oracle-api --bin oracle-server
+# record every event to a durable log and recover from it on restart:
+cargo run --release -p oracle-cli -- serve --event-log oracle.jsonl
 # open the live dashboard:
 open http://localhost:8080/
 # or hit the API directly:
@@ -172,7 +181,9 @@ curl localhost:8080/predict/match/1
 
 Visiting `/` serves a self-contained dashboard (no build step, no CDN) that subscribes to
 the `/live` WebSocket and renders live match win bars, a championship-odds leaderboard, a
-probability-over-time chart, and a feed-health indicator, all updating in real time.
+probability-over-time chart, and a feed-health indicator, all updating in real time. With
+`--event-log`, every event is appended as JSON and replayed on the next start, so a restart
+mid-tournament recovers its state instead of starting cold.
 
 | Method | Path | Description |
 |--------|------|-------------|
@@ -212,16 +223,17 @@ docker compose up --build         # serves on :8080
   graceful cancellation.
 - **Data-parallelism** -> `rayon`-parallel Monte-Carlo with deterministic per-iteration
   seeding; ~50k full tournament simulations/second.
-- **Applied statistics** -> Dixon-Coles MLE with time decay (**fit on xG** when present),
-  Elo, Bayesian conditioning, lineup- and venue-aware attack/defense adjustments, a
-  **stacked** `[Dixon-Coles, Elo, Market]` ensemble (weights + temperature learned to
-  minimize held-out log-loss), and **proper scoring rules** measured against the
-  **bookmaker's implied odds** on real or synthetic data.
+- **Applied statistics** -> Dixon-Coles MLE with time decay (**fit on xG** when present)
+  and **ridge regularization** that shrinks sparse-data teams, Elo, Bayesian conditioning,
+  lineup- and venue-aware adjustments, a **stacked** `[Dixon-Coles, Elo, Market]` ensemble,
+  and honest evaluation: **proper scoring rules** vs the **bookmaker's implied odds**, a
+  **reliability curve + ECE**, and **Monte-Carlo standard error** on the forecast.
 - **Resilient ingestion** -> an authoritative `ScoreSync` reconciliation (so a dropped or
-  duplicated poll can't corrupt the score), a feed-health signal with exponential
-  backoff, a hand-rolled token-bucket rate limiter + TTL cache, structured `tracing`,
-  Prometheus metrics, `#![forbid(unsafe_code)]`, unit + property + integration tests,
-  Criterion benchmarks, CI, and Docker.
+  duplicated poll can't corrupt the score), a feed-health signal with exponential backoff,
+  a **durable append-only event log** that is replayed on boot for crash recovery, a
+  hand-rolled token-bucket rate limiter + TTL cache, structured `tracing`, Prometheus
+  metrics, `#![forbid(unsafe_code)]`, unit + property + integration tests, Criterion
+  benchmarks, CI, and Docker.
 - **Full-stack delivery** -> a dependency-free live web dashboard (vanilla JS + canvas)
   served by the API and driven entirely off the `/live` WebSocket.
 
@@ -249,9 +261,11 @@ cargo bench -p oracle-sim       # Monte-Carlo throughput
   simulator still builds a fresh bracket each run (a standard seeded single-elimination
   template, not FIFA's exact slotting); conditioning live *knockout* matches is future
   work. All documented in the code.
-- Deliberately deferred: **squad market value** (largely redundant with the strength
-  ratings offline) and **stakes / dead-rubber rotation** (speculative without a behavioural
-  model).
+- Still open on the model side: full **posterior intervals** (we report Monte-Carlo
+  standard error, not parameter uncertainty), **dynamic in-tournament** goal-model updates
+  (only Elo updates live today), and richer **knockout realism** (extra time, a less
+  coin-flip shootout). Deliberately deferred: **squad market value** (largely redundant with
+  the strength ratings offline) and **stakes / dead-rubber rotation** (speculative).
 
 ## 📄 License
 
