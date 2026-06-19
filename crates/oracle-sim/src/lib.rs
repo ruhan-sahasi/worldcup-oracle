@@ -54,6 +54,19 @@ pub struct InProgress {
     pub away_defense_adj: f64,
 }
 
+/// A per-team venue/travel adjustment in log space:
+/// `((home_attack, home_defense), (away_attack, away_defense))`.
+pub type VenueAdj = ((f64, f64), (f64, f64));
+
+/// Extra per-match inputs to the simulation. `live` conditions in-progress (or
+/// lineup-announced) matches; `venue` applies host/altitude/rest adjustments to **every**
+/// remaining fixture so context reaches the tournament-level forecast.
+#[derive(Debug, Clone, Default)]
+pub struct LiveInputs {
+    pub live: HashMap<MatchId, InProgress>,
+    pub venue: HashMap<MatchId, VenueAdj>,
+}
+
 /// Supplies expected goals for a (neutral-venue) matchup. Implemented for the
 /// Dixon-Coles [`oracle_model::GoalModel`]; mockable in tests.
 pub trait MatchSampler: Sync {
@@ -104,23 +117,23 @@ pub fn simulate<S: MatchSampler>(
         tournament,
         sampler,
         config,
-        &HashMap::new(),
+        &LiveInputs::default(),
         LiveConfig::default(),
     )
 }
 
-/// Like [`simulate`], but conditions any in-progress group match on its live state:
-/// instead of replaying from 0-0, it keeps the current score and samples only the
-/// remaining goals (scaled by time left and red cards). This is what keeps the live
-/// match odds and the tournament forecast coherent.
+/// Like [`simulate`], but applies extra per-match [`LiveInputs`]: in-progress matches are
+/// conditioned on their live score (sampling only the remainder), and venue/travel
+/// adjustments are applied to every remaining fixture. This keeps the live match odds,
+/// host advantage, and the tournament forecast coherent.
 pub fn simulate_with_live<S: MatchSampler>(
     tournament: &Tournament,
     sampler: &S,
     config: SimConfig,
-    live: &HashMap<MatchId, InProgress>,
+    inputs: &LiveInputs,
     live_config: LiveConfig,
 ) -> TournamentForecast {
-    let prep = Prepared::build(tournament, sampler, config, live, live_config);
+    let prep = Prepared::build(tournament, sampler, config, inputs, live_config);
     let n = prep.teams.len();
 
     // Fan out over iterations; each rayon task folds into its own tally, then we
@@ -187,7 +200,7 @@ impl Prepared {
         tournament: &Tournament,
         sampler: &S,
         config: SimConfig,
-        live: &HashMap<MatchId, InProgress>,
+        inputs: &LiveInputs,
         live_config: LiveConfig,
     ) -> Self {
         let teams: Vec<TeamId> = tournament.teams.iter().map(|t| t.id).collect();
@@ -237,15 +250,19 @@ impl Prepared {
                     .filter_map(|m| {
                         let h = *index.get(&m.home)?;
                         let a = *index.get(&m.away)?;
-                        let full = eg[h * n + a];
+                        // Venue/travel context adjusts the base rates of every fixture.
+                        let ((vh_atk, vh_def), (va_atk, va_def)) =
+                            inputs.venue.get(&m.id).copied().unwrap_or_default();
+                        let base_l = eg[h * n + a].0 * (vh_atk - va_def).exp();
+                        let base_m = eg[h * n + a].1 * (va_atk - vh_def).exp();
                         // In-progress matches keep their score and sample only the rest;
-                        // a confirmed lineup adjusts the base goal rates first.
-                        let (rates, current) = match live.get(&m.id) {
+                        // a confirmed lineup further adjusts the rates.
+                        let (rates, current) = match inputs.live.get(&m.id) {
                             Some(ip) => {
                                 let adj_lambda =
-                                    full.0 * (ip.home_attack_adj - ip.away_defense_adj).exp();
+                                    base_l * (ip.home_attack_adj - ip.away_defense_adj).exp();
                                 let adj_mu =
-                                    full.1 * (ip.away_attack_adj - ip.home_defense_adj).exp();
+                                    base_m * (ip.away_attack_adj - ip.home_defense_adj).exp();
                                 let state = LiveState {
                                     current: ip.score,
                                     minute: ip.minute,
@@ -257,7 +274,7 @@ impl Prepared {
                                     ip.score,
                                 )
                             }
-                            None => (full, Scoreline::new(0, 0)),
+                            None => ((base_l, base_m), Scoreline::new(0, 0)),
                         };
                         Some(RemainingMatch {
                             home_ix: h,
@@ -708,8 +725,8 @@ mod tests {
             .iter()
             .find(|m| m.home == TeamId(0) && m.away == TeamId(3))
             .unwrap();
-        let mut live = HashMap::new();
-        live.insert(
+        let mut inputs = LiveInputs::default();
+        inputs.live.insert(
             m.id,
             InProgress {
                 score: Scoreline::new(0, 3),
@@ -717,7 +734,7 @@ mod tests {
                 ..Default::default()
             },
         );
-        let conditioned = simulate_with_live(&t, &RankSampler, cfg, &live, LiveConfig::default());
+        let conditioned = simulate_with_live(&t, &RankSampler, cfg, &inputs, LiveConfig::default());
 
         let advance = |f: &TournamentForecast, team: u32| {
             f.teams
@@ -731,6 +748,42 @@ mod tests {
             "a 0-3 lead at 85' should lift team 3's advance odds (fresh {:.3} -> live {:.3})",
             advance(&fresh, 3),
             advance(&conditioned, 3),
+        );
+    }
+
+    #[test]
+    fn venue_advantage_lifts_champion_probability() {
+        let t = tiny_tournament();
+        let cfg = SimConfig {
+            iterations: 6000,
+            seed: 11,
+            ..Default::default()
+        };
+        let neutral = simulate(&t, &RankSampler, cfg);
+
+        // Give the weakest team (7) a strong home boost in every one of its fixtures.
+        let mut inputs = LiveInputs::default();
+        for m in &t.matches {
+            if m.home == TeamId(7) {
+                inputs.venue.insert(m.id, ((0.4, 0.2), (0.0, 0.0)));
+            } else if m.away == TeamId(7) {
+                inputs.venue.insert(m.id, ((0.0, 0.0), (0.4, 0.2)));
+            }
+        }
+        let hosted = simulate_with_live(&t, &RankSampler, cfg, &inputs, LiveConfig::default());
+
+        let champ = |f: &TournamentForecast, team: u32| {
+            f.teams
+                .iter()
+                .find(|x| x.team == TeamId(team))
+                .unwrap()
+                .p_champion
+        };
+        assert!(
+            champ(&hosted, 7) > champ(&neutral, 7),
+            "home advantage should raise team 7's title odds ({:.3} -> {:.3})",
+            champ(&neutral, 7),
+            champ(&hosted, 7),
         );
     }
 }

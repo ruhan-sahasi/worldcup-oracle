@@ -22,7 +22,10 @@ use oracle_domain::{
     TeamId, Tournament,
 };
 use oracle_model::poisson::poisson_pmf;
-use oracle_model::{implied_probabilities, DixonColesConfig, Ensemble, GoalModel, Observation};
+use oracle_model::{
+    context_adjustment, implied_probabilities, DixonColesConfig, Ensemble, GoalModel, Host,
+    MatchContext, Observation,
+};
 use oracle_ratings::RatingStore;
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
@@ -399,12 +402,18 @@ pub fn synthetic_history(n_matches: usize, seed: u64) -> Vec<Observation> {
         }
         let (lambda, mu) = rating_to_xg(strengths[i].1, strengths[j].1);
         let score = Scoreline::new(sample(&mut rng, lambda), sample(&mut rng, mu));
+        // xG is a noisy estimate of the true rate, but much less noisy than the
+        // Poisson-sampled scoreline, so fitting on it sharpens the model.
+        let home_xg = (lambda * (1.0 + rng.gen_range(-0.15..0.15))).max(0.05);
+        let away_xg = (mu * (1.0 + rng.gen_range(-0.15..0.15))).max(0.05);
         // Spread matches over ~1100 days, oldest first.
         let age_days = 1100.0 * (1.0 - k as f64 / n_matches as f64);
-        out.push(Observation::new(
+        out.push(Observation::with_xg(
             strengths[i].0,
             strengths[j].0,
             score,
+            home_xg,
+            away_xg,
             age_days,
         ));
     }
@@ -435,6 +444,24 @@ fn outcome_probs_from_rates(lambda: f64, mu: f64) -> Probabilities {
     Probabilities::new(h, d, a)
 }
 
+/// A synthetic bookmaker line (decimal odds) for a matchup, derived from the teams'
+/// strength ratings with a ~6% margin. Used by the simulation feed to emit an `Odds`
+/// event so the engine can demonstrate anchoring to the market.
+pub fn market_line(home: TeamId, away: TeamId) -> (f64, f64, f64) {
+    let strengths = team_strengths();
+    let rating = |t: TeamId| {
+        strengths
+            .iter()
+            .find(|(id, _)| *id == t)
+            .map_or(1500.0, |(_, r)| *r)
+    };
+    let (lambda, mu) = rating_to_xg(rating(home), rating(away));
+    let p = outcome_probs_from_rates(lambda, mu);
+    const MARGIN: f64 = 1.06;
+    let odds = |q: f64| (1.0 / (MARGIN * q.max(1e-6))).max(1.01);
+    (odds(p.home_win), odds(p.draw), odds(p.away_win))
+}
+
 /// Like [`synthetic_history`] but also attaches a synthetic "bookmaker" line per match:
 /// the true outcome probabilities with small noise (a sharp, near-optimal book). This
 /// lets the backtest show a market baseline fully offline. Supply a real CSV via
@@ -458,8 +485,17 @@ pub fn synthetic_history_with_market(n_matches: usize, seed: u64) -> Vec<MatchRe
             }
             let (lambda, mu) = rating_to_xg(strengths[i].1, strengths[j].1);
             let score = Scoreline::new(sample(&mut rng, lambda), sample(&mut rng, mu));
+            let home_xg = (lambda * (1.0 + rng.gen_range(-0.15..0.15))).max(0.05);
+            let away_xg = (mu * (1.0 + rng.gen_range(-0.15..0.15))).max(0.05);
             let age_days = 1100.0 * (1.0 - k as f64 / n_matches as f64);
-            let obs = Observation::new(strengths[i].0, strengths[j].0, score, age_days);
+            let obs = Observation::with_xg(
+                strengths[i].0,
+                strengths[j].0,
+                score,
+                home_xg,
+                away_xg,
+                age_days,
+            );
 
             let truth = outcome_probs_from_rates(lambda, mu);
             let mut noisy = |p: f64| p * (1.0 + rng.gen_range(-0.04..0.04));
@@ -498,9 +534,23 @@ pub fn load_results_csv(path: impl AsRef<Path>) -> Result<Vec<MatchRecord>> {
         ));
     };
     let (oh, od, oa) = (col("B365H"), col("B365D"), col("B365A"));
+    // Optional expected-goals columns (no universal standard, so try common spellings).
+    let cxgh = col("HxG")
+        .or_else(|| col("Home xG"))
+        .or_else(|| col("xG_home"));
+    let cxga = col("AxG")
+        .or_else(|| col("Away xG"))
+        .or_else(|| col("xG_away"));
 
     let mut ids: HashMap<String, u32> = HashMap::new();
-    let mut rows: Vec<(TeamId, TeamId, Scoreline, Option<Probabilities>)> = Vec::new();
+    #[allow(clippy::type_complexity)]
+    let mut rows: Vec<(
+        TeamId,
+        TeamId,
+        Scoreline,
+        Option<(f64, f64)>,
+        Option<Probabilities>,
+    )> = Vec::new();
     for record in reader.records() {
         let r = record.map_err(|e| IngestError::Data(e.to_string()))?;
         let cell = |i: usize| r.get(i).map(str::trim).filter(|s| !s.is_empty());
@@ -513,9 +563,13 @@ pub fn load_results_csv(path: impl AsRef<Path>) -> Result<Vec<MatchRecord>> {
         ) else {
             continue;
         };
-        let odd = |c: Option<usize>| c.and_then(cell).and_then(|s| s.parse::<f64>().ok());
-        let market = match (odd(oh), odd(od), odd(oa)) {
+        let num = |c: Option<usize>| c.and_then(cell).and_then(|s| s.parse::<f64>().ok());
+        let market = match (num(oh), num(od), num(oa)) {
             (Some(h), Some(d), Some(a)) => Some(implied_probabilities(h, d, a)),
+            _ => None,
+        };
+        let xg = match (num(cxgh), num(cxga)) {
+            (Some(h), Some(a)) => Some((h, a)),
             _ => None,
         };
         let mut intern = |name: &str| {
@@ -523,18 +577,121 @@ pub fn load_results_csv(path: impl AsRef<Path>) -> Result<Vec<MatchRecord>> {
             TeamId(*ids.entry(name.to_string()).or_insert(next))
         };
         let (h_id, a_id) = (intern(home), intern(away));
-        rows.push((h_id, a_id, Scoreline::new(hg, ag), market));
+        rows.push((h_id, a_id, Scoreline::new(hg, ag), xg, market));
     }
 
     let total = rows.len();
     Ok(rows
         .into_iter()
         .enumerate()
-        .map(|(k, (h, a, score, market))| MatchRecord {
-            obs: Observation::new(h, a, score, (total - k) as f64),
-            market,
+        .map(|(k, (h, a, score, xg, market))| {
+            // Oldest-first assumption: earlier rows get a larger age.
+            let age = (total - k) as f64;
+            let obs = match xg {
+                Some((hx, ax)) => Observation::with_xg(h, a, score, hx, ax, age),
+                None => Observation::new(h, a, score, age),
+            };
+            MatchRecord { obs, market }
         })
         .collect())
+}
+
+// ----- Venue & travel context (representative, offline) -----
+//
+// Real 2026 venue assignments come from the official schedule; this representative map lets
+// the host/altitude/rest feature work offline. Rest days are derived from the real gaps
+// between a team's fixtures, so that part is genuine.
+
+/// `(city, host country code, altitude in metres)`.
+const VENUES: &[(&str, &str, f64)] = &[
+    ("Mexico City", "MEX", 2240.0),
+    ("Guadalajara", "MEX", 1566.0),
+    ("Monterrey", "MEX", 540.0),
+    ("Denver", "USA", 1609.0),
+    ("Atlanta", "USA", 320.0),
+    ("Dallas", "USA", 130.0),
+    ("Kansas City", "USA", 270.0),
+    ("Los Angeles", "USA", 93.0),
+    ("New York", "USA", 10.0),
+    ("Miami", "USA", 2.0),
+    ("Toronto", "CAN", 76.0),
+    ("Vancouver", "CAN", 4.0),
+];
+
+/// A per-team venue/travel adjustment: `((home_attack, home_defense), (away_attack,
+/// away_defense))` in log space.
+pub type VenueAdj = ((f64, f64), (f64, f64));
+
+/// Host-nation country code for a team, or `None` if it is not a 2026 host.
+fn host_country(id: TeamId) -> Option<&'static str> {
+    match TEAMS.get(id.0 as usize).map(|t| t.1) {
+        Some(code @ ("USA" | "MEX" | "CAN")) => Some(code),
+        _ => None,
+    }
+}
+
+/// Per-match venue/travel context for the tournament: a representative venue assignment
+/// plus rest days derived from the real gaps between each team's fixtures.
+pub fn match_contexts(tournament: &Tournament) -> HashMap<MatchId, MatchContext> {
+    // Rest days: for each team, the gap to its previous fixture by kickoff.
+    let mut by_team: HashMap<TeamId, Vec<(MatchId, chrono::DateTime<Utc>)>> = HashMap::new();
+    for m in &tournament.matches {
+        by_team.entry(m.home).or_default().push((m.id, m.kickoff));
+        by_team.entry(m.away).or_default().push((m.id, m.kickoff));
+    }
+    let mut rest: HashMap<(TeamId, MatchId), u8> = HashMap::new();
+    for (team, mut fixtures) in by_team {
+        fixtures.sort_by_key(|(_, k)| *k);
+        let mut prev: Option<chrono::DateTime<Utc>> = None;
+        for (mid, k) in fixtures {
+            let days = match prev {
+                Some(p) => (k - p).num_days().clamp(1, 14) as u8,
+                None => 4,
+            };
+            rest.insert((team, mid), days);
+            prev = Some(k);
+        }
+    }
+
+    tournament
+        .matches
+        .iter()
+        .map(|m| {
+            // Hosts play in their own country; otherwise round-robin across all venues.
+            let (_, country, altitude_m) =
+                match host_country(m.home).or_else(|| host_country(m.away)) {
+                    Some(c) => {
+                        let in_country: Vec<&(&str, &str, f64)> =
+                            VENUES.iter().filter(|v| v.1 == c).collect();
+                        *in_country[(m.id.0 as usize) % in_country.len()]
+                    }
+                    None => VENUES[(m.id.0 as usize) % VENUES.len()],
+                };
+            let host = if host_country(m.home) == Some(country) {
+                Host::HomeTeam
+            } else if host_country(m.away) == Some(country) {
+                Host::AwayTeam
+            } else {
+                Host::Neutral
+            };
+            let ctx = MatchContext {
+                host,
+                altitude_m,
+                home_rest_days: rest.get(&(m.home, m.id)).copied().unwrap_or(4),
+                away_rest_days: rest.get(&(m.away, m.id)).copied().unwrap_or(4),
+            };
+            (m.id, ctx)
+        })
+        .collect()
+}
+
+/// Per-match venue/travel adjustments: `match_contexts` mapped through the model's
+/// `context_adjustment`. Each value is `((home_atk, home_def), (away_atk, away_def))`.
+pub fn venue_adjustments(tournament: &Tournament) -> HashMap<MatchId, VenueAdj> {
+    match_contexts(tournament)
+        .into_iter()
+        .map(|(id, ctx)| (id, context_adjustment(&ctx)))
+        .collect()
 }
 
 /// The offline-fitted baseline: a goal model, Elo seeds, and a **learned** ensemble.
@@ -545,41 +702,45 @@ pub struct Baseline {
 }
 
 /// Fit the full baseline on synthetic history with a proper train→validation split:
-/// Dixon-Coles and Elo are fit on the older 70%, then the ensemble weights +
-/// temperature are *learned* on the held-out 30%. This is what makes the shipped
-/// ensemble provably no worse than its best member (no more hardcoded weights).
+/// Dixon-Coles (on xG) and Elo are fit on the older 70%, then the ensemble weights +
+/// temperature are *learned* on the held-out 30%. The ensemble has three members
+/// `[Dixon-Coles, Elo, Market]`, so when a match has odds the engine anchors to the
+/// market, and degrades gracefully to two members when it does not.
 pub fn fit_baseline(seed: u64) -> Baseline {
-    let mut history = synthetic_history(4000, seed);
+    let mut history = synthetic_history_with_market(4000, seed);
     // Oldest first, so we train on the past and validate on more recent matches.
     history.sort_by(|a, b| {
-        b.age_days
-            .partial_cmp(&a.age_days)
+        b.obs
+            .age_days
+            .partial_cmp(&a.obs.age_days)
             .unwrap_or(std::cmp::Ordering::Equal)
     });
     let split = history.len() * 7 / 10;
     let (train, validation) = history.split_at(split);
 
-    let model = GoalModel::fit(train, DixonColesConfig::default());
+    let train_obs: Vec<Observation> = train.iter().map(|r| r.obs).collect();
+    let model = GoalModel::fit(&train_obs, DixonColesConfig::default());
 
     let elo_seeds = team_strengths();
     let mut ratings = RatingStore::with_defaults();
     for &(team, rating) in &elo_seeds {
         ratings.seed(team, rating);
     }
-    for obs in train {
-        ratings.record(obs.home, obs.away, obs.score, true);
+    for r in train {
+        ratings.record(r.obs.home, r.obs.away, r.obs.score, true);
     }
 
-    // Member predictions on the validation slice: [Dixon-Coles, Elo].
+    // Member predictions on the validation slice: [Dixon-Coles, Elo, Market].
     let mut member_preds = Vec::with_capacity(validation.len());
     let mut actuals = Vec::with_capacity(validation.len());
-    for obs in validation {
-        let dc = model.outcome_probabilities(obs.home, obs.away, true);
-        let elo = ratings.win_probabilities(obs.home, obs.away, true);
-        member_preds.push(vec![dc, elo]);
-        actuals.push(obs.score.outcome());
+    for r in validation {
+        let dc = model.outcome_probabilities(r.obs.home, r.obs.away, true);
+        let elo = ratings.win_probabilities(r.obs.home, r.obs.away, true);
+        let market = r.market.unwrap_or_else(Probabilities::uniform);
+        member_preds.push(vec![dc, elo, market]);
+        actuals.push(r.obs.score.outcome());
     }
-    let ensemble = Ensemble::fit(&member_preds, &actuals, 2);
+    let ensemble = Ensemble::fit(&member_preds, &actuals, 3);
 
     Baseline {
         model,
@@ -687,6 +848,28 @@ mod tests {
         assert!(records.iter().all(|r| r.market.is_some()));
         let m = records[0].market.unwrap();
         assert!((m.sum() - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn venue_adjustments_cover_all_matches_and_are_bounded() {
+        let t = world_cup_2026();
+        let adj = venue_adjustments(&t);
+        assert_eq!(adj.len(), t.matches.len());
+        for &((ha, hd), (aa, ad)) in adj.values() {
+            for v in [ha, hd, aa, ad] {
+                assert!(
+                    v.is_finite() && v.abs() <= 0.5,
+                    "adjustment out of range: {v}"
+                );
+            }
+        }
+        // At least the host nations exist in the field, so some context is non-neutral.
+        let contexts = match_contexts(&t);
+        let hosted = contexts
+            .values()
+            .filter(|c| c.host != Host::Neutral)
+            .count();
+        assert!(hosted > 0, "expected some host-nation matches");
     }
 
     #[test]

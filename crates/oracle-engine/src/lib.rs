@@ -31,9 +31,11 @@ use oracle_domain::{
     Tournament,
 };
 use oracle_ingest::DataProvider;
-use oracle_model::{live_score_grid, Ensemble, GoalModel, LiveConfig, LiveState};
+use oracle_model::{
+    implied_probabilities, live_score_grid, Ensemble, GoalModel, LiveConfig, LiveState,
+};
 use oracle_ratings::{EloConfig, RatingStore};
-use oracle_sim::{simulate_with_live, InProgress, SimConfig};
+use oracle_sim::{simulate_with_live, InProgress, LiveInputs, SimConfig, VenueAdj};
 use std::collections::HashMap;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
@@ -270,6 +272,9 @@ struct LiveMatch {
     home_defense_adj: f64,
     away_attack_adj: f64,
     away_defense_adj: f64,
+    /// Bookmaker-implied probabilities, set by an `Odds` event. Folded into the pre-match
+    /// ensemble as a third member when present.
+    market: Option<Probabilities>,
 }
 
 impl LiveMatch {
@@ -288,6 +293,7 @@ impl LiveMatch {
             home_defense_adj: 0.0,
             away_attack_adj: 0.0,
             away_defense_adj: 0.0,
+            market: None,
         }
     }
 
@@ -319,6 +325,8 @@ struct EngineState {
     sim_config: SimConfig,
     live: HashMap<MatchId, LiveMatch>,
     last_forecast: oracle_domain::TournamentForecast,
+    /// Per-match venue/travel adjustments (host, altitude, rest), precomputed once.
+    venue_adj: HashMap<MatchId, VenueAdj>,
     /// Whether the data feed is currently healthy (updated by `SourceStatus` events).
     source_healthy: bool,
     /// Wall-clock time the last event was processed - surfaces feed staleness.
@@ -342,6 +350,8 @@ impl EngineState {
         for (team, rating) in deps.elo_seeds {
             ratings.seed(team, rating);
         }
+        // Venue/travel context is static for the tournament, so precompute it once.
+        let venue_adj = oracle_ingest::data::venue_adjustments(&tournament);
         Self {
             tournament,
             names,
@@ -356,9 +366,22 @@ impl EngineState {
                 iterations: 0,
                 teams: Vec::new(),
             },
+            venue_adj,
             source_healthy: true,
             last_update: chrono::Utc::now(),
         }
+    }
+
+    /// Combined venue + lineup `(home_adj, away_adj)` deltas for a match (summed in log
+    /// space), feeding the adjusted goal model and the Monte-Carlo.
+    fn match_adjustments(&self, id: MatchId) -> VenueAdj {
+        let ((vh_a, vh_d), (va_a, va_d)) = self.venue_adj.get(&id).copied().unwrap_or_default();
+        let ((lh_a, lh_d), (la_a, la_d)) = self
+            .live
+            .get(&id)
+            .map(|l| (l.home_adj(), l.away_adj()))
+            .unwrap_or_default();
+        ((vh_a + lh_a, vh_d + lh_d), (va_a + la_a, va_d + la_d))
     }
 
     /// Apply an event to mutable state. Returns `true` when a result landed (the
@@ -439,6 +462,9 @@ impl EngineState {
                     lm.away_attack_adj = a_atk;
                     lm.away_defense_adj = a_def;
                 }
+                EventKind::Odds { home, draw, away } => {
+                    lm.market = Some(implied_probabilities(*home, *draw, *away));
+                }
                 // SourceStatus is handled above the match lookup; the rest are no-ops.
                 EventKind::SourceStatus { .. }
                 | EventKind::HalfTime
@@ -459,7 +485,8 @@ impl EngineState {
     fn recompute_forecast(&mut self) {
         // Condition the forecast on live state: matches in play (sample the remainder) and
         // matches with a confirmed lineup (adjusted goal rates), instead of treating every
-        // unfinished match as a fresh, full-strength 0-0.
+        // unfinished match as a fresh, full-strength 0-0. Venue/travel context applies to
+        // every fixture.
         let live: HashMap<MatchId, InProgress> = self
             .live
             .iter()
@@ -480,11 +507,15 @@ impl EngineState {
                 )
             })
             .collect();
+        let inputs = LiveInputs {
+            live,
+            venue: self.venue_adj.clone(),
+        };
         self.last_forecast = simulate_with_live(
             &self.tournament,
             &self.model,
             self.sim_config,
-            &live,
+            &inputs,
             self.live_config,
         );
     }
@@ -503,10 +534,8 @@ impl EngineState {
             None => (m.status, m.score, 0, 0, 0),
         };
         const NEUTRAL: bool = true;
-        // Apply any confirmed-lineup adjustment to this match's goal rates.
-        let (home_adj, away_adj) = lm
-            .map(|l| (l.home_adj(), l.away_adj()))
-            .unwrap_or(((0.0, 0.0), (0.0, 0.0)));
+        // Apply venue/travel + confirmed-lineup adjustments to this match's goal rates.
+        let (home_adj, away_adj) = self.match_adjustments(m.id);
         let (lambda, mu) = self
             .model
             .expected_goals_adjusted(m.home, m.away, NEUTRAL, home_adj, away_adj);
@@ -526,13 +555,19 @@ impl EngineState {
             }
             MatchStatus::Finished => (one_hot(score.outcome()), None, None),
             MatchStatus::Scheduled | MatchStatus::Postponed => {
-                // Pre-match: blend the (lineup-adjusted) Dixon-Coles grid with Elo.
+                // Pre-match: blend the (lineup-adjusted) Dixon-Coles grid with Elo, plus the
+                // bookmaker market as a third member when odds are present. The ensemble has
+                // three weights; `blend` renormalizes, so two members is a clean fallback.
                 let grid = self
                     .model
                     .score_grid_adjusted(m.home, m.away, NEUTRAL, home_adj, away_adj);
                 let dc = grid.outcome_probabilities();
                 let elo = self.ratings.win_probabilities(m.home, m.away, NEUTRAL);
-                let blended = self.ensemble.blend(&[dc, elo]);
+                let mut members = vec![dc, elo];
+                if let Some(market) = lm.and_then(|l| l.market) {
+                    members.push(market);
+                }
+                let blended = self.ensemble.blend(&members);
                 let mls = grid.most_likely_score();
                 (blended, Some(grid), Some(mls))
             }
@@ -739,6 +774,33 @@ mod tests {
         assert!(
             weakened < baseline,
             "benching the home star should lower home win probability ({baseline:.3} -> {weakened:.3})"
+        );
+    }
+
+    #[test]
+    fn odds_anchor_a_scheduled_match_toward_the_market() {
+        let mut state = fresh_state();
+        let metrics = Metrics::default();
+        let m = state.tournament.matches[0].clone();
+        let baseline = state.predict_match(&m).probabilities.home_win;
+
+        // A bookmaker line heavily favouring the away team.
+        state.apply_event(
+            &MatchEvent::new(
+                m.id,
+                0,
+                EventKind::Odds {
+                    home: 8.0,
+                    draw: 5.0,
+                    away: 1.3,
+                },
+            ),
+            &metrics,
+        );
+        let anchored = state.predict_match(&m).probabilities.home_win;
+        assert!(
+            anchored < baseline,
+            "away-favouring odds should pull home win probability down ({baseline:.3} -> {anchored:.3})"
         );
     }
 }

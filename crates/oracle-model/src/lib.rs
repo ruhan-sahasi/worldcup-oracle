@@ -14,12 +14,14 @@
 #![forbid(unsafe_code)]
 
 pub mod calibration;
+pub mod context;
 pub mod dixon_coles;
 pub mod ensemble;
 pub mod live;
 pub mod poisson;
 
 pub use calibration::{implied_probabilities, score, CalibrationReport};
+pub use context::{context_adjustment, Host, MatchContext};
 pub use dixon_coles::{DixonColesConfig, GoalModel, Observation};
 pub use ensemble::{Ensemble, EnsembleFitConfig};
 pub use live::{live_probabilities, live_score_grid, remaining_rates, LiveConfig, LiveState};

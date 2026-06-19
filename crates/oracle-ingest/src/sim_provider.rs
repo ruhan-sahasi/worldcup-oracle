@@ -88,6 +88,22 @@ impl SimProvider {
         )
         .await?;
 
+        // Publish a synthetic bookmaker line so the engine anchors the pre-match odds.
+        let (oh, od, oa) = data::market_line(home, away);
+        send(
+            tx,
+            MatchEvent::new(
+                match_id,
+                0,
+                EventKind::Odds {
+                    home: oh,
+                    draw: od,
+                    away: oa,
+                },
+            ),
+        )
+        .await?;
+
         send(tx, MatchEvent::new(match_id, 0, EventKind::KickOff)).await?;
 
         for minute in 1..=90u16 {

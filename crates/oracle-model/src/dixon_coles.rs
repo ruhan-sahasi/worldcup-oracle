@@ -32,6 +32,10 @@ pub struct Observation {
     pub home: TeamId,
     pub away: TeamId,
     pub score: Scoreline,
+    /// Expected goals (xG) for each side, when available. The fit regresses on xG instead
+    /// of goals when present: xG is a far less noisy signal than the realized scoreline.
+    pub home_xg: Option<f64>,
+    pub away_xg: Option<f64>,
     /// Age of the match in days; older matches are exponentially down-weighted.
     pub age_days: f64,
 }
@@ -42,8 +46,39 @@ impl Observation {
             home,
             away,
             score,
+            home_xg: None,
+            away_xg: None,
             age_days,
         }
+    }
+
+    /// As [`new`], but with expected goals attached, which the fit prefers over goals.
+    pub fn with_xg(
+        home: TeamId,
+        away: TeamId,
+        score: Scoreline,
+        home_xg: f64,
+        away_xg: f64,
+        age_days: f64,
+    ) -> Self {
+        Self {
+            home,
+            away,
+            score,
+            home_xg: Some(home_xg),
+            away_xg: Some(away_xg),
+            age_days,
+        }
+    }
+
+    /// Regression target for the home rate: xG if present, else the realized goals.
+    fn target_home(&self) -> f64 {
+        self.home_xg.unwrap_or_else(|| f64::from(self.score.home))
+    }
+
+    /// Regression target for the away rate: xG if present, else the realized goals.
+    fn target_away(&self) -> f64 {
+        self.away_xg.unwrap_or_else(|| f64::from(self.score.away))
     }
 }
 
@@ -125,11 +160,12 @@ impl GoalModel {
 
         let mut attack: HashMap<TeamId, f64> = teams.iter().map(|&t| (t, 0.0)).collect();
         let mut defense: HashMap<TeamId, f64> = teams.iter().map(|&t| (t, 0.0)).collect();
-        // Seed intercept from the (weighted) average goals per team per match.
+        // Seed intercept from the (weighted) average expected goals per team per match
+        // (xG when available, else realized goals).
         let avg_goals: f64 = observations
             .iter()
             .zip(&weights)
-            .map(|(o, w)| w * f64::from(o.score.home + o.score.away) / 2.0)
+            .map(|(o, w)| w * (o.target_home() + o.target_away()) / 2.0)
             .sum::<f64>()
             / total_weight;
         let mut intercept = avg_goals.max(0.2).ln();
@@ -150,8 +186,10 @@ impl GoalModel {
                 let lambda = (intercept + a_h - d_a + home_advantage).exp();
                 let mu = (intercept + a_a - d_h).exp();
 
-                let res_h = f64::from(o.score.home) - lambda; // ∂/∂(logλ)
-                let res_a = f64::from(o.score.away) - mu; // ∂/∂(logμ)
+                // Regress on xG when present (sharper than goals); the Poisson score
+                // equation `target - rate` is a valid estimating equation either way.
+                let res_h = o.target_home() - lambda; // ∂/∂(logλ)
+                let res_a = o.target_away() - mu; // ∂/∂(logμ)
 
                 *g_attack.get_mut(&o.home).unwrap() += w * res_h;
                 *g_attack.get_mut(&o.away).unwrap() += w * res_a;
@@ -427,6 +465,39 @@ mod tests {
             "weakened home team is less favoured"
         );
         assert!((weak.sum() - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn xg_drives_the_fit_when_goals_are_uninformative() {
+        // Every match ends 0-0 (the scoreline carries no signal), but team 1 consistently
+        // out-creates team 2 on xG. A goals-only fit would rate them equal; the xG fit must
+        // make team 1 the favourite.
+        let mut obs = Vec::new();
+        for i in 0..40 {
+            let age = i as f64;
+            obs.push(Observation::with_xg(
+                t(1),
+                t(2),
+                Scoreline::new(0, 0),
+                2.2,
+                0.5,
+                age,
+            ));
+            obs.push(Observation::with_xg(
+                t(2),
+                t(1),
+                Scoreline::new(0, 0),
+                0.5,
+                2.2,
+                age,
+            ));
+        }
+        let model = GoalModel::fit(&obs, DixonColesConfig::default());
+        let (l, m) = model.expected_goals(t(1), t(2), true);
+        assert!(
+            l > m,
+            "xG should make team 1 the favourite ({l:.2} vs {m:.2})"
+        );
     }
 
     #[test]

@@ -11,7 +11,7 @@ use crate::team::TeamId;
 use serde::{Deserialize, Serialize};
 
 /// A timestamped thing that happened in a match.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MatchEvent {
     pub match_id: MatchId,
     /// Match minute the event occurred at (0 for pre-kickoff lineup events).
@@ -31,7 +31,9 @@ impl MatchEvent {
 
 /// What kind of event occurred. This is intentionally a closed set: every variant
 /// maps to a concrete state transition or model input.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// (Not `Eq`: the `Odds` variant carries `f64` decimal odds.)
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum EventKind {
     /// The match started.
@@ -65,6 +67,9 @@ pub enum EventKind {
         home: Vec<String>,
         away: Vec<String>,
     },
+    /// Bookmaker decimal odds for the match. The engine removes the vig and folds the
+    /// implied probabilities into the pre-match ensemble as a sharp, orthogonal prior.
+    Odds { home: f64, draw: f64, away: f64 },
 }
 
 impl EventKind {

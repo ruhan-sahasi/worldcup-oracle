@@ -16,9 +16,9 @@ mod watch;
 use clap::{Parser, Subcommand};
 use oracle_domain::{ScoreGrid, Team, TeamId};
 use oracle_ingest::data;
-use oracle_model::{Ensemble, GoalModel};
+use oracle_model::{Ensemble, GoalModel, LiveConfig};
 use oracle_ratings::RatingStore;
-use oracle_sim::{simulate, SimConfig};
+use oracle_sim::{simulate_with_live, LiveInputs, SimConfig};
 use std::net::SocketAddr;
 use std::time::Instant;
 
@@ -56,6 +56,14 @@ enum Command {
         /// Away team (name or FIFA code, case-insensitive).
         #[arg(long)]
         away: String,
+        /// Optional bookmaker decimal odds. Supply all three to anchor the ensemble to
+        /// the market line.
+        #[arg(long)]
+        home_odds: Option<f64>,
+        #[arg(long)]
+        draw_odds: Option<f64>,
+        #[arg(long)]
+        away_odds: Option<f64>,
     },
     /// Backtest the model and benchmark it against the bookmaker.
     Backtest {
@@ -88,7 +96,13 @@ async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Command::Simulate { iters, seed, top } => cmd_simulate(iters, seed, top),
-        Command::Predict { home, away } => cmd_predict(&home, &away),
+        Command::Predict {
+            home,
+            away,
+            home_odds,
+            draw_odds,
+            away_odds,
+        } => cmd_predict(&home, &away, (home_odds, draw_odds, away_odds)),
         Command::Backtest {
             matches,
             seed,
@@ -131,8 +145,13 @@ fn cmd_simulate(iters: u64, seed: u64, top: usize) -> anyhow::Result<()> {
         "Simulating {} - {} iterations (seed {})...\n",
         tournament.name, iters, seed
     );
+    // Apply the venue/travel context (host advantage, altitude, rest) to every fixture.
+    let inputs = LiveInputs {
+        venue: data::venue_adjustments(&tournament),
+        ..Default::default()
+    };
     let start = Instant::now();
-    let forecast = simulate(
+    let forecast = simulate_with_live(
         &tournament,
         &model,
         SimConfig {
@@ -140,6 +159,8 @@ fn cmd_simulate(iters: u64, seed: u64, top: usize) -> anyhow::Result<()> {
             seed,
             ..SimConfig::default()
         },
+        &inputs,
+        LiveConfig::default(),
     );
     let elapsed = start.elapsed();
 
@@ -170,7 +191,11 @@ fn cmd_simulate(iters: u64, seed: u64, top: usize) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn cmd_predict(home_q: &str, away_q: &str) -> anyhow::Result<()> {
+fn cmd_predict(
+    home_q: &str,
+    away_q: &str,
+    odds: (Option<f64>, Option<f64>, Option<f64>),
+) -> anyhow::Result<()> {
     let teams = data::teams();
     let home =
         resolve_team(home_q, &teams).ok_or_else(|| anyhow::anyhow!("unknown team: {home_q}"))?;
@@ -189,7 +214,16 @@ fn cmd_predict(home_q: &str, away_q: &str) -> anyhow::Result<()> {
     let grid = model.score_grid(home, away, true);
     let dc = grid.outcome_probabilities();
     let elo = ratings.win_probabilities(home, away, true);
-    let blended = ensemble.blend(&[dc, elo]);
+    // Anchor to the market when all three odds are supplied.
+    let market = match odds {
+        (Some(h), Some(d), Some(a)) => Some(oracle_model::implied_probabilities(h, d, a)),
+        _ => None,
+    };
+    let mut members = vec![dc, elo];
+    if let Some(m) = market {
+        members.push(m);
+    }
+    let blended = ensemble.blend(&members);
     let (lambda, mu) = model.expected_goals(home, away, true);
 
     println!("\n  {}  vs  {}   (neutral venue)\n", name(home), name(away));
@@ -210,6 +244,14 @@ fn cmd_predict(home_q: &str, away_q: &str) -> anyhow::Result<()> {
         elo.draw * 100.0,
         elo.away_win * 100.0,
     );
+    if let Some(m) = market {
+        println!(
+            "    Market     :  {:>5.1}% / {:>4.1}% / {:>5.1}%   (vig removed; anchored into the ensemble)",
+            m.home_win * 100.0,
+            m.draw * 100.0,
+            m.away_win * 100.0,
+        );
+    }
     println!("\n  Expected goals : {lambda:.2} – {mu:.2}");
     let (mh, ma, mp) = grid.most_likely_score();
     println!("  Most likely    : {mh}–{ma}  ({:.1}%)", mp * 100.0);
@@ -276,10 +318,21 @@ fn cmd_backtest(
     let validation = &records[train_end..val_end];
     let test = &records[val_end..];
 
-    // Fit the goal model and build Elo by replaying the training results. For synthetic
-    // data we can also seed Elo from known strengths; real CSV teams are interned, so Elo
-    // simply learns from the training matches.
+    let xg_present = train_obs.iter().any(|o| o.home_xg.is_some());
+    let market_present = records.iter().any(|r| r.market.is_some());
+
+    // Fit the goal model on xG when present (sharper), and build Elo by replaying training
+    // results. For synthetic data we can also seed Elo from known strengths; real CSV teams
+    // are interned, so Elo simply learns from the training matches.
     let model = GoalModel::fit(&train_obs, DixonColesConfig::default());
+    // A goals-only refit for comparison, to show the xG lever explicitly.
+    let model_goals = xg_present.then(|| {
+        let stripped: Vec<Observation> = train_obs
+            .iter()
+            .map(|o| Observation::new(o.home, o.away, o.score, o.age_days))
+            .collect();
+        GoalModel::fit(&stripped, DixonColesConfig::default())
+    });
     let mut ratings = RatingStore::with_defaults();
     if !real_data {
         for (team, rating) in data::team_strengths() {
@@ -290,20 +343,29 @@ fn cmd_backtest(
         ratings.record(r.obs.home, r.obs.away, r.obs.score, true);
     }
 
-    // Learn the ensemble weights + temperature on the validation split.
+    // Learn the ensemble on validation. Include the market as a third member when odds are
+    // available, so the ensemble can anchor to the sharpest signal.
     let mut val_preds = Vec::new();
     let mut val_actuals = Vec::new();
     for r in validation {
-        val_preds.push(vec![
-            model.outcome_probabilities(r.obs.home, r.obs.away, true),
-            ratings.win_probabilities(r.obs.home, r.obs.away, true),
-        ]);
-        val_actuals.push(r.obs.score.outcome());
+        let dc = model.outcome_probabilities(r.obs.home, r.obs.away, true);
+        let elo = ratings.win_probabilities(r.obs.home, r.obs.away, true);
+        if market_present {
+            if let Some(m) = r.market {
+                val_preds.push(vec![dc, elo, m]);
+                val_actuals.push(r.obs.score.outcome());
+            }
+        } else {
+            val_preds.push(vec![dc, elo]);
+            val_actuals.push(r.obs.score.outcome());
+        }
     }
-    let ensemble = Ensemble::fit(&val_preds, &val_actuals, 2);
+    let n_members = if market_present { 3 } else { 2 };
+    let ensemble = Ensemble::fit(&val_preds, &val_actuals, n_members);
 
     // Evaluate everything (incl. the bookmaker) on the held-out test split.
     let mut dc_preds = Vec::new();
+    let mut dc_goals_preds = Vec::new();
     let mut elo_preds = Vec::new();
     let mut ens_preds = Vec::new();
     let mut market_preds = Vec::new();
@@ -313,10 +375,18 @@ fn cmd_backtest(
         let elo = ratings.win_probabilities(r.obs.home, r.obs.away, true);
         dc_preds.push((dc, actual));
         elo_preds.push((elo, actual));
-        ens_preds.push((ensemble.blend(&[dc, elo]), actual));
+        if let Some(mg) = &model_goals {
+            dc_goals_preds.push((
+                mg.outcome_probabilities(r.obs.home, r.obs.away, true),
+                actual,
+            ));
+        }
+        let mut members = vec![dc, elo];
         if let Some(market) = r.market {
+            members.push(market);
             market_preds.push((market, actual));
         }
+        ens_preds.push((ensemble.blend(&members), actual));
     }
 
     println!(
@@ -344,22 +414,50 @@ fn cmd_backtest(
         "Uniform baseline",
         oracle_model::CalibrationReport::uniform_baseline(test.len()),
     );
-    row("Dixon-Coles", score(&dc_preds));
+    if !dc_goals_preds.is_empty() {
+        row("Dixon-Coles (goals)", score(&dc_goals_preds));
+    }
+    row(
+        if xg_present {
+            "Dixon-Coles (xG)"
+        } else {
+            "Dixon-Coles"
+        },
+        score(&dc_preds),
+    );
     row("Elo", score(&elo_preds));
-    row("Ensemble (learned)", score(&ens_preds));
+    row(
+        if market_present {
+            "Ensemble (+Market)"
+        } else {
+            "Ensemble (DC+Elo)"
+        },
+        score(&ens_preds),
+    );
     if market_preds.is_empty() {
         println!("  Market (bookmaker)        (no odds in this dataset)");
     } else {
         row("Market (bookmaker)", score(&market_preds));
     }
 
-    let wsum: f64 = ensemble.weights.iter().sum();
-    println!(
-        "\n  learned weights: Dixon-Coles {:.2} / Elo {:.2}   temperature {:.2}",
-        ensemble.weights.first().copied().unwrap_or(0.0) / wsum,
-        ensemble.weights.get(1).copied().unwrap_or(0.0) / wsum,
-        ensemble.temperature,
-    );
+    let wsum: f64 = ensemble.weights.iter().sum::<f64>().max(1e-9);
+    let w = |i: usize| ensemble.weights.get(i).copied().unwrap_or(0.0) / wsum;
+    if market_present {
+        println!(
+            "\n  learned weights: DC {:.2} / Elo {:.2} / Market {:.2}   temperature {:.2}",
+            w(0),
+            w(1),
+            w(2),
+            ensemble.temperature,
+        );
+    } else {
+        println!(
+            "\n  learned weights: DC {:.2} / Elo {:.2}   temperature {:.2}",
+            w(0),
+            w(1),
+            ensemble.temperature,
+        );
+    }
     println!("  (lower Brier / log-loss is better; the market is the bar to beat)\n");
     Ok(())
 }

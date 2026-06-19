@@ -294,4 +294,34 @@ mod tests {
             "fitted log-loss {ll_fit:.4} should be ≤ good-member-only {ll_good:.4}"
         );
     }
+
+    /// With three members where the third (a "market") is near-perfect, stacking should
+    /// put the most weight on it.
+    #[test]
+    fn fit_weights_a_near_perfect_market_member_heavily() {
+        let mut member_preds = Vec::new();
+        let mut actuals = Vec::new();
+        for i in 0..300u32 {
+            let actual = match i % 3 {
+                0 => Outcome::HomeWin,
+                1 => Outcome::Draw,
+                _ => Outcome::AwayWin,
+            };
+            let dc = Probabilities::new(0.45, 0.30, 0.25);
+            let elo = Probabilities::new(0.40, 0.30, 0.30);
+            let market = match actual {
+                Outcome::HomeWin => Probabilities::new(0.90, 0.07, 0.03),
+                Outcome::Draw => Probabilities::new(0.07, 0.90, 0.03),
+                Outcome::AwayWin => Probabilities::new(0.03, 0.07, 0.90),
+            };
+            member_preds.push(vec![dc, elo, market]);
+            actuals.push(actual);
+        }
+        let fitted = Ensemble::fit(&member_preds, &actuals, 3);
+        assert!(
+            fitted.weights[2] > fitted.weights[0] && fitted.weights[2] > fitted.weights[1],
+            "the near-perfect market member should carry the most weight ({:?})",
+            fitted.weights
+        );
+    }
 }
