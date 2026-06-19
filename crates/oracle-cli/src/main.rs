@@ -82,6 +82,10 @@ enum Command {
         /// Listen address.
         #[arg(long, default_value = "127.0.0.1:8080")]
         addr: SocketAddr,
+        /// Append-only event log path. Events are recorded here and replayed on restart
+        /// to recover state.
+        #[arg(long)]
+        event_log: Option<std::path::PathBuf>,
     },
     /// Live terminal dashboard following a simulated tournament.
     Watch {
@@ -108,7 +112,7 @@ async fn main() -> anyhow::Result<()> {
             seed,
             data,
         } => cmd_backtest(matches, seed, data),
-        Command::Serve { addr } => cmd_serve(addr).await,
+        Command::Serve { addr, event_log } => cmd_serve(addr, event_log).await,
         Command::Watch { speed } => watch::run(speed).await,
     }
 }
@@ -164,18 +168,23 @@ fn cmd_simulate(iters: u64, seed: u64, top: usize) -> anyhow::Result<()> {
     );
     let elapsed = start.elapsed();
 
+    // Monte-Carlo standard error on a probability from N iterations: sqrt(p(1-p)/N).
+    let n = forecast.iterations.max(1) as f64;
+    let stderr = |p: f64| (p * (1.0 - p) / n).sqrt();
+
     println!(
-        "{:>3}  {:<16} {:>8} {:>8} {:>8} {:>8} {:>8}",
-        "#", "Team", "Champ", "Final", "Semi", "Quart", "R16"
+        "{:>3}  {:<16} {:>15} {:>8} {:>8} {:>8} {:>8}",
+        "#", "Team", "Champ (±MC err)", "Final", "Semi", "Quart", "R16"
     );
-    println!("{}", "-".repeat(68));
+    println!("{}", "-".repeat(74));
     for (i, t) in forecast.ranked().into_iter().take(top).enumerate() {
         let name = names.get(&t.team).cloned().unwrap_or_default();
         println!(
-            "{:>3}  {:<16} {:>7.1}% {:>7.1}% {:>7.1}% {:>7.1}% {:>7.1}%",
+            "{:>3}  {:<16} {:>6.1}% ±{:>4.1}% {:>7.1}% {:>7.1}% {:>7.1}% {:>7.1}%",
             i + 1,
             name,
             t.p_champion * 100.0,
+            stderr(t.p_champion) * 100.0,
             t.p_final * 100.0,
             t.p_semi_final * 100.0,
             t.p_quarter_final * 100.0,
@@ -183,7 +192,8 @@ fn cmd_simulate(iters: u64, seed: u64, top: usize) -> anyhow::Result<()> {
         );
     }
     println!(
-        "\n{} simulations in {:.2}s  ({:.0} tournaments/sec)",
+        "\n{} simulations in {:.2}s  ({:.0} tournaments/sec); ±MC err is the Monte-Carlo \
+         standard error on the champion probability",
         iters,
         elapsed.as_secs_f64(),
         iters as f64 / elapsed.as_secs_f64().max(1e-9),
@@ -458,11 +468,34 @@ fn cmd_backtest(
             ensemble.temperature,
         );
     }
-    println!("  (lower Brier / log-loss is better; the market is the bar to beat)\n");
+    println!("  (lower Brier / log-loss is better; the market is the bar to beat)");
+
+    // Reliability (calibration) of the learned ensemble: in each predicted-probability
+    // bucket, how often did the outcome actually happen?
+    let rel = oracle_model::reliability(&ens_preds, 5);
+    println!("\n  Ensemble calibration (ECE {:.3}):", rel.ece);
+    println!(
+        "    {:>12}   {:>9}   {:>9}   {:>6}",
+        "bucket", "predicted", "empirical", "n"
+    );
+    for b in &rel.bins {
+        if b.count == 0 {
+            continue;
+        }
+        println!(
+            "    {:>4.0}-{:<3.0}%      {:>7.1}%   {:>7.1}%   {:>6}",
+            b.lo * 100.0,
+            b.hi * 100.0,
+            b.mean_pred * 100.0,
+            b.empirical * 100.0,
+            b.count,
+        );
+    }
+    println!("    (predicted ≈ empirical in every bucket means well-calibrated)\n");
     Ok(())
 }
 
-async fn cmd_serve(addr: SocketAddr) -> anyhow::Result<()> {
+async fn cmd_serve(addr: SocketAddr, event_log: Option<std::path::PathBuf>) -> anyhow::Result<()> {
     use tokio_util::sync::CancellationToken;
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -474,7 +507,10 @@ async fn cmd_serve(addr: SocketAddr) -> anyhow::Result<()> {
     let cancel = CancellationToken::new();
     let (engine, join) = oracle_engine::spawn(
         oracle_engine::presets::auto(),
-        oracle_engine::EngineConfig::default(),
+        oracle_engine::EngineConfig {
+            event_log,
+            ..Default::default()
+        },
         cancel.clone(),
     )
     .await?;
