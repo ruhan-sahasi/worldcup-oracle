@@ -101,8 +101,10 @@ P(x, y) = τ(x, y; λ, μ, ρ) · Poisson(x; λ) · Poisson(y; μ)
 Parameters are fit by **maximum likelihood** on historical results, each weighted by
 `exp(−ξ · age_days)` so recent form counts more. The attack/defense/intercept/home
 terms ascend the time-weighted Poisson log-likelihood analytically (the score
-equations reduce to `observed − expected` goals); `ρ` is fit by a 1-D search over the
-fully-corrected likelihood.
+equations reduce to `target − expected`); `ρ` is fit by a 1-D search over the
+fully-corrected likelihood. When **expected goals (xG)** are attached to an observation
+the fit regresses on them instead of the realized goals: xG is a much lower-noise signal
+(a team can dominate xG and lose), so the same estimating equation gives a sharper model.
 
 ### Bayesian in-match updating (`oracle-model::live`)
 Live, we condition on the current scoreline, minute, and red cards. Remaining goals
@@ -112,23 +114,28 @@ posterior over "goals still to come" gives live win/draw/win probabilities that 
 on every event.
 
 ### Ensemble (`oracle-model::ensemble`)
-A temperature-scaled **logarithmic opinion pool** blends the Dixon-Coles and Elo
-forecasts: `q(o) ∝ exp(τ · Σ_k a_k · ln p_k(o))`. The mixture weights `a_k` and
-temperature `τ` are **learned by stacking** (gradient descent on held-out log loss in
-`Ensemble::fit`), so the blend is provably no worse than its best member.
+A temperature-scaled **logarithmic opinion pool** blends up to three members,
+`[Dixon-Coles, Elo, Market]`: `q(o) ∝ exp(τ · Σ_k a_k · ln p_k(o))`. The mixture weights
+`a_k` and temperature `τ` are **learned by stacking** (gradient descent on held-out log
+loss in `Ensemble::fit`), so the blend is provably no worse than its best member. When a
+match has bookmaker odds they enter as the third member and the ensemble anchors to them;
+with no odds it degrades cleanly to two members (`blend` renormalizes the weights).
 
-### Lineup adjustment (`oracle-ingest::data` + `oracle-model`)
-A confirmed starting XI is compared to the team's strongest available XI to produce a
-log-space `(attack, defense)` adjustment, applied to the goal rates via
-`GoalModel::expected_goals_adjusted`. A rested or missing key player lowers that team's
-expected goals and lifts the opponent's. Squads are synthetic for offline use; the live
-adapter would supply real lineups.
+### Lineup & venue adjustments (`oracle-ingest::data` + `oracle-model`)
+Two context signals produce log-space per-team `(attack, defense)` deltas that sum and feed
+`GoalModel::expected_goals_adjusted`. **Lineups**: a confirmed XI compared to the strongest
+available XI (a missing key player lowers that side and lifts the opponent). **Venue/travel
+(`MatchContext`)**: host-nation/crowd advantage, Mexico-City-style altitude, and rest-day
+differential. Venue applies to every Monte-Carlo fixture, so host advantage reaches the
+champion odds. Squads, xG, and venue assignments are synthetic offline; rest days come from
+the real fixture schedule.
 
-### Market benchmark (`oracle-model::implied_probabilities`)
+### Market prior & benchmark (`oracle-model::implied_probabilities`)
 Decimal odds are inverted and the overround normalized away to recover the bookmaker's
-implied probabilities. The `backtest` command scores the market on the held-out split
-beside the models, so "can we beat the book" is explicit. `load_results_csv` ingests real
-football-data.co.uk results with closing odds.
+implied probabilities. These feed the ensemble's third member (above) and, in `backtest`,
+score the market on the held-out split beside the models, so "can we beat the book" is
+explicit. `load_results_csv` ingests real football-data.co.uk results with closing odds
+(and optional xG columns).
 
 ### Monte-Carlo tournament sim (`oracle-sim`)
 Plays the remaining group fixtures and the 32-team knockout out tens of thousands of

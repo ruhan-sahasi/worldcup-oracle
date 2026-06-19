@@ -45,11 +45,12 @@ fully offline with **zero keys and zero network**.
 
 | Piece | What it contributes |
 |-------|---------------------|
-| **Dixon-Coles** bivariate Poisson, MLE-fit with time decay | full exact-score distribution per matchup |
+| **Dixon-Coles** bivariate Poisson, MLE-fit with time decay, **fit on xG when available** | full exact-score distribution per matchup, from a low-noise signal |
 | **Elo** with home edge + margin-of-victory scaling | a complementary strength signal |
-| **Log-opinion-pool ensemble** (weights + temperature **learned by stacking**) | a single, sharper blended forecast that's provably ≥ its best member |
+| **Log-opinion-pool ensemble** (`[Dixon-Coles, Elo, Market]` weights + temperature **learned by stacking**) | a single sharper forecast, anchored to the bookmaker when odds are present |
 | **Bayesian live updater** | conditions on score + minute + red cards for live odds |
 | **Lineup adjustment** | a confirmed XI shifts each team's attack and defense |
+| **Venue & travel context** | host advantage, altitude, and rest-day differential adjust each match |
 | **Monte-Carlo** (rayon-parallel, **conditions in-progress matches** on their live score) | tournament-level champion odds that move with live results |
 
 Calibration is measured with proper scoring rules (Brier, log-loss), benchmarked against
@@ -105,27 +106,28 @@ cargo run --release -p oracle-cli -- simulate --iters 50000
 ```text
   #  Team                Champ    Final     Semi    Quart      R16
 --------------------------------------------------------------------
-  1  France              12.3%    18.9%    27.9%    42.7%    67.3%
-  2  Argentina            7.6%    12.7%    20.3%    33.2%    54.7%
-  3  Spain                6.7%    11.7%    19.1%    33.9%    55.9%
+  1  France               9.5%    15.0%    23.7%    37.5%    59.5%
+  2  Argentina            8.0%    13.5%    21.8%    34.5%    56.1%
+  3  Spain                7.1%    12.1%    20.0%    33.5%    54.1%
   ...
-50000 simulations in 1.0s  (~50k tournaments/sec)
+30000 simulations in 0.05s  (host advantage, altitude, and rest folded in)
 ```
 
 ```bash
-# 3. Predict a single matchup (ensemble + exact-score grid):
-cargo run --release -p oracle-cli -- predict --home Brazil --away Argentina
+# 3. Predict a matchup. Pass --*-odds to anchor the ensemble to a bookmaker line:
+cargo run --release -p oracle-cli -- predict --home Brazil --away Argentina \
+    --home-odds 2.4 --draw-odds 3.2 --away-odds 2.9
 ```
 
 ```text
   Brazil  vs  Argentina   (neutral venue)
 
-  Ensemble :  Brazil       31.8%    Draw  28.0%    Argentina    40.2%
-    Dixon-Coles:   32.7% / 23.5% /  43.8%      Elo:   27.8% / 30.1% /  42.1%
+  Ensemble :  Brazil       35.2%    Draw  28.1%    Argentina    36.7%
+    Dixon-Coles:   34.0% / 25.6% /  40.3%      Elo:   27.8% / 30.1% /  42.1%
+    Market     :   38.8% / 29.1% /  32.1%   (vig removed; anchored into the ensemble)
 
-  Expected goals : 1.40 – 1.65
-  Most likely    : 1–1  (10.8%)
-  Over 2.5 goals : 58.7%      Both teams to score : 60.6%
+  Expected goals : 1.34 – 1.48
+  Most likely    : 1–1
 ```
 
 ```bash
@@ -141,19 +143,21 @@ cargo run --release -p oracle-cli -- backtest --data path/to/football-data.csv
   Model                   Brier   LogLoss      Acc
   ------------------------------------------------
   Uniform baseline       0.6667    1.0986    33.3%
-  Dixon-Coles            0.6277    1.0415    47.6%
+  Dixon-Coles (goals)    0.6283    1.0433    46.2%
+  Dixon-Coles (xG)       0.6227    1.0360    48.2%
   Elo                    0.6719    1.1273    46.4%
-  Ensemble (learned)     0.6354    1.0544    47.4%
-  Market (bookmaker)     0.6221    1.0339    49.2%
+  Ensemble (+Market)     0.6272    1.0427    47.5%
+  Market (bookmaker)     0.6197    1.0318    48.8%
 
-  learned weights: Dixon-Coles 0.65 / Elo 0.35   temperature 0.70
+  learned weights: DC 0.37 / Elo 0.22 / Market 0.41   temperature 0.77
 ```
 
-Stacking learns the member weights and a temperature on a held-out split, so the
-ensemble is provably no worse than its best member. The bookmaker's implied odds are the
-hard bar to beat: the engine approaches the market but does not (yet) clear it.
-`--data` runs the same three-way split on a real
-[football-data.co.uk](https://www.football-data.co.uk) results CSV with closing odds.
+Two levers are visible here. Fitting on **xG** beats fitting on goals (a lower-noise
+signal). And stacking learns to lean on the **market** (the heaviest weight), since the
+bookmaker's vig-free implied odds are the hard bar to beat: the engine approaches the
+market but does not clear it. `--data` runs the same three-way split on a real
+[football-data.co.uk](https://www.football-data.co.uk) CSV (with closing odds, and xG
+columns if present).
 
 ### Run the server and live dashboard
 
@@ -208,10 +212,11 @@ docker compose up --build         # serves on :8080
   graceful cancellation.
 - **Data-parallelism** -> `rayon`-parallel Monte-Carlo with deterministic per-iteration
   seeding; ~50k full tournament simulations/second.
-- **Applied statistics** -> Dixon-Coles MLE with time decay, Elo, Bayesian conditioning,
-  lineup-aware attack/defense adjustments, a **stacked** ensemble (weights + temperature
-  learned to minimize held-out log-loss), and **proper scoring rules** measured against
-  the **bookmaker's implied odds** on real or synthetic data.
+- **Applied statistics** -> Dixon-Coles MLE with time decay (**fit on xG** when present),
+  Elo, Bayesian conditioning, lineup- and venue-aware attack/defense adjustments, a
+  **stacked** `[Dixon-Coles, Elo, Market]` ensemble (weights + temperature learned to
+  minimize held-out log-loss), and **proper scoring rules** measured against the
+  **bookmaker's implied odds** on real or synthetic data.
 - **Resilient ingestion** -> an authoritative `ScoreSync` reconciliation (so a dropped or
   duplicated poll can't corrupt the score), a feed-health signal with exponential
   backoff, a hand-rolled token-bucket rate limiter + TTL cache, structured `tracing`,
@@ -236,13 +241,17 @@ cargo bench -p oracle-sim       # Monte-Carlo throughput
   reproducible** (drawn from team-strength priors), so the fit, backtest, and market
   benchmark run without a network. The synthetic backtest validates the *machinery*; for
   a real skill measurement pass `backtest --data` a real results CSV with closing odds.
-- Squads are **synthetic** for offline use, so the lineup feature is fully demonstrable
-  via the simulation feed; the live football-data.org adapter does not yet ingest real
-  lineups, so it degrades gracefully to no adjustment.
+- Squads, xG, and venue assignments are **synthetic** for offline use, so the lineup, xG,
+  and venue features are fully demonstrable via the simulation feed; the live
+  football-data.org adapter does not yet ingest real lineups, xG, or odds, so each
+  degrades gracefully. Rest days are derived from the real fixture schedule.
 - In-progress **group** matches are conditioned on their live score, but the knockout
   simulator still builds a fresh bracket each run (a standard seeded single-elimination
   template, not FIFA's exact slotting); conditioning live *knockout* matches is future
   work. All documented in the code.
+- Deliberately deferred: **squad market value** (largely redundant with the strength
+  ratings offline) and **stakes / dead-rubber rotation** (speculative without a behavioural
+  model).
 
 ## 📄 License
 
