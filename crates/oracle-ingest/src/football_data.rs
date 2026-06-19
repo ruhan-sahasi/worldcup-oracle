@@ -8,6 +8,13 @@
 //! Set `FOOTBALL_DATA_API_KEY` to use it; without a key the engine falls back to the
 //! simulation/replay providers, so this is an optional upgrade path, never a hard
 //! requirement.
+//!
+//! What the feed provides, by tier: **results** (scores, status, stage, group) work on the
+//! free tier and drive `Goal`/`FullTime`/`ScoreSync` events. **Line-ups** are emitted as
+//! `Lineup` events when the match payload includes them (a paid tier), and are simply absent
+//! on the free tier (no adjustment, no error). **Odds** and **expected goals** are not
+//! offered by this provider at any tier: use the CSV path (`backtest --data`) for real odds,
+//! and a dedicated xG source to populate `Observation` xG.
 
 use crate::cache::TtlCache;
 use crate::error::{IngestError, Result};
@@ -171,6 +178,17 @@ impl DataProvider for FootballDataProvider {
                         let minute = m.minute.unwrap_or(0);
                         match last.get(&id) {
                             None => {
+                                // On first sighting, surface a confirmed line-up if the feed
+                                // provides one (tiers that expose it announce it pre-kickoff).
+                                if let Some((home, away)) = m.lineups() {
+                                    let _ = tx
+                                        .send(MatchEvent::new(
+                                            parsed.id,
+                                            minute,
+                                            EventKind::Lineup { home, away },
+                                        ))
+                                        .await;
+                                }
                                 if parsed.is_live() {
                                     let _ = tx
                                         .send(MatchEvent::new(
@@ -316,6 +334,16 @@ struct ApiMatch {
 #[derive(Debug, Deserialize)]
 struct ApiSide {
     id: Option<u64>,
+    /// Starting line-up, present only on API tiers that expose it (absent on the free tier,
+    /// where this is simply an empty list and the engine applies no lineup adjustment).
+    #[serde(default)]
+    lineup: Vec<ApiPlayer>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ApiPlayer {
+    #[serde(default)]
+    name: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -336,6 +364,16 @@ impl ApiMatch {
     /// The group letter, e.g. "GROUP_A" → 'A'.
     fn group_letter(&self) -> Option<char> {
         self.group.as_ref().and_then(|g| g.chars().last())
+    }
+
+    /// Confirmed `(home, away)` line-ups as player-name lists, when both sides expose one.
+    /// Returns `None` on tiers (or before kickoff) that don't include line-ups.
+    fn lineups(&self) -> Option<(Vec<String>, Vec<String>)> {
+        let names = |side: &ApiSide| -> Vec<String> {
+            side.lineup.iter().filter_map(|p| p.name.clone()).collect()
+        };
+        let (home, away) = (names(&self.home_team), names(&self.away_team));
+        (!home.is_empty() && !away.is_empty()).then_some((home, away))
     }
 
     /// Translate into the domain `Match`, or `None` if teams aren't assigned yet.
@@ -437,5 +475,26 @@ mod tests {
         assert_eq!(m.score, Scoreline::new(2, 1));
         assert!(matches!(m.stage, Stage::Group('B')));
         assert!(matches!(m.status, MatchStatus::Live { minute: 63 }));
+        // No lineup in this payload (free-tier shape) -> no lineup ingested.
+        assert!(resp.matches[0].lineups().is_none());
+    }
+
+    #[test]
+    fn parses_lineups_when_present() {
+        let json = r#"{
+            "matches": [{
+                "id": 1,
+                "status": "TIMED",
+                "stage": "GROUP_STAGE",
+                "group": "GROUP_A",
+                "homeTeam": { "id": 10, "lineup": [{ "name": "A. One" }, { "name": "B. Two" }] },
+                "awayTeam": { "id": 11, "lineup": [{ "name": "C. Three" }] },
+                "score": { "fullTime": { "home": null, "away": null } }
+            }]
+        }"#;
+        let resp: MatchesResponse = serde_json::from_str(json).unwrap();
+        let (home, away) = resp.matches[0].lineups().expect("lineups present");
+        assert_eq!(home, vec!["A. One".to_string(), "B. Two".to_string()]);
+        assert_eq!(away, vec!["C. Three".to_string()]);
     }
 }
