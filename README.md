@@ -166,6 +166,11 @@ well-calibrated (predicted ≈ empirical in every bucket). `--data` runs the sam
 [football-data.co.uk](https://www.football-data.co.uk) CSV (with closing odds, and xG
 columns if present).
 
+> **Validated on real data.** On 1,520 real Premier League matches with real Bet365 closing
+> odds, the stacked ensemble (Brier **0.5416**) matches the bookmaker's closing line (0.5421)
+> out-of-sample and stays well-calibrated (ECE 0.018). Numbers and a one-command reproducer
+> are in [`docs/VALIDATION.md`](docs/VALIDATION.md) (`bash scripts/fetch-results.sh`).
+
 ### Run the server and live dashboard
 
 ```bash
@@ -249,14 +254,16 @@ cargo bench -p oracle-sim       # Monte-Carlo throughput
 
 - The bundled roster/draw is a **representative sample** for offline use, not FIFA's
   official draw; the live adapter pulls the real teams, fixtures, and results.
-- Offline training data and the offline "bookmaker" line are **synthetic but
-  reproducible** (drawn from team-strength priors), so the fit, backtest, and market
-  benchmark run without a network. The synthetic backtest validates the *machinery*; for
-  a real skill measurement pass `backtest --data` a real results CSV with closing odds.
-- Squads, xG, and venue assignments are **synthetic** for offline use, so the lineup, xG,
-  and venue features are fully demonstrable via the simulation feed; the live
-  football-data.org adapter does not yet ingest real lineups, xG, or odds, so each
-  degrades gracefully. Rest days are derived from the real fixture schedule.
+- The default offline data (training history, the "bookmaker" line) is **synthetic but
+  reproducible**, so everything runs without a network. That validates the *machinery*;
+  the model's *real* skill is measured separately on real matches with real odds, see
+  [`docs/VALIDATION.md`](docs/VALIDATION.md). World-Cup-specific real validation needs
+  international results + odds (the same `--data` path accepts them).
+- Squads and venue assignments are **synthetic** for offline use, so the lineup and venue
+  features are fully demonstrable via the simulation feed. The live football-data.org
+  adapter ingests results (and **line-ups** on tiers that expose them); odds and xG are not
+  offered by that provider, so they come from the CSV path or a dedicated source. Rest days
+  are derived from the real fixture schedule.
 - In-progress **group** matches are conditioned on their live score, but the knockout
   simulator still builds a fresh bracket each run (a standard seeded single-elimination
   template, not FIFA's exact slotting); conditioning live *knockout* matches is future
