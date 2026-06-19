@@ -330,6 +330,8 @@ fn cmd_backtest(
 
     let xg_present = train_obs.iter().any(|o| o.home_xg.is_some());
     let market_present = records.iter().any(|r| r.market.is_some());
+    // Real club fixtures have a genuine home venue; the synthetic World Cup is neutral.
+    let neutral = !real_data;
 
     // Fit the goal model on xG when present (sharper), and build Elo by replaying training
     // results. For synthetic data we can also seed Elo from known strengths; real CSV teams
@@ -350,7 +352,7 @@ fn cmd_backtest(
         }
     }
     for r in &records[..train_end] {
-        ratings.record(r.obs.home, r.obs.away, r.obs.score, true);
+        ratings.record(r.obs.home, r.obs.away, r.obs.score, neutral);
     }
 
     // Learn the ensemble on validation. Include the market as a third member when odds are
@@ -358,8 +360,8 @@ fn cmd_backtest(
     let mut val_preds = Vec::new();
     let mut val_actuals = Vec::new();
     for r in validation {
-        let dc = model.outcome_probabilities(r.obs.home, r.obs.away, true);
-        let elo = ratings.win_probabilities(r.obs.home, r.obs.away, true);
+        let dc = model.outcome_probabilities(r.obs.home, r.obs.away, neutral);
+        let elo = ratings.win_probabilities(r.obs.home, r.obs.away, neutral);
         if market_present {
             if let Some(m) = r.market {
                 val_preds.push(vec![dc, elo, m]);
@@ -381,13 +383,13 @@ fn cmd_backtest(
     let mut market_preds = Vec::new();
     for r in test {
         let actual = r.obs.score.outcome();
-        let dc = model.outcome_probabilities(r.obs.home, r.obs.away, true);
-        let elo = ratings.win_probabilities(r.obs.home, r.obs.away, true);
+        let dc = model.outcome_probabilities(r.obs.home, r.obs.away, neutral);
+        let elo = ratings.win_probabilities(r.obs.home, r.obs.away, neutral);
         dc_preds.push((dc, actual));
         elo_preds.push((elo, actual));
         if let Some(mg) = &model_goals {
             dc_goals_preds.push((
-                mg.outcome_probabilities(r.obs.home, r.obs.away, true),
+                mg.outcome_probabilities(r.obs.home, r.obs.away, neutral),
                 actual,
             ));
         }
