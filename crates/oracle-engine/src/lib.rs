@@ -20,9 +20,11 @@
 
 #![forbid(unsafe_code)]
 
+pub mod event_log;
 pub mod presets;
 mod snapshot;
 
+pub use event_log::EventLog;
 pub use snapshot::{MatchPrediction, Metrics, RatingEntry, Snapshot};
 
 use arc_swap::ArcSwap;
@@ -37,6 +39,7 @@ use oracle_model::{
 use oracle_ratings::{EloConfig, RatingStore};
 use oracle_sim::{simulate_with_live, InProgress, LiveInputs, SimConfig, VenueAdj};
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
@@ -95,7 +98,7 @@ impl EngineDeps {
 }
 
 /// Tuning for the engine runtime.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct EngineConfig {
     /// Bounded capacity of the ingest→engine channel (back-pressure on the source).
     pub channel_capacity: usize,
@@ -103,6 +106,9 @@ pub struct EngineConfig {
     pub broadcast_capacity: usize,
     /// How often the tournament forecast is recomputed regardless of events.
     pub forecast_every: Duration,
+    /// Optional append-only event log. When set, every event is recorded and the log is
+    /// replayed on startup to recover state across restarts.
+    pub event_log: Option<PathBuf>,
 }
 
 impl Default for EngineConfig {
@@ -111,6 +117,7 @@ impl Default for EngineConfig {
             channel_capacity: 1024,
             broadcast_capacity: 256,
             forecast_every: Duration::from_secs(3),
+            event_log: None,
         }
     }
 }
@@ -176,6 +183,24 @@ pub async fn spawn(
     );
 
     let mut state = EngineState::new(tournament, deps);
+    let metrics = Arc::new(Metrics::default());
+
+    // Recover from a prior run: replay the event log before the live feed resumes.
+    let event_log = match &config.event_log {
+        Some(path) => {
+            let prior = EventLog::read(path)?;
+            if !prior.is_empty() {
+                tracing::info!(events = prior.len(), "replaying event log to recover state");
+                for ev in &prior {
+                    state.apply_event(ev, &metrics);
+                    metrics.events_processed.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+            Some(Arc::new(EventLog::create(path)?))
+        }
+        None => None,
+    };
+
     state.recompute_forecast();
     let initial = Arc::new(state.build_snapshot(&provider_name));
 
@@ -183,7 +208,7 @@ pub async fn spawn(
     let engine = Arc::new(Engine {
         latest: ArcSwap::new(initial),
         updates,
-        metrics: Arc::new(Metrics::default()),
+        metrics: metrics.clone(),
         tournament_name: state.tournament.name.clone(),
         provider_name: provider_name.clone(),
     });
@@ -199,7 +224,7 @@ pub async fn spawn(
 
     let loop_engine = engine.clone();
     let join = tokio::spawn(async move {
-        event_loop(state, loop_engine, rx, cancel, config).await;
+        event_loop(state, loop_engine, rx, cancel, config, event_log).await;
         provider_handle.abort();
     });
 
@@ -213,6 +238,7 @@ async fn event_loop(
     mut rx: mpsc::Receiver<MatchEvent>,
     cancel: CancellationToken,
     config: EngineConfig,
+    event_log: Option<Arc<EventLog>>,
 ) {
     let mut forecast_timer = tokio::time::interval(config.forecast_every);
     forecast_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -229,6 +255,12 @@ async fn event_loop(
             msg = rx.recv() => match msg {
                 None => break, // feed exhausted
                 Some(event) => {
+                    // Durably record the event before acting on it (crash recovery).
+                    if let Some(log) = &event_log {
+                        if let Err(e) = log.append(&event) {
+                            tracing::warn!(error = %e, "event-log append failed");
+                        }
+                    }
                     let landed = state.apply_event(&event, &engine.metrics);
                     engine.metrics.events_processed.fetch_add(1, Ordering::Relaxed);
                     // Recompute when a result lands, a score-changing event arrives, or a
@@ -802,5 +834,55 @@ mod tests {
             anchored < baseline,
             "away-favouring odds should pull home win probability down ({baseline:.3} -> {anchored:.3})"
         );
+    }
+
+    #[test]
+    fn event_log_replay_rebuilds_state() {
+        let path = std::env::temp_dir().join("oracle_engine_recovery_test.jsonl");
+        let _ = std::fs::remove_file(&path);
+        let metrics = Metrics::default();
+
+        // State A: apply a full match and record every event to the log.
+        let mut a = fresh_state();
+        let m = a.tournament.matches[0].clone();
+        let events = vec![
+            MatchEvent::new(m.id, 0, EventKind::KickOff),
+            MatchEvent::new(
+                m.id,
+                30,
+                EventKind::Goal {
+                    team: m.home,
+                    scorer: None,
+                },
+            ),
+            MatchEvent::new(
+                m.id,
+                90,
+                EventKind::FullTime {
+                    score: Scoreline::new(2, 1),
+                },
+            ),
+        ];
+        let log = EventLog::create(&path).unwrap();
+        for e in &events {
+            log.append(e).unwrap();
+            a.apply_event(e, &metrics);
+        }
+        drop(log);
+
+        // State B: rebuild purely by replaying the recorded log.
+        let mut b = fresh_state();
+        for e in EventLog::read(&path).unwrap() {
+            b.apply_event(&e, &metrics);
+        }
+
+        // The recovered finished result and rating change must match the original.
+        assert_eq!(b.tournament.matches[0].score, Scoreline::new(2, 1));
+        assert_eq!(
+            a.tournament.matches[0].status,
+            b.tournament.matches[0].status
+        );
+        assert!((a.ratings.rating(m.home) - b.ratings.rating(m.home)).abs() < 1e-9);
+        let _ = std::fs::remove_file(&path);
     }
 }
