@@ -20,7 +20,9 @@ pub mod ensemble;
 pub mod live;
 pub mod poisson;
 
-pub use calibration::{implied_probabilities, score, CalibrationReport};
+pub use calibration::{
+    implied_probabilities, reliability, score, CalibrationReport, ReliabilityBin, ReliabilityReport,
+};
 pub use context::{context_adjustment, Host, MatchContext};
 pub use dixon_coles::{DixonColesConfig, GoalModel, Observation};
 pub use ensemble::{Ensemble, EnsembleFitConfig};

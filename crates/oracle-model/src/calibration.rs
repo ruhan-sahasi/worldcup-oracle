@@ -87,6 +87,75 @@ pub fn score(predictions: &[(Probabilities, Outcome)]) -> CalibrationReport {
     }
 }
 
+/// One probability bin of a reliability (calibration) curve.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct ReliabilityBin {
+    pub lo: f64,
+    pub hi: f64,
+    /// Mean predicted probability of the predictions that fell in this bin.
+    pub mean_pred: f64,
+    /// Empirical frequency with which those predictions came true.
+    pub empirical: f64,
+    pub count: usize,
+}
+
+/// A reliability curve plus its expected calibration error.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReliabilityReport {
+    pub bins: Vec<ReliabilityBin>,
+    /// Expected calibration error: count-weighted mean gap between predicted and empirical.
+    pub ece: f64,
+}
+
+/// Build a reliability curve over `bins` equal-width probability bins. Every class
+/// probability of every prediction contributes a `(predicted, did it happen)` pair, so a
+/// well-calibrated model has empirical ≈ predicted in each bin (and a low ECE).
+pub fn reliability(predictions: &[(Probabilities, Outcome)], bins: usize) -> ReliabilityReport {
+    let bins = bins.max(1);
+    let mut sum_pred = vec![0.0f64; bins];
+    let mut sum_hit = vec![0.0f64; bins];
+    let mut count = vec![0usize; bins];
+
+    for (p, actual) in predictions {
+        for outcome in [Outcome::HomeWin, Outcome::Draw, Outcome::AwayWin] {
+            let pred = p.of(outcome);
+            let hit = if outcome == *actual { 1.0 } else { 0.0 };
+            let b = ((pred * bins as f64) as usize).min(bins - 1);
+            sum_pred[b] += pred;
+            sum_hit[b] += hit;
+            count[b] += 1;
+        }
+    }
+
+    let total: usize = count.iter().sum();
+    let mut ece = 0.0;
+    let bin_report = (0..bins)
+        .map(|b| {
+            let c = count[b];
+            let (mean_pred, empirical) = if c > 0 {
+                (sum_pred[b] / c as f64, sum_hit[b] / c as f64)
+            } else {
+                (0.0, 0.0)
+            };
+            if c > 0 && total > 0 {
+                ece += (c as f64 / total as f64) * (mean_pred - empirical).abs();
+            }
+            ReliabilityBin {
+                lo: b as f64 / bins as f64,
+                hi: (b + 1) as f64 / bins as f64,
+                mean_pred,
+                empirical,
+                count: c,
+            }
+        })
+        .collect();
+
+    ReliabilityReport {
+        bins: bin_report,
+        ece,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -128,5 +197,44 @@ mod tests {
             "shortest odds = favourite"
         );
         assert!(p.home_win > p.draw && p.home_win > p.away_win);
+    }
+
+    #[test]
+    fn calibrated_set_has_lower_ece_than_overconfident() {
+        // Build n predictions all equal to `p`, with `frac_home` home wins and the rest
+        // split evenly between draw and away.
+        let mk = |n: usize, p: Probabilities, frac_home: f64| {
+            (0..n)
+                .map(|i| {
+                    let r = i as f64 / n as f64;
+                    let actual = if r < frac_home {
+                        Outcome::HomeWin
+                    } else if r < frac_home + (1.0 - frac_home) / 2.0 {
+                        Outcome::Draw
+                    } else {
+                        Outcome::AwayWin
+                    };
+                    (p, actual)
+                })
+                .collect::<Vec<_>>()
+        };
+        // Predictions match reality (0.5/0.25/0.25 with 50% home).
+        let calibrated = mk(400, Probabilities::new(0.5, 0.25, 0.25), 0.5);
+        // Wildly overconfident (0.9 home) but still only 50% home wins.
+        let overconfident = mk(400, Probabilities::new(0.9, 0.05, 0.05), 0.5);
+
+        let r_cal = reliability(&calibrated, 10);
+        let r_over = reliability(&overconfident, 10);
+        assert!(
+            r_cal.ece < 0.05,
+            "well-calibrated ECE should be small: {}",
+            r_cal.ece
+        );
+        assert!(
+            r_cal.ece < r_over.ece,
+            "calibrated ECE {} should beat overconfident {}",
+            r_cal.ece,
+            r_over.ece
+        );
     }
 }

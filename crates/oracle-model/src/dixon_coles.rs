@@ -93,6 +93,10 @@ pub struct DixonColesConfig {
     pub iterations: usize,
     /// Gradient-ascent learning rate.
     pub learning_rate: f64,
+    /// L2 (ridge) shrinkage on the attack/defense coefficients toward the mean. Because a
+    /// data-rich team accumulates a larger gradient than a data-poor one, this shrinks
+    /// sparse-data teams more, which is exactly the regularization a World Cup needs.
+    pub ridge: f64,
 }
 
 impl Default for DixonColesConfig {
@@ -102,6 +106,7 @@ impl Default for DixonColesConfig {
             max_goals: 10,
             iterations: 400,
             learning_rate: 0.06,
+            ridge: 0.01,
         }
     }
 }
@@ -200,9 +205,12 @@ impl GoalModel {
             }
 
             let step = config.learning_rate / total_weight;
+            let shrink = config.learning_rate * config.ridge;
             for t in &teams {
-                *attack.get_mut(t).unwrap() += step * g_attack[t];
-                *defense.get_mut(t).unwrap() += step * g_defense[t];
+                let (a, d) = (attack[t], defense[t]);
+                // Gradient ascent on the log-likelihood, minus an L2 penalty (ridge).
+                *attack.get_mut(t).unwrap() += step * g_attack[t] - shrink * a;
+                *defense.get_mut(t).unwrap() += step * g_defense[t] - shrink * d;
             }
             intercept += step * g_intercept;
             home_advantage += step * g_home;
@@ -465,6 +473,36 @@ mod tests {
             "weakened home team is less favoured"
         );
         assert!((weak.sum() - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn ridge_shrinks_sparse_data_teams_more() {
+        // Rich history among teams 1-3, plus a team (9) with just two lopsided wins.
+        let mut obs = synthetic_history();
+        obs.push(Observation::new(t(9), t(2), Scoreline::new(5, 0), 1.0));
+        obs.push(Observation::new(t(9), t(3), Scoreline::new(5, 0), 1.0));
+
+        let strength = |m: &GoalModel| (m.attack_of(t(9)) - m.defense_of(t(9))).abs();
+        let no_ridge = GoalModel::fit(
+            &obs,
+            DixonColesConfig {
+                ridge: 0.0,
+                ..DixonColesConfig::default()
+            },
+        );
+        let heavy_ridge = GoalModel::fit(
+            &obs,
+            DixonColesConfig {
+                ridge: 0.5,
+                ..DixonColesConfig::default()
+            },
+        );
+        assert!(
+            strength(&heavy_ridge) < strength(&no_ridge),
+            "ridge should shrink the sparse team's strength ({:.3} -> {:.3})",
+            strength(&no_ridge),
+            strength(&heavy_ridge),
+        );
     }
 
     #[test]
