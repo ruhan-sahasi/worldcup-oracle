@@ -24,6 +24,6 @@ pub use calibration::{
     implied_probabilities, reliability, score, CalibrationReport, ReliabilityBin, ReliabilityReport,
 };
 pub use context::{context_adjustment, Host, MatchContext};
-pub use dixon_coles::{DixonColesConfig, GoalModel, Observation};
+pub use dixon_coles::{DixonColesConfig, GoalModel, Observation, ScoreModel};
 pub use ensemble::{Ensemble, EnsembleFitConfig};
 pub use live::{live_probabilities, live_score_grid, remaining_rates, LiveConfig, LiveState};

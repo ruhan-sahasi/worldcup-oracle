@@ -17,11 +17,17 @@
 //! Parameters are fit by **maximum likelihood** on historical results, with each
 //! match down-weighted by `exp(−ξ · age_days)` so recent form counts for more
 //! (the Dixon-Coles time-decay trick). We ascend the time-weighted Poisson
-//! log-likelihood analytically for the attack/defense/intercept/home terms - the
-//! Poisson score equations reduce neatly to `(observed − expected) goals` - and fit
-//! `ρ` with a one-dimensional search over the full corrected likelihood.
+//! log-likelihood for the attack/defense/intercept/home terms with a backtracking,
+//! convergence-checked step (a non-improving step is rolled back and the learning rate
+//! halved, so the fit cannot oscillate or diverge), then fit the dependence parameter by a
+//! one-dimensional search over the full corrected likelihood.
+//!
+//! Two dependence models are available (see [`ScoreModel`]): independent margins with the
+//! Dixon-Coles low-score correction `ρ`, or a **bivariate Poisson** whose shared component
+//! models positive correlation directly. The `wc-oracle tune` command picks between them,
+//! and the rest of the hyperparameters, by held-out log-loss.
 
-use crate::poisson::poisson_pmf;
+use crate::poisson::{bivariate_poisson_pmf, poisson_pmf};
 use oracle_domain::{Probabilities, ScoreGrid, Scoreline, TeamId};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -82,6 +88,16 @@ impl Observation {
     }
 }
 
+/// How the joint scoreline distribution models the dependence between the two teams' goals.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum ScoreModel {
+    /// Independent Poisson margins with the Dixon-Coles low-score correction `ρ`.
+    #[default]
+    Independent,
+    /// Bivariate Poisson: a shared component induces positive correlation directly.
+    Bivariate,
+}
+
 /// Hyper-parameters controlling the fit.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct DixonColesConfig {
@@ -89,7 +105,7 @@ pub struct DixonColesConfig {
     pub xi: f64,
     /// Largest goal count modelled exactly in the score grid.
     pub max_goals: usize,
-    /// Gradient-ascent iterations.
+    /// Maximum gradient-ascent iterations (the fit stops early once it converges).
     pub iterations: usize,
     /// Gradient-ascent learning rate.
     pub learning_rate: f64,
@@ -97,6 +113,10 @@ pub struct DixonColesConfig {
     /// data-rich team accumulates a larger gradient than a data-poor one, this shrinks
     /// sparse-data teams more, which is exactly the regularization a World Cup needs.
     pub ridge: f64,
+    /// Relative-improvement tolerance for the convergence check.
+    pub tol: f64,
+    /// Which dependence model the score grid uses.
+    pub model: ScoreModel,
 }
 
 impl Default for DixonColesConfig {
@@ -107,6 +127,8 @@ impl Default for DixonColesConfig {
             iterations: 400,
             learning_rate: 0.06,
             ridge: 0.01,
+            tol: 1e-7,
+            model: ScoreModel::Independent,
         }
     }
 }
@@ -116,7 +138,13 @@ impl Default for DixonColesConfig {
 pub struct GoalModel {
     intercept: f64,
     home_advantage: f64,
+    /// Dixon-Coles low-score correction (used by [`ScoreModel::Independent`]).
     rho: f64,
+    /// Bivariate-Poisson covariance term λ3 (used by [`ScoreModel::Bivariate`]).
+    #[serde(default)]
+    covariance: f64,
+    #[serde(default)]
+    model: ScoreModel,
     max_goals: usize,
     attack: HashMap<TeamId, f64>,
     defense: HashMap<TeamId, f64>,
@@ -129,6 +157,8 @@ impl Default for GoalModel {
             intercept: 0.3,       // exp(0.3) ≈ 1.35 baseline goals
             home_advantage: 0.25, // exp(0.25) ≈ 1.28× at home
             rho: -0.05,
+            covariance: 0.0,
+            model: ScoreModel::Independent,
             max_goals: 10,
             attack: HashMap::new(),
             defense: HashMap::new(),
@@ -176,7 +206,32 @@ impl GoalModel {
         let mut intercept = avg_goals.max(0.2).ln();
         let mut home_advantage = 0.25_f64;
 
-        // ---- Gradient ascent on the time-weighted Poisson log-likelihood ----
+        // The time-weighted Poisson mean-fit log-likelihood: exactly what the gradient step
+        // ascends (regressing the marginal rates on the targets), so it is the right
+        // objective to monitor for convergence and to guard against an overshooting step.
+        let mean_ll = |attack: &HashMap<TeamId, f64>,
+                       defense: &HashMap<TeamId, f64>,
+                       intercept: f64,
+                       home: f64|
+         -> f64 {
+            observations
+                .iter()
+                .zip(&weights)
+                .map(|(o, &w)| {
+                    let lambda = (intercept + attack[&o.home] - defense[&o.away] + home).exp();
+                    let mu = (intercept + attack[&o.away] - defense[&o.home]).exp();
+                    w * (o.target_home() * lambda.max(1e-12).ln() - lambda
+                        + o.target_away() * mu.max(1e-12).ln()
+                        - mu)
+                })
+                .sum()
+        };
+
+        // ---- Gradient ascent to convergence, with an objective-monotone (backtracking)
+        // step: a step that fails to improve the objective is rolled back and the learning
+        // rate halved, so the fit cannot oscillate or diverge and stops once it has settled.
+        let mut lr = config.learning_rate;
+        let mut prev_ll = mean_ll(&attack, &defense, intercept, home_advantage);
         for _ in 0..config.iterations {
             let mut g_attack: HashMap<TeamId, f64> = teams.iter().map(|&t| (t, 0.0)).collect();
             let mut g_defense: HashMap<TeamId, f64> = teams.iter().map(|&t| (t, 0.0)).collect();
@@ -204,8 +259,12 @@ impl GoalModel {
                 g_home += w * res_h;
             }
 
-            let step = config.learning_rate / total_weight;
-            let shrink = config.learning_rate * config.ridge;
+            // Snapshot so a non-improving step can be rolled back.
+            let (snap_a, snap_d, snap_i, snap_h) =
+                (attack.clone(), defense.clone(), intercept, home_advantage);
+
+            let step = lr / total_weight;
+            let shrink = lr * config.ridge;
             for t in &teams {
                 let (a, d) = (attack[t], defense[t]);
                 // Gradient ascent on the log-likelihood, minus an L2 penalty (ridge).
@@ -219,26 +278,67 @@ impl GoalModel {
             // absorbed by the intercept rather than drifting freely.
             recenter(&mut attack);
             recenter(&mut defense);
+
+            let ll = mean_ll(&attack, &defense, intercept, home_advantage);
+            if !ll.is_finite() || ll < prev_ll {
+                // Overshoot: undo the step and take a smaller one next time.
+                attack = snap_a;
+                defense = snap_d;
+                intercept = snap_i;
+                home_advantage = snap_h;
+                lr *= 0.5;
+                if lr <= 1e-9 {
+                    break;
+                }
+                continue;
+            }
+            if ll - prev_ll <= config.tol * prev_ll.abs().max(1.0) {
+                break; // converged
+            }
+            prev_ll = ll;
         }
 
-        // ---- Fit ρ on the fully-corrected likelihood via a refined grid search ----
-        let rho = fit_rho(
-            observations,
-            &weights,
-            &attack,
-            &defense,
-            intercept,
-            home_advantage,
-        );
+        // ---- Fit the dependence parameter on the fully-corrected (integer-goal) likelihood.
+        let (rho, covariance) = match config.model {
+            ScoreModel::Independent => (
+                fit_rho(
+                    observations,
+                    &weights,
+                    &attack,
+                    &defense,
+                    intercept,
+                    home_advantage,
+                ),
+                0.0,
+            ),
+            ScoreModel::Bivariate => (
+                0.0,
+                fit_covariance(
+                    observations,
+                    &weights,
+                    &attack,
+                    &defense,
+                    intercept,
+                    home_advantage,
+                ),
+            ),
+        };
 
         GoalModel {
             intercept,
             home_advantage,
             rho,
+            covariance,
+            model: config.model,
             max_goals: config.max_goals,
             attack,
             defense,
         }
+    }
+
+    /// The fitted bivariate-Poisson covariance term (`0` for the independent model).
+    pub fn covariance(&self) -> f64 {
+        self.covariance
     }
 
     pub fn home_advantage(&self) -> f64 {
@@ -317,13 +417,25 @@ impl GoalModel {
         (lambda, mu)
     }
 
-    /// Build the Dixon-Coles score grid from explicit goal rates.
+    /// Build the joint score grid from explicit marginal goal rates, using whichever
+    /// dependence model this was fit with.
     fn grid_from(&self, lambda: f64, mu: f64) -> ScoreGrid {
-        ScoreGrid::from_fn(self.max_goals, |h, a| {
-            poisson_pmf(h as u32, lambda)
-                * poisson_pmf(a as u32, mu)
-                * tau(h, a, lambda, mu, self.rho)
-        })
+        match self.model {
+            ScoreModel::Independent => ScoreGrid::from_fn(self.max_goals, |h, a| {
+                poisson_pmf(h as u32, lambda)
+                    * poisson_pmf(a as u32, mu)
+                    * tau(h, a, lambda, mu, self.rho)
+            }),
+            ScoreModel::Bivariate => {
+                // Preserve the marginal means: lambda3 is the shared component, so the home
+                // own-rate is lambda - lambda3 (clamped to keep both own-rates positive).
+                let l3 = self.covariance.min(0.95 * lambda.min(mu)).max(0.0);
+                let (l1, l2) = (lambda - l3, mu - l3);
+                ScoreGrid::from_fn(self.max_goals, |h, a| {
+                    bivariate_poisson_pmf(h as u32, a as u32, l1, l2, l3)
+                })
+            }
+        }
     }
 
     /// The full joint score distribution with the Dixon-Coles low-score correction.
@@ -441,6 +553,60 @@ fn fit_rho(
     best_rho
 }
 
+/// One-dimensional search for the bivariate-Poisson covariance `λ3` that maximizes the
+/// time-weighted log-likelihood, holding the fitted marginal means fixed (`λ1 = μ_home - λ3`,
+/// `λ2 = μ_away - λ3`, clamped). `λ3 = 0` is the independent model, so the search only helps.
+fn fit_covariance(
+    obs: &[Observation],
+    weights: &[f64],
+    attack: &HashMap<TeamId, f64>,
+    defense: &HashMap<TeamId, f64>,
+    intercept: f64,
+    home_advantage: f64,
+) -> f64 {
+    let ll = |cov: f64| -> f64 {
+        obs.iter()
+            .zip(weights)
+            .map(|(o, &w)| {
+                let lambda =
+                    (intercept + attack[&o.home] - defense[&o.away] + home_advantage).exp();
+                let mu = (intercept + attack[&o.away] - defense[&o.home]).exp();
+                let l3 = cov.min(0.95 * lambda.min(mu)).max(0.0);
+                let p = bivariate_poisson_pmf(
+                    o.score.home as u32,
+                    o.score.away as u32,
+                    lambda - l3,
+                    mu - l3,
+                    l3,
+                );
+                w * p.max(1e-12).ln()
+            })
+            .sum()
+    };
+
+    // Covariance is non-negative and small; coarse grid then local refinement.
+    let mut best = 0.0;
+    let mut best_ll = ll(0.0);
+    let (mut lo, mut hi) = (0.0, 0.6);
+    for _ in 0..4 {
+        let mut local_best = best;
+        let steps = 20;
+        for i in 0..=steps {
+            let cov = lo + (hi - lo) * i as f64 / steps as f64;
+            let cur = ll(cov);
+            if cur > best_ll {
+                best_ll = cur;
+                local_best = cov;
+            }
+        }
+        best = local_best;
+        let span = (hi - lo) / steps as f64;
+        lo = (best - span).max(0.0);
+        hi = best + span;
+    }
+    best
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -504,6 +670,44 @@ mod tests {
             "weakened home team is less favoured"
         );
         assert!((weak.sum() - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn bivariate_model_fits_and_normalizes() {
+        let cfg = DixonColesConfig {
+            model: ScoreModel::Bivariate,
+            ..DixonColesConfig::default()
+        };
+        let model = GoalModel::fit(&synthetic_history(), cfg);
+        assert!(model.covariance() >= 0.0, "covariance is non-negative");
+        let g = model.score_grid(t(1), t(2), true);
+        assert!((g.sum() - 1.0).abs() < 1e-6, "bivariate grid normalizes");
+        // Strength ordering still recovered under the bivariate model.
+        let p = model.outcome_probabilities(t(1), t(2), true);
+        assert!(p.home_win > p.away_win);
+    }
+
+    #[test]
+    fn bivariate_with_more_draws_in_data_learns_positive_covariance() {
+        // A history dominated by draws should pull the covariance above zero (the shared
+        // component is how the bivariate model represents extra draw mass).
+        let mut obs = Vec::new();
+        for i in 0..60 {
+            let age = i as f64;
+            obs.push(Observation::new(t(1), t(2), Scoreline::new(1, 1), age));
+            obs.push(Observation::new(t(2), t(1), Scoreline::new(2, 2), age));
+            obs.push(Observation::new(t(1), t(2), Scoreline::new(0, 0), age));
+        }
+        let cfg = DixonColesConfig {
+            model: ScoreModel::Bivariate,
+            ..DixonColesConfig::default()
+        };
+        let model = GoalModel::fit(&obs, cfg);
+        assert!(
+            model.covariance() > 0.0,
+            "draw-heavy data should learn a positive covariance (got {})",
+            model.covariance()
+        );
     }
 
     #[test]
