@@ -68,12 +68,19 @@ fn ui(frame: &mut Frame, snap: &Snapshot, engine: &Engine) {
     } else {
         "    ⚠ STALE FEED".to_string()
     };
+    // Finished matches the goal model has learned from (in-tournament learning).
+    let learned = snap
+        .matches
+        .iter()
+        .filter(|mp| matches!(mp.status, MatchStatus::Finished))
+        .count();
     let header = Paragraph::new(format!(
-        " {}    provider: {}    events: {}    goals: {}    updated: {}{}",
+        " {}    provider: {}    events: {}    goals: {}    learned: {}    updated: {}{}",
         snap.tournament,
         snap.provider,
         m.events_processed.load(Ordering::Relaxed),
         m.goals_seen.load(Ordering::Relaxed),
+        learned,
         snap.generated_at.format("%H:%M:%S"),
         health,
     ))

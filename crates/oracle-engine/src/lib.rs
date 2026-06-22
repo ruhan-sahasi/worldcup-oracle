@@ -57,6 +57,9 @@ pub struct EngineDeps {
     pub ensemble: Ensemble,
     pub live_config: LiveConfig,
     pub sim_config: SimConfig,
+    /// Learning rate for the online goal-model update applied to each finished match, so the
+    /// model learns from in-tournament results. 0 disables in-tournament learning.
+    pub tournament_lr: f64,
 }
 
 impl EngineDeps {
@@ -73,11 +76,17 @@ impl EngineDeps {
                 iterations: 20_000,
                 ..SimConfig::default()
             },
+            tournament_lr: 0.03,
         }
     }
 
     pub fn with_model(mut self, model: GoalModel) -> Self {
         self.model = model;
+        self
+    }
+
+    pub fn with_tournament_lr(mut self, lr: f64) -> Self {
+        self.tournament_lr = lr;
         self
     }
 
@@ -355,6 +364,8 @@ struct EngineState {
     ensemble: Ensemble,
     live_config: LiveConfig,
     sim_config: SimConfig,
+    /// Online learning rate applied to the goal model on each finished match (0 = off).
+    tournament_lr: f64,
     live: HashMap<MatchId, LiveMatch>,
     last_forecast: oracle_domain::TournamentForecast,
     /// Per-match venue/travel adjustments (host, altitude, rest), precomputed once.
@@ -393,6 +404,7 @@ impl EngineState {
             ensemble: deps.ensemble,
             live_config: deps.live_config,
             sim_config: deps.sim_config,
+            tournament_lr: deps.tournament_lr,
             live: HashMap::new(),
             last_forecast: oracle_domain::TournamentForecast {
                 iterations: 0,
@@ -505,8 +517,12 @@ impl EngineState {
         }
 
         if let Some(score) = final_score {
-            // World Cup matches are at neutral venues.
+            // World Cup matches are at neutral venues. Both ratings learn from the result:
+            // Elo, and the Dixon-Coles goal model (online, so the forecast tracks tournament
+            // form instead of staying frozen at the offline fit).
             self.ratings.record(home, away, score, true);
+            self.model
+                .update_with_result(home, away, score, true, self.tournament_lr);
             self.tournament.matches[pos].status = MatchStatus::Finished;
             self.tournament.matches[pos].score = score;
             return true;
@@ -723,6 +739,65 @@ mod tests {
     fn fresh_state() -> EngineState {
         let deps = EngineDeps::new(Arc::new(SimProvider::new()));
         EngineState::new(data::world_cup_2026(), deps)
+    }
+
+    fn state_with_lr(lr: f64) -> EngineState {
+        let deps = EngineDeps::new(Arc::new(SimProvider::new()))
+            .with_model(data::fit_baseline_model(7))
+            .with_elo_seeds(data::team_strengths())
+            .with_tournament_lr(lr);
+        EngineState::new(data::world_cup_2026(), deps)
+    }
+
+    #[test]
+    fn in_tournament_learning_lifts_an_overperformer() {
+        // Pick a team and finish two of its group matches as 5-0 thrashings, then compare a
+        // learning engine (lr > 0) against an identical no-learning one (lr = 0).
+        let pick = |state: &EngineState| -> (TeamId, Vec<MatchId>) {
+            let team = state.tournament.matches[0].home;
+            let ids: Vec<MatchId> = state
+                .tournament
+                .matches
+                .iter()
+                .filter(|m| m.home == team)
+                .take(2)
+                .map(|m| m.id)
+                .collect();
+            (team, ids)
+        };
+
+        let run = |lr: f64| -> f64 {
+            let mut state = state_with_lr(lr);
+            let metrics = Metrics::default();
+            let (team, ids) = pick(&state);
+            for id in ids {
+                state.apply_event(
+                    &MatchEvent::new(
+                        id,
+                        90,
+                        EventKind::FullTime {
+                            score: Scoreline::new(5, 0),
+                        },
+                    ),
+                    &metrics,
+                );
+            }
+            state.recompute_forecast();
+            state
+                .last_forecast
+                .teams
+                .iter()
+                .find(|t| t.team == team)
+                .unwrap()
+                .p_champion
+        };
+
+        let learned = run(0.08);
+        let frozen = run(0.0);
+        assert!(
+            learned > frozen,
+            "two 5-0 wins should raise the team's title odds via learning ({frozen:.4} -> {learned:.4})"
+        );
     }
 
     #[test]
