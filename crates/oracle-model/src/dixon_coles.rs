@@ -257,6 +257,37 @@ impl GoalModel {
         self.defense.get(&t).copied().unwrap_or(0.0)
     }
 
+    /// Online update from a single finished match: one gradient-ascent step on the two
+    /// teams' attack/defense coefficients toward the observed score, at learning rate `lr`.
+    ///
+    /// This is the per-observation step of [`fit`] applied incrementally, so the model
+    /// learns from in-tournament results as they land instead of staying frozen at the
+    /// offline fit. Only the four team-specific coefficients move, leaving the league-level
+    /// intercept and home advantage fixed, so global drift stays bounded; the residual is
+    /// clamped so one blowout cannot swing a rating. We intentionally do not recenter
+    /// (recentering is a global batch-fit operation and would perturb every other team).
+    pub fn update_with_result(
+        &mut self,
+        home: TeamId,
+        away: TeamId,
+        score: Scoreline,
+        neutral: bool,
+        lr: f64,
+    ) {
+        if lr == 0.0 {
+            return;
+        }
+        let (lambda, mu) = self.expected_goals(home, away, neutral);
+        let res_h = (f64::from(score.home) - lambda).clamp(-4.0, 4.0);
+        let res_a = (f64::from(score.away) - mu).clamp(-4.0, 4.0);
+
+        // attack rises / opponent defense falls when a side outscores its expectation.
+        *self.attack.entry(home).or_insert(0.0) += lr * res_h;
+        *self.defense.entry(away).or_insert(0.0) -= lr * res_h;
+        *self.attack.entry(away).or_insert(0.0) += lr * res_a;
+        *self.defense.entry(home).or_insert(0.0) -= lr * res_a;
+    }
+
     /// Expected goals `(λ_home, μ_away)` for a matchup. `neutral` removes the home
     /// edge (the World Cup default).
     pub fn expected_goals(&self, home: TeamId, away: TeamId, neutral: bool) -> (f64, f64) {
@@ -503,6 +534,36 @@ mod tests {
             strength(&no_ridge),
             strength(&heavy_ridge),
         );
+    }
+
+    #[test]
+    fn online_update_strengthens_a_repeated_winner() {
+        let model = GoalModel::fit(&synthetic_history(), DixonColesConfig::default());
+        let before = model.outcome_probabilities(t(2), t(1), true).home_win;
+
+        // Team 2 (the weak side) now thrashes team 1 several times in the tournament.
+        let mut learned = model.clone();
+        let s2 = learned.attack_of(t(2)) - learned.defense_of(t(2));
+        for _ in 0..6 {
+            learned.update_with_result(t(2), t(1), Scoreline::new(4, 0), true, 0.05);
+        }
+        let s2_after = learned.attack_of(t(2)) - learned.defense_of(t(2));
+        assert!(s2_after > s2, "a repeated big winner should strengthen");
+
+        let after = learned.outcome_probabilities(t(2), t(1), true).home_win;
+        assert!(
+            after > before,
+            "its win probability vs team 1 should rise ({before:.3} -> {after:.3})"
+        );
+    }
+
+    #[test]
+    fn online_update_with_zero_lr_is_a_noop() {
+        let mut model = GoalModel::fit(&synthetic_history(), DixonColesConfig::default());
+        let before = model.expected_goals(t(1), t(2), true);
+        model.update_with_result(t(1), t(2), Scoreline::new(5, 0), true, 0.0);
+        let after = model.expected_goals(t(1), t(2), true);
+        assert_eq!(before, after);
     }
 
     #[test]
