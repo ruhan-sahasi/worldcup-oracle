@@ -50,6 +50,7 @@ fully offline with **zero keys and zero network**.
 | **Log-opinion-pool ensemble** (`[Dixon-Coles, Elo, Market]` weights + temperature **learned by stacking**) | a single sharper forecast, anchored to the bookmaker when odds are present |
 | **Bayesian live updater** | conditions on score + minute + red cards for live odds |
 | **Lineup adjustment** | a confirmed XI shifts each team's attack and defense |
+| **Suspension tracking** | yellow-card accumulation drops a suspended starter from the next match before its lineup is known |
 | **Venue & travel context** | host advantage, altitude, and rest-day differential adjust each match |
 | **Monte-Carlo** (rayon-parallel, **conditions in-progress matches** on their live score) | tournament-level champion odds that move with live results |
 
@@ -230,8 +231,8 @@ docker compose up --build         # serves on :8080
   seeding; ~50k full tournament simulations/second.
 - **Applied statistics** -> Dixon-Coles MLE with time decay (**fit on xG** when present)
   and **ridge regularization** that shrinks sparse-data teams, **online updating from each
-  finished match** so the model learns in-tournament, Elo, Bayesian conditioning, lineup-
-  and venue-aware adjustments, a **stacked** `[Dixon-Coles, Elo, Market]` ensemble, and
+  finished match** so the model learns in-tournament, Elo, Bayesian conditioning, lineup-,
+  suspension-, and venue-aware adjustments, a **stacked** `[Dixon-Coles, Elo, Market]` ensemble, and
   honest evaluation: **proper scoring rules** vs the **bookmaker's implied odds**, a
   **reliability curve + ECE**, and **Monte-Carlo standard error** on the forecast.
 - **Resilient ingestion** -> an authoritative `ScoreSync` reconciliation (so a dropped or

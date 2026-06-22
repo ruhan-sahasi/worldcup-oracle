@@ -131,14 +131,18 @@ loss in `Ensemble::fit`), so the blend is provably no worse than its best member
 match has bookmaker odds they enter as the third member and the ensemble anchors to them;
 with no odds it degrades cleanly to two members (`blend` renormalizes the weights).
 
-### Lineup & venue adjustments (`oracle-ingest::data` + `oracle-model`)
-Two context signals produce log-space per-team `(attack, defense)` deltas that sum and feed
-`GoalModel::expected_goals_adjusted`. **Lineups**: a confirmed XI compared to the strongest
-available XI (a missing key player lowers that side and lifts the opponent). **Venue/travel
-(`MatchContext`)**: host-nation/crowd advantage, Mexico-City-style altitude, and rest-day
-differential. Venue applies to every Monte-Carlo fixture, so host advantage reaches the
-champion odds. Squads, xG, and venue assignments are synthetic offline; rest days come from
-the real fixture schedule.
+### Lineup, suspension & venue adjustments (`oracle-ingest::data` + `oracle-model`)
+Three context signals produce log-space per-team `(attack, defense)` deltas that sum and
+feed `GoalModel::expected_goals_adjusted`. **Lineups**: a confirmed XI compared to the
+strongest available XI (a missing key player lowers that side and lifts the opponent).
+**Suspensions**: the engine accumulates `YellowCard` events per player and, on reaching the
+threshold (2), drops that player from the team's next unplayed match. That match's prediction
+and forecast then carry the lineup penalty as a *pre-lineup prior*, superseded by the real
+lineup once it is announced (which on a live feed already excludes the suspended player).
+**Venue/travel (`MatchContext`)**: host-nation/crowd advantage, Mexico-City-style altitude,
+and rest-day differential. Venue (and any pre-lineup suspension penalty) applies to every
+Monte-Carlo fixture, so it reaches the champion odds. Squads, xG, and venue assignments are
+synthetic offline; rest days come from the real fixture schedule.
 
 ### Market prior & benchmark (`oracle-model::implied_probabilities`)
 Decimal odds are inverted and the overround normalized away to recover the bookmaker's
