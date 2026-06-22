@@ -45,7 +45,7 @@ fully offline with **zero keys and zero network**.
 
 | Piece | What it contributes |
 |-------|---------------------|
-| **Dixon-Coles** bivariate Poisson, MLE-fit with time decay, **fit on xG when available** | full exact-score distribution per matchup, from a low-noise signal |
+| **Dixon-Coles** bivariate Poisson, MLE-fit with time decay, **fit on xG when available**, **updated online from results** | full exact-score distribution that sharpens as the tournament unfolds |
 | **Elo** with home edge + margin-of-victory scaling | a complementary strength signal |
 | **Log-opinion-pool ensemble** (`[Dixon-Coles, Elo, Market]` weights + temperature **learned by stacking**) | a single sharper forecast, anchored to the bookmaker when odds are present |
 | **Bayesian live updater** | conditions on score + minute + red cards for live odds |
@@ -229,9 +229,10 @@ docker compose up --build         # serves on :8080
 - **Data-parallelism** -> `rayon`-parallel Monte-Carlo with deterministic per-iteration
   seeding; ~50k full tournament simulations/second.
 - **Applied statistics** -> Dixon-Coles MLE with time decay (**fit on xG** when present)
-  and **ridge regularization** that shrinks sparse-data teams, Elo, Bayesian conditioning,
-  lineup- and venue-aware adjustments, a **stacked** `[Dixon-Coles, Elo, Market]` ensemble,
-  and honest evaluation: **proper scoring rules** vs the **bookmaker's implied odds**, a
+  and **ridge regularization** that shrinks sparse-data teams, **online updating from each
+  finished match** so the model learns in-tournament, Elo, Bayesian conditioning, lineup-
+  and venue-aware adjustments, a **stacked** `[Dixon-Coles, Elo, Market]` ensemble, and
+  honest evaluation: **proper scoring rules** vs the **bookmaker's implied odds**, a
   **reliability curve + ECE**, and **Monte-Carlo standard error** on the forecast.
 - **Resilient ingestion** -> an authoritative `ScoreSync` reconciliation (so a dropped or
   duplicated poll can't corrupt the score), a feed-health signal with exponential backoff,
@@ -268,11 +269,13 @@ cargo bench -p oracle-sim       # Monte-Carlo throughput
   simulator still builds a fresh bracket each run (a standard seeded single-elimination
   template, not FIFA's exact slotting); conditioning live *knockout* matches is future
   work. All documented in the code.
-- Still open on the model side: full **posterior intervals** (we report Monte-Carlo
-  standard error, not parameter uncertainty), **dynamic in-tournament** goal-model updates
-  (only Elo updates live today), and richer **knockout realism** (extra time, a less
-  coin-flip shootout). Deliberately deferred: **squad market value** (largely redundant with
-  the strength ratings offline) and **stakes / dead-rubber rotation** (speculative).
+- The goal model now **learns in-tournament** from each finished match (a one-step online
+  Poisson update); the deeper version, a full **dynamic / state-space (Kalman) rating** with
+  process noise, is still future work. Also open: full **posterior intervals** (we report
+  Monte-Carlo standard error, not parameter uncertainty) and richer **knockout realism**
+  (extra time, a less coin-flip shootout). Deliberately deferred: **squad market value**
+  (largely redundant with the strength ratings offline) and **stakes / dead-rubber
+  rotation** (speculative).
 
 ## 📄 License
 

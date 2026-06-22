@@ -109,6 +109,13 @@ An **L2 (ridge)** penalty shrinks the coefficients toward the mean; because a da
 team accumulates a larger gradient, sparse-data teams are shrunk more, which is the
 regularization a sparse, unbalanced international schedule needs.
 
+The model also **learns in-tournament**: `update_with_result` applies one online
+gradient step (the per-observation step of the fit, residual-clamped, on just the two
+teams' coefficients) on each finished match. The engine calls it from the `FullTime` arm
+alongside the Elo update, so as the group stage unfolds the forecast tracks tournament form
+instead of staying frozen at the offline fit. A full dynamic/state-space rating with process
+noise is the deeper future version.
+
 ### Bayesian in-match updating (`oracle-model::live`)
 Live, we condition on the current scoreline, minute, and red cards. Remaining goals
 for each side are Poisson over the time left, scaled by the fraction of the match
