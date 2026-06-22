@@ -6,6 +6,7 @@
 //! wc-oracle simulate   # Monte-Carlo champion odds for the 2026 World Cup
 //! wc-oracle predict    # one-off matchup prediction (ensemble + score grid)
 //! wc-oracle backtest   # calibration + bookmaker benchmark (real or synthetic data)
+//! wc-oracle tune       # search goal-model hyperparameters by held-out log-loss
 //! wc-oracle serve      # run the REST + WebSocket server
 //! wc-oracle watch      # live terminal dashboard (TUI)
 //! ```
@@ -77,6 +78,17 @@ enum Command {
         #[arg(long)]
         data: Option<std::path::PathBuf>,
     },
+    /// Search goal-model hyperparameters, picking the best by held-out log-loss.
+    Tune {
+        /// Total synthetic matches when no --data file is given.
+        #[arg(long, default_value_t = 4000)]
+        matches: usize,
+        #[arg(long, default_value_t = 7)]
+        seed: u64,
+        /// Path to a football-data.co.uk style results CSV (tune on real data + odds).
+        #[arg(long)]
+        data: Option<std::path::PathBuf>,
+    },
     /// Run the REST + WebSocket server.
     Serve {
         /// Listen address.
@@ -112,6 +124,11 @@ async fn main() -> anyhow::Result<()> {
             seed,
             data,
         } => cmd_backtest(matches, seed, data),
+        Command::Tune {
+            matches,
+            seed,
+            data,
+        } => cmd_tune(matches, seed, data),
         Command::Serve { addr, event_log } => cmd_serve(addr, event_log).await,
         Command::Watch { speed } => watch::run(speed).await,
     }
@@ -494,6 +511,132 @@ fn cmd_backtest(
         );
     }
     println!("    (predicted ≈ empirical in every bucket means well-calibrated)\n");
+    Ok(())
+}
+
+fn cmd_tune(
+    n_matches: usize,
+    seed: u64,
+    data_path: Option<std::path::PathBuf>,
+) -> anyhow::Result<()> {
+    use oracle_model::{score, DixonColesConfig, GoalModel, Observation, ScoreModel};
+
+    let (mut records, source, real_data) = match &data_path {
+        Some(p) => (data::load_results_csv(p)?, format!("{}", p.display()), true),
+        None => (
+            data::synthetic_history_with_market(n_matches, seed),
+            format!("{n_matches} synthetic matches"),
+            false,
+        ),
+    };
+    if records.len() < 100 {
+        anyhow::bail!("need at least 100 matches to tune (got {})", records.len());
+    }
+    let neutral = !real_data;
+
+    // Temporal split: fit on the oldest 60%, select hyperparameters on the next 20%
+    // (validation), and report the winner's honest loss on the most recent 20% (test).
+    records.sort_by(|a, b| {
+        b.obs
+            .age_days
+            .partial_cmp(&a.obs.age_days)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    let n = records.len();
+    let train: Vec<Observation> = records[..n * 6 / 10].iter().map(|r| r.obs).collect();
+    let validation: Vec<Observation> = records[n * 6 / 10..n * 8 / 10]
+        .iter()
+        .map(|r| r.obs)
+        .collect();
+    let test: Vec<Observation> = records[n * 8 / 10..].iter().map(|r| r.obs).collect();
+
+    // Log-loss of a config's Dixon-Coles model fit on `train`, scored on `eval`.
+    let evaluate = |cfg: DixonColesConfig, eval: &[Observation]| -> f64 {
+        let model = GoalModel::fit(&train, cfg);
+        let preds: Vec<_> = eval
+            .iter()
+            .map(|o| {
+                (
+                    model.outcome_probabilities(o.home, o.away, neutral),
+                    o.score.outcome(),
+                )
+            })
+            .collect();
+        score(&preds).log_loss
+    };
+
+    // The hand-picked constants we are replacing with searched values.
+    const XIS: &[f64] = &[0.001, 0.002, 0.003, 0.005, 0.008];
+    const RIDGES: &[f64] = &[0.0, 0.005, 0.01, 0.02, 0.05];
+    const MODELS: &[(ScoreModel, &str)] = &[
+        (ScoreModel::Independent, "independent"),
+        (ScoreModel::Bivariate, "bivariate"),
+    ];
+
+    let base = DixonColesConfig::default();
+    let mut best = (base, evaluate(base, &validation));
+    let mut evaluated = 0usize;
+    for &xi in XIS {
+        for &ridge in RIDGES {
+            for &(model, _) in MODELS {
+                let cfg = DixonColesConfig {
+                    xi,
+                    ridge,
+                    model,
+                    ..base
+                };
+                let ll = evaluate(cfg, &validation);
+                evaluated += 1;
+                if ll < best.1 {
+                    best = (cfg, ll);
+                }
+            }
+        }
+    }
+
+    let model_name = |m: ScoreModel| match m {
+        ScoreModel::Independent => "independent",
+        ScoreModel::Bivariate => "bivariate",
+    };
+    println!(
+        "\nTuning on {}  (train {} / validation {} / test {}); {} configs searched\n",
+        source,
+        train.len(),
+        validation.len(),
+        test.len(),
+        evaluated
+    );
+    println!(
+        "  {:<26} {:>12} {:>12}",
+        "Config", "val logloss", "test logloss"
+    );
+    println!("  {}", "-".repeat(52));
+    println!(
+        "  {:<26} {:>12.4} {:>12.4}",
+        format!(
+            "default (xi {:.3}, ridge {:.3}, {})",
+            base.xi,
+            base.ridge,
+            model_name(base.model)
+        ),
+        evaluate(base, &validation),
+        evaluate(base, &test),
+    );
+    println!(
+        "  {:<26} {:>12.4} {:>12.4}",
+        format!(
+            "tuned   (xi {:.3}, ridge {:.3}, {})",
+            best.0.xi,
+            best.0.ridge,
+            model_name(best.0.model)
+        ),
+        best.1,
+        evaluate(best.0, &test),
+    );
+    println!(
+        "\n  Searched goal-model hyperparameters (xi, ridge, score model) by held-out\n  \
+         log-loss. Lower is better; the test column is the honest out-of-sample number.\n"
+    );
     Ok(())
 }
 
