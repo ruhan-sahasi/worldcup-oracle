@@ -90,24 +90,30 @@ log λ = c + α_i − β_j + h        (home goals)
 log μ = c + α_j − β_i            (away goals)
 ```
 
-The joint score distribution is two near-independent Poissons with the Dixon-Coles
-low-score correction `τ` on the {0-0, 1-0, 0-1, 1-1} cells (real football has more
-low-scoring draws than independence implies):
-
-```
-P(x, y) = τ(x, y; λ, μ, ρ) · Poisson(x; λ) · Poisson(y; μ)
-```
+The joint score distribution uses one of two **score models** (`ScoreModel`, selectable and
+tunable). Independent (default): two Poissons with the Dixon-Coles low-score correction `τ`
+on the {0-0, 1-0, 0-1, 1-1} cells (real football has more low-scoring draws than
+independence implies), `P(x, y) = τ(x, y; λ, μ, ρ) · Poisson(x; λ) · Poisson(y; μ)`.
+Bivariate Poisson: a shared component `λ3` induces positive correlation directly,
+`X = U1 + U3`, `Y = U2 + U3`, with the marginal means preserved (`λ1 = λ − λ3`); `λ3 = 0`
+recovers independence.
 
 Parameters are fit by **maximum likelihood** on historical results, each weighted by
-`exp(−ξ · age_days)` so recent form counts more. The attack/defense/intercept/home
-terms ascend the time-weighted Poisson log-likelihood analytically (the score
-equations reduce to `target − expected`); `ρ` is fit by a 1-D search over the
-fully-corrected likelihood. When **expected goals (xG)** are attached to an observation
-the fit regresses on them instead of the realized goals: xG is a much lower-noise signal
-(a team can dominate xG and lose), so the same estimating equation gives a sharper model.
-An **L2 (ridge)** penalty shrinks the coefficients toward the mean; because a data-rich
-team accumulates a larger gradient, sparse-data teams are shrunk more, which is the
-regularization a sparse, unbalanced international schedule needs.
+`exp(−ξ · age_days)` so recent form counts more. The attack/defense/intercept/home terms
+ascend the time-weighted Poisson log-likelihood, with a **backtracking, convergence-checked
+step**: a step that fails to improve the objective is rolled back and the learning rate
+halved, so the fit cannot oscillate or diverge and stops once it settles. The dependence
+parameter (`ρ` or `λ3`) is then fit by a 1-D search over the fully-corrected likelihood.
+When **expected goals (xG)** are attached to an observation the fit regresses on them
+instead of the realized goals: xG is a much lower-noise signal (a team can dominate xG and
+lose), so the same estimating equation gives a sharper model. An **L2 (ridge)** penalty
+shrinks the coefficients toward the mean; because a data-rich team accumulates a larger
+gradient, sparse-data teams are shrunk more, the regularization a sparse, unbalanced
+international schedule needs.
+
+The hand-tuning is removed by `wc-oracle tune`, which grid-searches the time decay `ξ`, the
+ridge strength, and the score model on a validation split (selecting by log-loss) and reports
+the winner's honest test-set loss, so these constants are optimized rather than guessed.
 
 The model also **learns in-tournament**: `update_with_result` applies one online
 gradient step (the per-observation step of the fit, residual-clamped, on just the two

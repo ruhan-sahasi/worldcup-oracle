@@ -45,7 +45,7 @@ fully offline with **zero keys and zero network**.
 
 | Piece | What it contributes |
 |-------|---------------------|
-| **Dixon-Coles** bivariate Poisson, MLE-fit with time decay, **fit on xG when available**, **updated online from results** | full exact-score distribution that sharpens as the tournament unfolds |
+| **Dixon-Coles / bivariate-Poisson** goal model, MLE-fit (convergence-checked) with time decay + ridge, **fit on xG when available**, **updated online from results** | full exact-score distribution that sharpens as the tournament unfolds; the score model and fit hyperparameters are **tuned by held-out log-loss** |
 | **Elo** with home edge + margin-of-victory scaling | a complementary strength signal |
 | **Log-opinion-pool ensemble** (`[Dixon-Coles, Elo, Market]` weights + temperature **learned by stacking**) | a single sharper forecast, anchored to the bookmaker when odds are present |
 | **Bayesian live updater** | conditions on score + minute + red cards for live odds |
@@ -166,6 +166,24 @@ market but does not clear it. And the **reliability table + ECE** confirm the en
 well-calibrated (predicted ≈ empirical in every bucket). `--data` runs the same split on a real
 [football-data.co.uk](https://www.football-data.co.uk) CSV (with closing odds, and xG
 columns if present).
+
+```bash
+# 6. Tune the goal-model hyperparameters (time decay, ridge, score model) by held-out
+#    log-loss, replacing hand-picked constants with searched ones:
+cargo run --release -p oracle-cli -- tune
+```
+
+```text
+  Config                      val logloss test logloss
+  ----------------------------------------------------
+  default (xi 0.003, ridge 0.010, independent)       1.0621       1.0376
+  tuned   (xi 0.001, ridge 0.000, bivariate)         1.0604       1.0361
+```
+
+`tune` grid-searches the goal-model fit (time-decay ξ, ridge, and the score model:
+independent-Poisson-plus-Dixon-Coles vs **bivariate Poisson**), selecting on a validation
+split and reporting the winner's honest test-set loss, so the constants are optimized rather
+than guessed.
 
 > **Validated on real data.** On 1,520 real Premier League matches with real Bet365 closing
 > odds, the stacked ensemble (Brier **0.5416**) matches the bookmaker's closing line (0.5421)
