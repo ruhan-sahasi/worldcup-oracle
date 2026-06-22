@@ -67,6 +67,7 @@ impl SimProvider {
         let p_home_goal = (lambda / 90.0).min(1.0);
         let p_away_goal = (mu / 90.0).min(1.0);
         const P_RED_CARD: f64 = 0.0004; // per team per minute
+        const P_YELLOW: f64 = 0.03; // ~1.3 bookings per team per match (realistic)
 
         let mut rng = StdRng::seed_from_u64(self.seed ^ (u64::from(match_id.0) << 8));
         let mut score = Scoreline::new(0, 0);
@@ -75,14 +76,16 @@ impl SimProvider {
         // the time, so the lineup-aware adjustment visibly moves the odds.
         let drop_home_star = rng.gen_bool(0.25);
         let drop_away_star = rng.gen_bool(0.25);
+        let home_xi = data::starting_lineup(home, drop_home_star);
+        let away_xi = data::starting_lineup(away, drop_away_star);
         send(
             tx,
             MatchEvent::new(
                 match_id,
                 0,
                 EventKind::Lineup {
-                    home: data::starting_lineup(home, drop_home_star),
-                    away: data::starting_lineup(away, drop_away_star),
+                    home: home_xi.clone(),
+                    away: away_xi.clone(),
                 },
             ),
         )
@@ -145,6 +148,21 @@ impl SimProvider {
                 send(
                     tx,
                     MatchEvent::new(match_id, minute, EventKind::RedCard { team }),
+                )
+                .await?;
+            } else if rng.gen_bool(P_YELLOW) {
+                // Book a player from the carded side, biased toward the talisman (XI index 1)
+                // so a key player can reach two yellows across the group stage and be
+                // suspended, exercising the suspension-tracking path.
+                let (team, xi) = if rng.gen_bool(0.5) {
+                    (home, &home_xi)
+                } else {
+                    (away, &away_xi)
+                };
+                let player = pick_booked_player(&mut rng, xi);
+                send(
+                    tx,
+                    MatchEvent::new(match_id, minute, EventKind::YellowCard { team, player }),
                 )
                 .await?;
             } else if minute % self.tick_every == 0 {
@@ -213,6 +231,20 @@ impl DataProvider for SimProvider {
 /// Send an event, mapping a closed channel to a typed error.
 async fn send(tx: &Sender<MatchEvent>, event: MatchEvent) -> Result<()> {
     tx.send(event).await.map_err(|_| IngestError::ChannelClosed)
+}
+
+/// Pick which player in an XI gets booked, biased toward the talisman (index 1, the
+/// boosted attacker in a synthetic squad) so a key player can accumulate cards.
+fn pick_booked_player(rng: &mut StdRng, xi: &[String]) -> Option<String> {
+    if xi.is_empty() {
+        return None;
+    }
+    let idx = if xi.len() > 1 && rng.gen_bool(0.45) {
+        1 // the star plays on the edge, so bookings concentrate enough to suspend
+    } else {
+        rng.gen_range(0..xi.len())
+    };
+    Some(xi[idx].clone())
 }
 
 #[cfg(test)]
