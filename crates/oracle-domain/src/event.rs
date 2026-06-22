@@ -49,8 +49,13 @@ pub enum EventKind {
     },
     /// A red card was shown - reduces that team's scoring intensity in the live model.
     RedCard { team: TeamId },
-    /// A yellow card (carried for completeness / future discipline modelling).
-    YellowCard { team: TeamId },
+    /// A yellow card. `player` lets the engine track booking accumulation toward a
+    /// suspension; `None` (a feed without player detail) is still valid, just untrackable.
+    YellowCard {
+        team: TeamId,
+        #[serde(default)]
+        player: Option<String>,
+    },
     /// Half-time.
     HalfTime,
     /// The match finished with a final `score`.

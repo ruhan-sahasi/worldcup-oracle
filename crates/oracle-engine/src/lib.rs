@@ -60,6 +60,9 @@ pub struct EngineDeps {
     /// Learning rate for the online goal-model update applied to each finished match, so the
     /// model learns from in-tournament results. 0 disables in-tournament learning.
     pub tournament_lr: f64,
+    /// Yellow cards that suspend a player for their team's next match. 0 disables suspension
+    /// tracking. The World Cup group-stage rule is 2.
+    pub suspension_threshold: u8,
 }
 
 impl EngineDeps {
@@ -77,6 +80,7 @@ impl EngineDeps {
                 ..SimConfig::default()
             },
             tournament_lr: 0.03,
+            suspension_threshold: 2,
         }
     }
 
@@ -87,6 +91,11 @@ impl EngineDeps {
 
     pub fn with_tournament_lr(mut self, lr: f64) -> Self {
         self.tournament_lr = lr;
+        self
+    }
+
+    pub fn with_suspension_threshold(mut self, threshold: u8) -> Self {
+        self.suspension_threshold = threshold;
         self
     }
 
@@ -366,6 +375,12 @@ struct EngineState {
     sim_config: SimConfig,
     /// Online learning rate applied to the goal model on each finished match (0 = off).
     tournament_lr: f64,
+    /// Yellow-card threshold for a suspension (0 = off).
+    suspension_threshold: u8,
+    /// Yellow-card count per (team, player), reset when a suspension is triggered.
+    yellows: HashMap<(TeamId, String), u8>,
+    /// Players suspended for a given match (its team's next unplayed match when carded).
+    suspended: HashMap<MatchId, Vec<(TeamId, String)>>,
     live: HashMap<MatchId, LiveMatch>,
     last_forecast: oracle_domain::TournamentForecast,
     /// Per-match venue/travel adjustments (host, altitude, rest), precomputed once.
@@ -405,6 +420,9 @@ impl EngineState {
             live_config: deps.live_config,
             sim_config: deps.sim_config,
             tournament_lr: deps.tournament_lr,
+            suspension_threshold: deps.suspension_threshold,
+            yellows: HashMap::new(),
+            suspended: HashMap::new(),
             live: HashMap::new(),
             last_forecast: oracle_domain::TournamentForecast {
                 iterations: 0,
@@ -420,11 +438,8 @@ impl EngineState {
     /// space), feeding the adjusted goal model and the Monte-Carlo.
     fn match_adjustments(&self, id: MatchId) -> VenueAdj {
         let ((vh_a, vh_d), (va_a, va_d)) = self.venue_adj.get(&id).copied().unwrap_or_default();
-        let ((lh_a, lh_d), (la_a, la_d)) = self
-            .live
-            .get(&id)
-            .map(|l| (l.home_adj(), l.away_adj()))
-            .unwrap_or_default();
+        // Player availability: announced lineup if known, else a suspension-derived estimate.
+        let ((lh_a, lh_d), (la_a, la_d)) = self.availability_adj(id);
         ((vh_a + lh_a, vh_d + lh_d), (va_a + la_a, va_d + la_d))
     }
 
@@ -445,6 +460,7 @@ impl EngineState {
         let base = LiveMatch::from_fixture(&self.tournament.matches[pos]);
 
         let mut final_score: Option<Scoreline> = None;
+        let mut booking: Option<(TeamId, String)> = None;
         {
             let lm = self.live.entry(event.match_id).or_insert(base);
             match &event.kind {
@@ -509,10 +525,14 @@ impl EngineState {
                 EventKind::Odds { home, draw, away } => {
                     lm.market = Some(implied_probabilities(*home, *draw, *away));
                 }
+                EventKind::YellowCard { team, player } => {
+                    // Recorded for booking accumulation; resolved after the borrow ends.
+                    if let Some(name) = player {
+                        booking = Some((*team, name.clone()));
+                    }
+                }
                 // SourceStatus is handled above the match lookup; the rest are no-ops.
-                EventKind::SourceStatus { .. }
-                | EventKind::HalfTime
-                | EventKind::YellowCard { .. } => {}
+                EventKind::SourceStatus { .. } | EventKind::HalfTime => {}
             }
         }
 
@@ -527,7 +547,73 @@ impl EngineState {
             self.tournament.matches[pos].score = score;
             return true;
         }
+
+        // Booking accumulation: on reaching the threshold, suspend the player for the
+        // team's next unplayed match (reset the count, since the suspension is then served).
+        if let Some((team, name)) = booking {
+            if self.suspension_threshold > 0 {
+                let count = self.yellows.entry((team, name.clone())).or_insert(0);
+                *count += 1;
+                if *count >= self.suspension_threshold {
+                    *count = 0;
+                    if let Some(next) = self.next_unplayed_match(team) {
+                        let slot = self.suspended.entry(next).or_default();
+                        if !slot.iter().any(|(t, n)| *t == team && *n == name) {
+                            slot.push((team, name));
+                            return true; // the next match's forecast changed
+                        }
+                    }
+                }
+            }
+        }
         false
+    }
+
+    /// The team's next unplayed match by kickoff (where a suspension would be served).
+    fn next_unplayed_match(&self, team: TeamId) -> Option<MatchId> {
+        self.tournament
+            .matches
+            .iter()
+            .filter(|m| !m.is_finished() && (m.home == team || m.away == team))
+            .min_by_key(|m| m.kickoff)
+            .map(|m| m.id)
+    }
+
+    /// Player-availability lineup delta for a match: the announced lineup if one was
+    /// received (it already reflects reality), else a suspension-derived estimate (a
+    /// suspended starter missing the strongest XI), else none.
+    fn availability_adj(&self, id: MatchId) -> VenueAdj {
+        if let Some(lm) = self.live.get(&id) {
+            if lm.has_lineup() {
+                return (lm.home_adj(), lm.away_adj());
+            }
+        }
+        let Some(out) = self.suspended.get(&id) else {
+            return ((0.0, 0.0), (0.0, 0.0));
+        };
+        let Some(m) = self
+            .match_index
+            .get(&id)
+            .map(|&p| &self.tournament.matches[p])
+        else {
+            return ((0.0, 0.0), (0.0, 0.0));
+        };
+        let side_adj = |team: TeamId| -> (f64, f64) {
+            let banned: Vec<&String> = out
+                .iter()
+                .filter(|(t, _)| *t == team)
+                .map(|(_, n)| n)
+                .collect();
+            if banned.is_empty() {
+                return (0.0, 0.0);
+            }
+            let present: Vec<String> = oracle_ingest::data::starting_lineup(team, false)
+                .into_iter()
+                .filter(|n| !banned.contains(&n))
+                .collect();
+            oracle_ingest::data::lineup_adjustment(team, &present)
+        };
+        (side_adj(m.home), side_adj(m.away))
     }
 
     fn recompute_forecast(&mut self) {
@@ -555,10 +641,22 @@ impl EngineState {
                 )
             })
             .collect();
-        let inputs = LiveInputs {
-            live,
-            venue: self.venue_adj.clone(),
-        };
+        // Venue context applies to every fixture; suspensions add a player-availability
+        // penalty to scheduled matches that have no announced lineup yet (lineup/live
+        // matches already carry their delta in `live`, so we skip them to avoid double count).
+        let mut venue = self.venue_adj.clone();
+        for &id in self.suspended.keys() {
+            if live.contains_key(&id) {
+                continue;
+            }
+            let ((ha, hd), (aa, ad)) = self.availability_adj(id);
+            let e = venue.entry(id).or_default();
+            e.0 .0 += ha;
+            e.0 .1 += hd;
+            e.1 .0 += aa;
+            e.1 .1 += ad;
+        }
+        let inputs = LiveInputs { live, venue };
         self.last_forecast = simulate_with_live(
             &self.tournament,
             &self.model,
@@ -797,6 +895,93 @@ mod tests {
         assert!(
             learned > frozen,
             "two 5-0 wins should raise the team's title odds via learning ({frozen:.4} -> {learned:.4})"
+        );
+    }
+
+    fn state_with_threshold(threshold: u8) -> EngineState {
+        let deps = EngineDeps::new(Arc::new(SimProvider::new()))
+            .with_model(data::fit_baseline_model(7))
+            .with_elo_seeds(data::team_strengths())
+            .with_suspension_threshold(threshold);
+        EngineState::new(data::world_cup_2026(), deps)
+    }
+
+    #[test]
+    fn two_yellows_suspend_a_starter_and_weaken_the_next_match() {
+        // A team's probability of winning its next match should drop once a starter is
+        // suspended (threshold 2) versus suspension tracking off (threshold 0).
+        let win_prob_next = |threshold: u8| -> f64 {
+            let mut state = state_with_threshold(threshold);
+            let metrics = Metrics::default();
+            let team = state.tournament.matches[0].home;
+            let starter = oracle_ingest::data::starting_lineup(team, false)[1].clone();
+            let carrier = state.tournament.matches[0].id;
+            for _ in 0..2 {
+                state.apply_event(
+                    &MatchEvent::new(
+                        carrier,
+                        30,
+                        EventKind::YellowCard {
+                            team,
+                            player: Some(starter.clone()),
+                        },
+                    ),
+                    &metrics,
+                );
+            }
+            let next = state.next_unplayed_match(team).expect("a next match");
+            let m = state
+                .tournament
+                .matches
+                .iter()
+                .find(|m| m.id == next)
+                .unwrap()
+                .clone();
+            let p = state.predict_match(&m).probabilities;
+            if m.home == team {
+                p.home_win
+            } else {
+                p.away_win
+            }
+        };
+        let suspended = win_prob_next(2);
+        let available = win_prob_next(0);
+        assert!(
+            suspended < available,
+            "a suspended starter should lower the team's next-match win probability ({available:.3} -> {suspended:.3})"
+        );
+    }
+
+    #[test]
+    fn one_yellow_or_unnamed_card_creates_no_suspension() {
+        let mut state = state_with_threshold(2);
+        let metrics = Metrics::default();
+        let team = state.tournament.matches[0].home;
+        let carrier = state.tournament.matches[0].id;
+        let starter = oracle_ingest::data::starting_lineup(team, false)[1].clone();
+
+        // One yellow: under threshold, no suspension.
+        state.apply_event(
+            &MatchEvent::new(
+                carrier,
+                10,
+                EventKind::YellowCard {
+                    team,
+                    player: Some(starter),
+                },
+            ),
+            &metrics,
+        );
+        // Two unnamed yellows: untrackable, no suspension.
+        for _ in 0..2 {
+            state.apply_event(
+                &MatchEvent::new(carrier, 20, EventKind::YellowCard { team, player: None }),
+                &metrics,
+            );
+        }
+        assert!(
+            state.suspended.is_empty(),
+            "no suspension should have been created"
         );
     }
 
