@@ -47,12 +47,13 @@ fully offline with **zero keys and zero network**.
 |-------|---------------------|
 | **Dixon-Coles / bivariate-Poisson** goal model, MLE-fit (convergence-checked) with time decay + ridge, **fit on xG when available**, **updated online from results** | full exact-score distribution that sharpens as the tournament unfolds; the score model and fit hyperparameters are **tuned by held-out log-loss** |
 | **Elo** with home edge + margin-of-victory scaling | a complementary strength signal |
-| **Log-opinion-pool ensemble** (`[Dixon-Coles, Elo, Market]` weights + temperature **learned by stacking**) | a single sharper forecast, anchored to the bookmaker when odds are present |
+| **State-space (Kalman) rating** - each team a Gaussian `N(mean, var)`, random-walk between matches + Kalman update from each result | principled in-tournament learning *and* a per-team uncertainty that the Monte-Carlo consumes |
+| **Log-opinion-pool ensemble** (`[Dixon-Coles, Elo, State-space, Market]` weights + temperature **learned by stacking**) | a single sharper forecast, anchored to the bookmaker when odds are present |
 | **Bayesian live updater** with **score effects** | conditions on score, minute, and red cards; a trailing team chases and a leading team defends |
 | **Lineup adjustment** | a confirmed XI shifts each team's attack and defense |
 | **Suspension tracking** | yellow-card accumulation drops a suspended starter from the next match before its lineup is known |
 | **Venue & travel context** | host advantage, altitude, and rest-day differential adjust each match |
-| **Monte-Carlo** (rayon-parallel, **conditions in-progress matches** on their live score; knockouts go to **extra time + a near-50/50 shootout**; **resamples team strength each iteration**) | tournament-level champion odds that move with live results and carry parameter uncertainty |
+| **Monte-Carlo** (rayon-parallel, **conditions in-progress matches** on their live score; the **fixed 2026 knockout bracket**; knockouts go to **extra time + a near-50/50 shootout**; **resamples team strength each iteration**) | tournament-level champion odds that move with live results and carry parameter uncertainty |
 
 Calibration is measured with proper scoring rules (Brier, log-loss), benchmarked against
 the bookmaker's implied odds, and regression-tested. The maths are written up in
@@ -82,7 +83,7 @@ flowchart LR
 | Crate | Responsibility |
 |-------|----------------|
 | `oracle-domain` | pure types (teams, matches, events, probabilities); no I/O |
-| `oracle-ratings` | Elo rating system |
+| `oracle-ratings` | Elo + state-space (Kalman) rating systems |
 | `oracle-model` | Dixon-Coles, Bayesian live model, ensemble, calibration |
 | `oracle-sim` | parallel Monte-Carlo tournament simulator |
 | `oracle-ingest` | `DataProvider` trait + sim / replay / live adapters, rate-limit + cache |
@@ -250,7 +251,8 @@ docker compose up --build         # serves on :8080
 - **Applied statistics** -> Dixon-Coles MLE with time decay (**fit on xG** when present)
   and **ridge regularization** that shrinks sparse-data teams, **online updating from each
   finished match** so the model learns in-tournament, Elo, Bayesian conditioning, lineup-,
-  suspension-, and venue-aware adjustments, a **stacked** `[Dixon-Coles, Elo, Market]` ensemble, and
+  suspension-, and venue-aware adjustments, a **state-space (Kalman) rating** with per-team
+  uncertainty, a **stacked** `[Dixon-Coles, Elo, State-space, Market]` ensemble, and
   honest evaluation: **proper scoring rules** vs the **bookmaker's implied odds**, a
   **reliability curve + ECE**, and **Monte-Carlo standard error** on the forecast.
 - **Resilient ingestion** -> an authoritative `ScoreSync` reconciliation (so a dropped or
@@ -284,15 +286,17 @@ cargo bench -p oracle-sim       # Monte-Carlo throughput
   adapter ingests results (and **line-ups** on tiers that expose them); odds and xG are not
   offered by that provider, so they come from the CSV path or a dedicated source. Rest days
   are derived from the real fixture schedule.
-- Knockout ties go to extra time and a near-50/50 shootout, but the simulator still builds a
-  fresh bracket each run (a standard seeded single-elimination template, not FIFA's exact
-  slotting), and in-progress *knockout* matches are not yet conditioned on their live score
-  (in-progress *group* matches are). Both documented in the code.
-- The goal model now **learns in-tournament** from each finished match (a one-step online
-  Poisson update); the deeper version, a full **dynamic / state-space (Kalman) rating** with
-  process noise, is still future work. The Monte-Carlo now propagates **parameter
-  uncertainty** by resampling each team's strength per iteration from its fitted standard
-  error (so champion odds are not over-concentrated), though that is a Gaussian
+- Knockout ties go to extra time and a near-50/50 shootout, and the simulator plays the **fixed
+  2026 knockout bracket** (group winners/runners-up/best thirds placed in their real R32 slots)
+  when the tournament has the real shape. Two honest caveats: the best-third -> slot assignment
+  is a fixed deterministic rule, not FIFA's full 495-row lookup table, and the team-to-group
+  draw is synthetic. In-progress *knockout* matches are not yet conditioned on their live score
+  (in-progress *group* matches are). All documented in the code.
+- The goal model **learns in-tournament** two ways: a one-step online Poisson update on the
+  Dixon-Coles coefficients, and a full **state-space (Kalman) rating** that carries each team's
+  strength as a Gaussian and updates its mean *and* variance from every result. That variance
+  feeds the Monte-Carlo, which propagates **parameter uncertainty** by resampling each team's
+  strength per iteration (so champion odds are not over-concentrated), though that is a Gaussian
   approximation, not a full Bayesian posterior. Deliberately deferred: **squad market value**
   (largely redundant with the strength ratings offline) and **stakes / dead-rubber rotation**
   (speculative).

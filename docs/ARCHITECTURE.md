@@ -119,8 +119,20 @@ The model also **learns in-tournament**: `update_with_result` applies one online
 gradient step (the per-observation step of the fit, residual-clamped, on just the two
 teams' coefficients) on each finished match. The engine calls it from the `FullTime` arm
 alongside the Elo update, so as the group stage unfolds the forecast tracks tournament form
-instead of staying frozen at the offline fit. A full dynamic/state-space rating with process
-noise is the deeper future version.
+instead of staying frozen at the offline fit.
+
+### State-space (Kalman) rating (`oracle-ratings::state_space`)
+The deeper version of in-tournament learning *and* uncertainty. Each team carries a Gaussian
+belief about its latent strength, `N(mean, var)`, in goal-difference units. Between matches the
+strength performs a **random walk** (variance grows with elapsed days, so a thinly-observed team
+is correctly less certain); at a match the goal margin is a noisy linear measurement of the
+strength gap and a two-state **Kalman update** moves both means toward the surprise and shrinks
+their variances. Trained offline over the full match history and then updated live from each
+`FullTime`, it produces two things a point-estimate rating cannot: a win/draw/win prediction that
+becomes the ensemble's fourth member, and a per-team *uncertainty* (`stddev`) that the engine maps
+to log-rate units and feeds the Monte-Carlo as a dynamic `rating_sigma` (below), replacing the
+static fit-based uncertainty. A single latent strength is modelled, not separate attack/defense
+states.
 
 ### Bayesian in-match updating (`oracle-model::live`)
 Live, we condition on the current scoreline, minute, and red cards. Remaining goals
@@ -132,12 +144,12 @@ within-match dynamic. Convolving "goals already in" with the posterior over "goa
 to come" gives live win/draw/win probabilities that move on every event.
 
 ### Ensemble (`oracle-model::ensemble`)
-A temperature-scaled **logarithmic opinion pool** blends up to three members,
-`[Dixon-Coles, Elo, Market]`: `q(o) ∝ exp(τ · Σ_k a_k · ln p_k(o))`. The mixture weights
-`a_k` and temperature `τ` are **learned by stacking** (gradient descent on held-out log
+A temperature-scaled **logarithmic opinion pool** blends up to four members,
+`[Dixon-Coles, Elo, State-space, Market]`: `q(o) ∝ exp(τ · Σ_k a_k · ln p_k(o))`. The mixture
+weights `a_k` and temperature `τ` are **learned by stacking** (gradient descent on held-out log
 loss in `Ensemble::fit`), so the blend is provably no worse than its best member. When a
-match has bookmaker odds they enter as the third member and the ensemble anchors to them;
-with no odds it degrades cleanly to two members (`blend` renormalizes the weights).
+match has bookmaker odds they enter as the fourth member and the ensemble anchors to them;
+with no odds it degrades cleanly to the three model members (`blend` renormalizes the weights).
 
 ### Lineup, suspension & venue adjustments (`oracle-ingest::data` + `oracle-model`)
 Three context signals produce log-space per-team `(attack, defense)` deltas that sum and
@@ -170,14 +182,22 @@ independent, so it fans out over `rayon`; per-iteration RNG seeds make a given
 `(seed, iterations)` perfectly reproducible. Each probability carries a Monte-Carlo
 standard error `sqrt(p(1-p)/N)`, surfaced by `simulate`.
 
-Crucially, each iteration also **resamples every team's strength** from its fitted
-uncertainty (`MatchSampler::rating_stderr`, log-space attack/defense shifts held fixed across
-that team's matches), so the forecast carries **parameter uncertainty**, not just match
-variance. Data-poor teams wobble more (their `GoalModel::strength_uncertainty` is larger),
-which fattens the tails and stops champion odds from being over-concentrated, the failure
-mode of treating point-estimate ratings as certain. The `SimConfig::rating_uncertainty`
-multiplier scales (or disables, at 0) the effect; it is a Gaussian approximation, not a full
-Bayesian posterior.
+The knockout uses the **fixed 2026 bracket** (`FIXED_R32`) when the tournament has the real
+shape - 12 groups of four, top two plus the eight best thirds - placing each group winner,
+runner-up, and best third in its slot and playing a stable R32 -> R16 -> QF -> SF -> Final
+tree, so a strong group winner is correctly kept away from other winners until late. Other
+shapes (small test tournaments) fall back to generic reflection seeding. The best-third ->
+slot assignment is a fixed deterministic rule, not FIFA's full 495-row lookup table, and the
+team-to-group draw is synthetic.
+
+Crucially, each iteration also **resamples every team's strength** from its uncertainty, so the
+forecast carries **parameter uncertainty**, not just match variance. The engine supplies a
+per-team log-rate SD from the dynamic state-space rating (`LiveInputs::rating_sigma`); absent
+that, the sampler's own static fit-based uncertainty (`MatchSampler::rating_stderr`) is used.
+Data-poor or thinly-observed teams wobble more, which fattens the tails and stops champion odds
+from being over-concentrated, the failure mode of treating point-estimate ratings as certain.
+The `SimConfig::rating_uncertainty` multiplier scales (or disables, at 0) the effect; it is a
+Gaussian approximation, not a full Bayesian posterior.
 
 ### Calibration (`oracle-model::reliability`)
 Beyond Brier and log loss, `reliability` bins predictions by confidence and compares
