@@ -671,3 +671,38 @@ async fn cmd_serve(addr: SocketAddr, event_log: Option<std::path::PathBuf>) -> a
     let _ = join.await;
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{resolve_team, top_scorelines};
+    use oracle_domain::ScoreGrid;
+    use oracle_ingest::data;
+
+    #[test]
+    fn resolve_team_matches_name_code_case_and_substring() {
+        let teams = data::teams();
+        let brazil = resolve_team("Brazil", &teams).expect("full name");
+        assert_eq!(resolve_team("BRA", &teams), Some(brazil), "FIFA code");
+        assert_eq!(
+            resolve_team("brazil", &teams),
+            Some(brazil),
+            "case-insensitive"
+        );
+        assert_eq!(resolve_team("  brazil  ", &teams), Some(brazil), "trimmed");
+        // Substring fallback (no exact name/code match).
+        let usa = resolve_team("United States", &teams);
+        assert_eq!(resolve_team("United", &teams), usa, "substring match");
+        assert_eq!(resolve_team("Atlantis", &teams), None, "unknown team");
+    }
+
+    #[test]
+    fn top_scorelines_are_ranked_and_truncated() {
+        // A grid whose single most likely cell is 2-1.
+        let grid = ScoreGrid::from_fn(4, |h, a| if (h, a) == (2, 1) { 10.0 } else { 1.0 });
+        let top = top_scorelines(&grid, 3);
+        assert_eq!(top.len(), 3, "truncated to n");
+        assert_eq!((top[0].0, top[0].1), (2, 1), "modal scoreline first");
+        // Sorted by probability, descending.
+        assert!(top[0].2 >= top[1].2 && top[1].2 >= top[2].2);
+    }
+}

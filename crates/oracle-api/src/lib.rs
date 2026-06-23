@@ -302,3 +302,105 @@ impl LiveView {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::router;
+    use axum::body::{to_bytes, Body};
+    use axum::http::{Request, StatusCode};
+    use oracle_engine::{presets, spawn, Engine, EngineConfig};
+    use std::sync::Arc;
+    use tokio_util::sync::CancellationToken;
+    use tower::ServiceExt; // for `oneshot`
+
+    /// Spawn an engine over the deterministic simulation feed (no network), with a populated
+    /// initial snapshot, plus a cancel token to wind it down.
+    async fn test_engine() -> (Arc<Engine>, CancellationToken) {
+        let cancel = CancellationToken::new();
+        let (engine, _join) = spawn(
+            presets::simulated(),
+            EngineConfig::default(),
+            cancel.clone(),
+        )
+        .await
+        .expect("engine spawns");
+        (engine, cancel)
+    }
+
+    /// Fire one GET request at a fresh router and return `(status, body bytes)`.
+    async fn get(engine: &Arc<Engine>, uri: &str) -> (StatusCode, Vec<u8>) {
+        let req = Request::builder().uri(uri).body(Body::empty()).unwrap();
+        let res = router(engine.clone()).oneshot(req).await.unwrap();
+        let status = res.status();
+        let bytes = to_bytes(res.into_body(), usize::MAX).await.unwrap();
+        (status, bytes.to_vec())
+    }
+
+    fn json(bytes: &[u8]) -> serde_json::Value {
+        serde_json::from_slice(bytes).expect("valid JSON body")
+    }
+
+    #[tokio::test]
+    async fn rest_routes_return_expected_shapes() {
+        let (engine, cancel) = test_engine().await;
+
+        let (status, body) = get(&engine, "/health").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, b"ok");
+
+        let (status, body) = get(&engine, "/api").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json(&body)["service"], "worldcup-oracle");
+
+        let (status, body) = get(&engine, "/teams").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json(&body).as_array().unwrap().len(), 48);
+
+        let (status, body) = get(&engine, "/matches").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json(&body).as_array().unwrap().len(), 72);
+
+        let (status, body) = get(&engine, "/predict/tournament").await;
+        assert_eq!(status, StatusCode::OK);
+        let champ_mass: f64 = json(&body)["teams"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["p_champion"].as_f64().unwrap())
+            .sum();
+        assert!(
+            (champ_mass - 1.0).abs() < 0.05,
+            "champion mass ~1: {champ_mass}"
+        );
+
+        let (status, body) = get(&engine, "/predict/match/1").await;
+        assert_eq!(status, StatusCode::OK);
+        let m = json(&body);
+        assert!(m["home_name"].is_string() && m["away_name"].is_string());
+        let p = &m["probabilities"];
+        let sum = p["home_win"].as_f64().unwrap()
+            + p["draw"].as_f64().unwrap()
+            + p["away_win"].as_f64().unwrap();
+        assert!((sum - 1.0).abs() < 1e-6, "match probs sum to 1");
+
+        let (status, body) = get(&engine, "/metrics").await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(String::from_utf8_lossy(&body).contains("oracle_events_processed_total"));
+
+        cancel.cancel();
+    }
+
+    #[tokio::test]
+    async fn unknown_match_is_404_and_dashboard_is_served() {
+        let (engine, cancel) = test_engine().await;
+
+        let (status, _) = get(&engine, "/predict/match/999999").await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+
+        let (status, body) = get(&engine, "/").await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(String::from_utf8_lossy(&body).contains("<title>"));
+
+        cancel.cancel();
+    }
+}

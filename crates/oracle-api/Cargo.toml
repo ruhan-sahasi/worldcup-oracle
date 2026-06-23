@@ -22,6 +22,9 @@ futures-util.workspace = true
 anyhow.workspace = true
 tokio-util.workspace = true
 
+[dev-dependencies]
+tower = { workspace = true, features = ["util"] }
+
 [[bin]]
 name = "oracle-server"
 path = "src/bin/server.rs"

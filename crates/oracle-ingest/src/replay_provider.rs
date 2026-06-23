@@ -125,3 +125,72 @@ impl DataProvider for ReplayProvider {
 async fn send(tx: &Sender<MatchEvent>, event: MatchEvent) -> Result<()> {
     tx.send(event).await.map_err(|_| IngestError::ChannelClosed)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::DataProvider;
+    use oracle_domain::{Confederation, Group, MatchStatus, Scoreline, Team, TeamId};
+    use std::time::Duration;
+
+    fn one_match_tournament() -> Tournament {
+        let mut t = Tournament::new("Replay Test");
+        t.teams = vec![
+            Team::new(0, "Alpha", "ALP", Confederation::Uefa),
+            Team::new(1, "Beta", "BET", Confederation::Uefa),
+        ];
+        t.groups.push(Group {
+            name: 'A',
+            teams: vec![TeamId(0), TeamId(1)],
+        });
+        t.matches.push(Match {
+            id: MatchId(1),
+            home: TeamId(0),
+            away: TeamId(1),
+            stage: Stage::Group('A'),
+            kickoff: chrono::DateTime::from_timestamp(0, 0).unwrap(),
+            status: MatchStatus::Finished,
+            score: Scoreline::new(2, 1),
+        });
+        t
+    }
+
+    #[tokio::test]
+    async fn replays_a_finished_match_into_an_event_stream() {
+        let provider =
+            ReplayProvider::new(one_match_tournament()).with_minute_delay(Duration::from_millis(0));
+        let (tx, mut rx) = tokio::sync::mpsc::channel(256);
+        let cancel = CancellationToken::new();
+        provider.run(tx, cancel).await.unwrap();
+
+        let mut events = Vec::new();
+        while let Ok(e) = rx.try_recv() {
+            events.push(e);
+        }
+
+        // Opens with a health heartbeat, then a kickoff for the match.
+        assert!(matches!(
+            events[0].kind,
+            EventKind::SourceStatus { healthy: true }
+        ));
+        assert!(events.iter().any(|e| matches!(e.kind, EventKind::KickOff)));
+
+        // The three real goals (2-1) are all emitted.
+        let goals = events
+            .iter()
+            .filter(|e| matches!(e.kind, EventKind::Goal { .. }))
+            .count();
+        assert_eq!(goals, 3, "two home + one away goal");
+
+        // Ends with the authoritative full-time score.
+        let ft = events
+            .iter()
+            .rev()
+            .find_map(|e| match e.kind {
+                EventKind::FullTime { score } => Some(score),
+                _ => None,
+            })
+            .expect("a full-time event");
+        assert_eq!(ft, Scoreline::new(2, 1));
+    }
+}
