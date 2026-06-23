@@ -21,9 +21,11 @@
 //!
 //! In-progress **group** matches are conditioned on their live score/minute/red-cards
 //! (see [`simulate_with_live`] / [`InProgress`]) so the tournament forecast tracks live
-//! results. Documented modelling choices: the knockout bracket uses a standard seeded
-//! single-elimination template (winners spread against runners-up/best-thirds) rather
-//! than FIFA's exact slotting, and in-progress *knockout* matches are still built fresh.
+//! results. A level knockout tie goes to 30' of extra time at a reduced rate and then a
+//! near-50/50 penalty shootout (see [`SimConfig::extra_time_fraction`] /
+//! [`SimConfig::shootout_skill`]). Documented modelling choices: the knockout bracket uses a
+//! standard seeded single-elimination template (winners spread against runners-up/best-thirds)
+//! rather than FIFA's exact slotting, and in-progress *knockout* matches are still built fresh.
 #![forbid(unsafe_code)]
 
 use oracle_domain::{
@@ -91,6 +93,12 @@ pub struct SimConfig {
     pub advance_per_group: usize,
     /// Best third-placed teams that also advance (8 in the 2026 format).
     pub best_thirds: usize,
+    /// Extra-time goal rate as a fraction of a full match (30' is 1/3, damped a little since
+    /// extra time is cautious). Applied when a knockout tie is level after 90'.
+    pub extra_time_fraction: f64,
+    /// How much an expected-goal edge tilts a penalty shootout away from 50/50 (small;
+    /// shootouts are mostly luck). The shootout win probability is clamped to [0.35, 0.65].
+    pub shootout_skill: f64,
 }
 
 impl Default for SimConfig {
@@ -100,6 +108,8 @@ impl Default for SimConfig {
             seed: 0,
             advance_per_group: 2,
             best_thirds: 8,
+            extra_time_fraction: 0.30,
+            shootout_skill: 0.10,
         }
     }
 }
@@ -165,6 +175,8 @@ struct Prepared {
     advance_per_group: usize,
     best_thirds: usize,
     n: usize,
+    extra_time_fraction: f64,
+    shootout_skill: f64,
     /// Knockout wins required to be credited with reaching each forecast stage:
     /// `[advanced, R16, QF, SF, Final, Champion]`. Derived from the bracket depth so
     /// the stages line up with the real 32-team format and degrade gracefully for
@@ -319,6 +331,8 @@ impl Prepared {
             advance_per_group: config.advance_per_group,
             best_thirds: config.best_thirds,
             n,
+            extra_time_fraction: config.extra_time_fraction,
+            shootout_skill: config.shootout_skill,
             required,
         }
     }
@@ -334,8 +348,8 @@ impl Prepared {
         }
     }
 
-    /// Sample the winner's team-index of a knockout tie (penalties break a draw,
-    /// weighted by relative strength).
+    /// Sample the winner's team-index of a knockout tie: 90 minutes, then 30 of extra time
+    /// at a reduced rate, then a penalty shootout that is close to a coin flip.
     fn sample_knockout(&self, rng: &mut StdRng, a: usize, b: usize) -> usize {
         if a == BYE {
             return b;
@@ -344,14 +358,19 @@ impl Prepared {
             return a;
         }
         let (la, ma) = self.eg[a * self.n + b];
-        let gh = Self::sample_goals(rng, la);
-        let ga = Self::sample_goals(rng, ma);
+        let mut gh = Self::sample_goals(rng, la);
+        let mut ga = Self::sample_goals(rng, ma);
+        if gh == ga {
+            // Extra time: a third of a match, at lower scoring intensity.
+            gh += Self::sample_goals(rng, la * self.extra_time_fraction);
+            ga += Self::sample_goals(rng, ma * self.extra_time_fraction);
+        }
         match gh.cmp(&ga) {
             std::cmp::Ordering::Greater => a,
             std::cmp::Ordering::Less => b,
             std::cmp::Ordering::Equal => {
-                // Shootout: probability team a wins ∝ its share of expected goals.
-                let p = if la + ma > 0.0 { la / (la + ma) } else { 0.5 };
+                // Shootout: near 50/50, only slightly tilted by the expected-goal edge.
+                let p = (0.5 + self.shootout_skill * (la - ma)).clamp(0.35, 0.65);
                 if rng.gen::<f64>() < p {
                     a
                 } else {
@@ -575,8 +594,64 @@ mod tests {
         }
     }
 
+    /// A sampler giving every matchup the same expected goals (perfectly even teams).
+    struct EvenSampler;
+    impl MatchSampler for EvenSampler {
+        fn xg(&self, _home: TeamId, _away: TeamId) -> (f64, f64) {
+            (1.3, 1.3)
+        }
+    }
+
     fn epoch() -> chrono::DateTime<chrono::Utc> {
         chrono::DateTime::from_timestamp(0, 0).unwrap()
+    }
+
+    #[test]
+    fn knockout_between_even_teams_is_a_coin_flip() {
+        // With identical teams, extra time stays symmetric and the shootout is 50/50, so
+        // neither side has an edge over many knockout ties.
+        let t = tiny_tournament();
+        let prep = Prepared::build(
+            &t,
+            &EvenSampler,
+            SimConfig::default(),
+            &LiveInputs::default(),
+            LiveConfig::default(),
+        );
+        let mut rng = StdRng::seed_from_u64(99);
+        let trials = 20_000;
+        let a_wins = (0..trials)
+            .filter(|_| prep.sample_knockout(&mut rng, 0, 1) == 0)
+            .count();
+        let rate = a_wins as f64 / trials as f64;
+        assert!(
+            (rate - 0.5).abs() < 0.03,
+            "even knockout should be ~50/50, got {rate:.3}"
+        );
+    }
+
+    #[test]
+    fn knockout_favours_the_stronger_team_but_not_overwhelmingly() {
+        // Close teams (ids 3 and 4): the favourite wins more than half, but extra time and a
+        // near-coin-flip shootout keep it well short of certainty.
+        let t = tiny_tournament();
+        let prep = Prepared::build(
+            &t,
+            &RankSampler,
+            SimConfig::default(),
+            &LiveInputs::default(),
+            LiveConfig::default(),
+        );
+        let mut rng = StdRng::seed_from_u64(7);
+        let trials = 20_000;
+        let strong_wins = (0..trials)
+            .filter(|_| prep.sample_knockout(&mut rng, 3, 4) == 3)
+            .count();
+        let rate = strong_wins as f64 / trials as f64;
+        assert!(
+            rate > 0.52 && rate < 0.85,
+            "stronger side favoured, not certain: {rate:.3}"
+        );
     }
 
     fn tiny_tournament() -> Tournament {
