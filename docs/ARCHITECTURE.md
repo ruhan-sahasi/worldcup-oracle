@@ -125,9 +125,11 @@ noise is the deeper future version.
 ### Bayesian in-match updating (`oracle-model::live`)
 Live, we condition on the current scoreline, minute, and red cards. Remaining goals
 for each side are Poisson over the time left, scaled by the fraction of the match
-remaining and perturbed by red cards. Convolving "goals already in" with the
-posterior over "goals still to come" gives live win/draw/win probabilities that move
-on every event.
+remaining and perturbed by red cards. **Score effects** then adjust the remaining-goal
+intensities by the current margin (saturating with `tanh(|margin|)`): a trailing team
+chases (scores more) and a leading team defends (scores less), the well-documented
+within-match dynamic. Convolving "goals already in" with the posterior over "goals still
+to come" gives live win/draw/win probabilities that move on every event.
 
 ### Ensemble (`oracle-model::ensemble`)
 A temperature-scaled **logarithmic opinion pool** blends up to three members,
@@ -160,7 +162,10 @@ explicit. `load_results_csv` ingests real football-data.co.uk results with closi
 ### Monte-Carlo tournament sim (`oracle-sim`)
 Plays the remaining group fixtures and the 32-team knockout out tens of thousands of
 times - sampling each scoreline from the goal model - to estimate every team's
-probability of advancing, reaching each round, and winning the cup. Iterations are
+probability of advancing, reaching each round, and winning the cup. A level knockout tie
+goes to **30 minutes of extra time** at a reduced rate and, if still level, a **penalty
+shootout** that is close to a coin flip (only slightly tilted by the expected-goal edge,
+clamped to [0.35, 0.65]), instead of being decided by relative strength. Iterations are
 independent, so it fans out over `rayon`; per-iteration RNG seeds make a given
 `(seed, iterations)` perfectly reproducible. Each probability carries a Monte-Carlo
 standard error `sqrt(p(1-p)/N)`, surfaced by `simulate`.

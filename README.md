@@ -48,11 +48,11 @@ fully offline with **zero keys and zero network**.
 | **Dixon-Coles / bivariate-Poisson** goal model, MLE-fit (convergence-checked) with time decay + ridge, **fit on xG when available**, **updated online from results** | full exact-score distribution that sharpens as the tournament unfolds; the score model and fit hyperparameters are **tuned by held-out log-loss** |
 | **Elo** with home edge + margin-of-victory scaling | a complementary strength signal |
 | **Log-opinion-pool ensemble** (`[Dixon-Coles, Elo, Market]` weights + temperature **learned by stacking**) | a single sharper forecast, anchored to the bookmaker when odds are present |
-| **Bayesian live updater** | conditions on score + minute + red cards for live odds |
+| **Bayesian live updater** with **score effects** | conditions on score, minute, and red cards; a trailing team chases and a leading team defends |
 | **Lineup adjustment** | a confirmed XI shifts each team's attack and defense |
 | **Suspension tracking** | yellow-card accumulation drops a suspended starter from the next match before its lineup is known |
 | **Venue & travel context** | host advantage, altitude, and rest-day differential adjust each match |
-| **Monte-Carlo** (rayon-parallel, **conditions in-progress matches** on their live score) | tournament-level champion odds that move with live results |
+| **Monte-Carlo** (rayon-parallel, **conditions in-progress matches** on their live score; knockouts go to **extra time + a near-50/50 shootout**) | tournament-level champion odds that move with live results |
 
 Calibration is measured with proper scoring rules (Brier, log-loss), benchmarked against
 the bookmaker's implied odds, and regression-tested. The maths are written up in
@@ -284,17 +284,17 @@ cargo bench -p oracle-sim       # Monte-Carlo throughput
   adapter ingests results (and **line-ups** on tiers that expose them); odds and xG are not
   offered by that provider, so they come from the CSV path or a dedicated source. Rest days
   are derived from the real fixture schedule.
-- In-progress **group** matches are conditioned on their live score, but the knockout
-  simulator still builds a fresh bracket each run (a standard seeded single-elimination
-  template, not FIFA's exact slotting); conditioning live *knockout* matches is future
-  work. All documented in the code.
+- Knockout ties go to extra time and a near-50/50 shootout, but the simulator still builds a
+  fresh bracket each run (a standard seeded single-elimination template, not FIFA's exact
+  slotting), and in-progress *knockout* matches are not yet conditioned on their live score
+  (in-progress *group* matches are). Both documented in the code.
 - The goal model now **learns in-tournament** from each finished match (a one-step online
   Poisson update); the deeper version, a full **dynamic / state-space (Kalman) rating** with
-  process noise, is still future work. Also open: full **posterior intervals** (we report
-  Monte-Carlo standard error, not parameter uncertainty) and richer **knockout realism**
-  (extra time, a less coin-flip shootout). Deliberately deferred: **squad market value**
-  (largely redundant with the strength ratings offline) and **stakes / dead-rubber
-  rotation** (speculative).
+  process noise, is still future work. Also open: full **posterior intervals** in the
+  Monte-Carlo (we propagate match variance and report its standard error, but not parameter
+  uncertainty in the team ratings). Deliberately deferred: **squad market value** (largely
+  redundant with the strength ratings offline) and **stakes / dead-rubber rotation**
+  (speculative).
 
 ## 📄 License
 
