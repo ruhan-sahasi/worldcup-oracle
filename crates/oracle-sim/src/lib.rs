@@ -34,7 +34,7 @@ use oracle_domain::{
 use oracle_model::{remaining_rates, LiveConfig, LiveState};
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
-use rand_distr::{Distribution, Poisson};
+use rand_distr::{Distribution, Normal, Poisson};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -74,12 +74,24 @@ pub struct LiveInputs {
 pub trait MatchSampler: Sync {
     /// Expected goals `(home_xg, away_xg)` for `home` vs `away` at a neutral site.
     fn xg(&self, home: TeamId, away: TeamId) -> (f64, f64);
+
+    /// Log-space standard deviation of a team's strength, i.e. how uncertain its rating is.
+    /// The simulator resamples each team's strength from this once per iteration, so the
+    /// forecast reflects parameter uncertainty rather than treating point estimates as
+    /// certain. Defaults to 0 (no uncertainty), which reproduces the deterministic forecast.
+    fn rating_stderr(&self, _team: TeamId) -> f64 {
+        0.0
+    }
 }
 
 impl MatchSampler for oracle_model::GoalModel {
     fn xg(&self, home: TeamId, away: TeamId) -> (f64, f64) {
         // World Cup matches are played at neutral venues.
         self.expected_goals(home, away, true)
+    }
+
+    fn rating_stderr(&self, team: TeamId) -> f64 {
+        self.strength_uncertainty(team)
     }
 }
 
@@ -99,6 +111,10 @@ pub struct SimConfig {
     /// How much an expected-goal edge tilts a penalty shootout away from 50/50 (small;
     /// shootouts are mostly luck). The shootout win probability is clamped to [0.35, 0.65].
     pub shootout_skill: f64,
+    /// Multiplier on each team's strength uncertainty (`MatchSampler::rating_stderr`) when
+    /// resampling team strength per iteration. 1.0 uses the fitted uncertainty; 0 disables
+    /// parameter uncertainty (a purely deterministic-strength forecast).
+    pub rating_uncertainty: f64,
 }
 
 impl Default for SimConfig {
@@ -110,6 +126,7 @@ impl Default for SimConfig {
             best_thirds: 8,
             extra_time_fraction: 0.30,
             shootout_skill: 0.10,
+            rating_uncertainty: 1.0,
         }
     }
 }
@@ -177,6 +194,10 @@ struct Prepared {
     n: usize,
     extra_time_fraction: f64,
     shootout_skill: f64,
+    /// Per-team log-space strength SD (indexed by team-index), resampled each iteration.
+    team_sigma: Vec<f64>,
+    /// Whether any team has non-zero strength uncertainty (skip the draw entirely if not).
+    has_uncertainty: bool,
     /// Knockout wins required to be credited with reaching each forecast stage:
     /// `[advanced, R16, QF, SF, Final, Champion]`. Derived from the bracket depth so
     /// the stages line up with the real 32-team format and degrade gracefully for
@@ -323,6 +344,14 @@ impl Prepared {
             total_rounds,
         ];
 
+        // Per-team strength uncertainty (scaled by the config multiplier), resampled per
+        // iteration so the forecast carries parameter uncertainty, not just match variance.
+        let team_sigma: Vec<f64> = teams
+            .iter()
+            .map(|&t| (config.rating_uncertainty * sampler.rating_stderr(t)).max(0.0))
+            .collect();
+        let has_uncertainty = team_sigma.iter().any(|&s| s > 0.0);
+
         Self {
             teams,
             eg,
@@ -333,6 +362,8 @@ impl Prepared {
             n,
             extra_time_fraction: config.extra_time_fraction,
             shootout_skill: config.shootout_skill,
+            team_sigma,
+            has_uncertainty,
             required,
         }
     }
@@ -350,14 +381,24 @@ impl Prepared {
 
     /// Sample the winner's team-index of a knockout tie: 90 minutes, then 30 of extra time
     /// at a reduced rate, then a penalty shootout that is close to a coin flip.
-    fn sample_knockout(&self, rng: &mut StdRng, a: usize, b: usize) -> usize {
+    fn sample_knockout(
+        &self,
+        rng: &mut StdRng,
+        a: usize,
+        b: usize,
+        att: &[f64],
+        def: &[f64],
+    ) -> usize {
         if a == BYE {
             return b;
         }
         if b == BYE {
             return a;
         }
-        let (la, ma) = self.eg[a * self.n + b];
+        // Apply this iteration's resampled team strengths to the base expected goals.
+        let (eg_a, eg_b) = self.eg[a * self.n + b];
+        let la = eg_a * (att[a] - def[b]).exp();
+        let ma = eg_b * (att[b] - def[a]).exp();
         let mut gh = Self::sample_goals(rng, la);
         let mut ga = Self::sample_goals(rng, ma);
         if gh == ga {
@@ -380,11 +421,39 @@ impl Prepared {
         }
     }
 
+    /// Draw this iteration's per-team log-space `(attack, defense)` strength shifts from each
+    /// team's uncertainty. Returns all-zero vectors when no uncertainty is configured.
+    fn draw_strength_shifts(&self, rng: &mut StdRng) -> (Vec<f64>, Vec<f64>) {
+        if !self.has_uncertainty {
+            return (vec![0.0; self.n], vec![0.0; self.n]);
+        }
+        let std_normal = Normal::new(0.0, 1.0).expect("valid normal");
+        let draw = |rng: &mut StdRng| -> Vec<f64> {
+            self.team_sigma
+                .iter()
+                .map(|&s| {
+                    if s > 0.0 {
+                        s * std_normal.sample(rng)
+                    } else {
+                        0.0
+                    }
+                })
+                .collect()
+        };
+        (draw(rng), draw(rng))
+    }
+
     /// Play one full tournament. Returns a per-team vector of knockout rounds won:
     /// `-1` = did not qualify, `0` = qualified but lost first knockout match,
     /// `total_rounds` = champion.
     fn simulate_once(&self, rng: &mut StdRng) -> Vec<i64> {
         let mut wins = vec![-1i64; self.n];
+
+        // Resample each team's strength for this simulated universe (log-space attack and
+        // defense shifts). Held fixed across all of the team's matches this iteration, so a
+        // team that turns out stronger than its point estimate is stronger everywhere. All
+        // zero when no uncertainty is configured, reproducing the deterministic forecast.
+        let (att, def) = self.draw_strength_shifts(rng);
 
         // ---- Group stage ----
         let mut winners = Vec::new();
@@ -403,9 +472,12 @@ impl Prepared {
             let mut standings: Vec<Standing> = table.iter().map(|(_, s)| *s).collect();
 
             for rm in &group.remaining {
+                // Apply this iteration's strength shifts to the (venue/lineup-adjusted) rates.
+                let rate_h = rm.rates.0 * (att[rm.home_ix] - def[rm.away_ix]).exp();
+                let rate_a = rm.rates.1 * (att[rm.away_ix] - def[rm.home_ix]).exp();
                 // Final goals = already scored (0 unless in progress) + sampled remainder.
-                let gh = i32::from(rm.current.home) + Self::sample_goals(rng, rm.rates.0);
-                let ga = i32::from(rm.current.away) + Self::sample_goals(rng, rm.rates.1);
+                let gh = i32::from(rm.current.home) + Self::sample_goals(rng, rate_h);
+                let ga = i32::from(rm.current.away) + Self::sample_goals(rng, rate_a);
                 apply_result_at(&mut standings, pos[&rm.home_ix], pos[&rm.away_ix], gh, ga);
             }
             for (i, (_, s)) in table.iter_mut().enumerate() {
@@ -450,7 +522,8 @@ impl Prepared {
         // ---- Knockout: round 1 by reflection, then fold adjacent winners ----
         let mut survivors: Vec<usize> = Vec::with_capacity(bracket / 2);
         for i in 0..bracket / 2 {
-            let w = self.sample_knockout(rng, seed_order[i], seed_order[bracket - 1 - i]);
+            let w =
+                self.sample_knockout(rng, seed_order[i], seed_order[bracket - 1 - i], &att, &def);
             if w != BYE {
                 wins[w] += 1;
             }
@@ -460,7 +533,7 @@ impl Prepared {
             let mut next = Vec::with_capacity(survivors.len().div_ceil(2));
             let mut k = 0;
             while k + 1 < survivors.len() {
-                let w = self.sample_knockout(rng, survivors[k], survivors[k + 1]);
+                let w = self.sample_knockout(rng, survivors[k], survivors[k + 1], &att, &def);
                 if w != BYE {
                     wins[w] += 1;
                 }
@@ -619,9 +692,10 @@ mod tests {
             LiveConfig::default(),
         );
         let mut rng = StdRng::seed_from_u64(99);
+        let z = vec![0.0; prep.n];
         let trials = 20_000;
         let a_wins = (0..trials)
-            .filter(|_| prep.sample_knockout(&mut rng, 0, 1) == 0)
+            .filter(|_| prep.sample_knockout(&mut rng, 0, 1, &z, &z) == 0)
             .count();
         let rate = a_wins as f64 / trials as f64;
         assert!(
@@ -643,9 +717,10 @@ mod tests {
             LiveConfig::default(),
         );
         let mut rng = StdRng::seed_from_u64(7);
+        let z = vec![0.0; prep.n];
         let trials = 20_000;
         let strong_wins = (0..trials)
-            .filter(|_| prep.sample_knockout(&mut rng, 3, 4) == 3)
+            .filter(|_| prep.sample_knockout(&mut rng, 3, 4, &z, &z) == 3)
             .count();
         let rate = strong_wins as f64 / trials as f64;
         assert!(
@@ -859,6 +934,42 @@ mod tests {
             "home advantage should raise team 7's title odds ({:.3} -> {:.3})",
             champ(&neutral, 7),
             champ(&hosted, 7),
+        );
+    }
+
+    /// A sampler with a strength gradient AND a fixed per-team rating uncertainty.
+    struct NoisyRankSampler;
+    impl MatchSampler for NoisyRankSampler {
+        fn xg(&self, home: TeamId, away: TeamId) -> (f64, f64) {
+            RankSampler.xg(home, away)
+        }
+        fn rating_stderr(&self, _team: TeamId) -> f64 {
+            0.30
+        }
+    }
+
+    #[test]
+    fn parameter_uncertainty_spreads_out_the_champion_odds() {
+        let t = tiny_tournament();
+        // Herfindahl concentration of the champion distribution: lower = less concentrated.
+        let herfindahl = |rating_uncertainty: f64| -> f64 {
+            let cfg = SimConfig {
+                iterations: 8000,
+                seed: 5,
+                rating_uncertainty,
+                ..Default::default()
+            };
+            simulate(&t, &NoisyRankSampler, cfg)
+                .teams
+                .iter()
+                .map(|tf| tf.p_champion * tf.p_champion)
+                .sum()
+        };
+        let concentrated = herfindahl(0.0); // point estimates treated as certain
+        let spread = herfindahl(1.0); // resample team strength each iteration
+        assert!(
+            spread < concentrated,
+            "parameter uncertainty should de-concentrate the title odds ({concentrated:.4} -> {spread:.4})"
         );
     }
 }
