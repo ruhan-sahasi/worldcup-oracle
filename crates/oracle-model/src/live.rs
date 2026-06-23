@@ -26,6 +26,11 @@ pub struct LiveConfig {
     pub red_card_self_penalty: f64,
     /// Multiplier applied to the opponent's scoring rate per red card a team receives.
     pub red_card_opponent_bonus: f64,
+    /// "Score effects": how much a *trailing* team raises its remaining scoring rate (it
+    /// chases). Scaled by `tanh(|margin|)`, so the boost saturates with the size of the lead.
+    pub chase_boost: f64,
+    /// How much a *leading* team lowers its remaining scoring rate (it defends the lead).
+    pub lead_drag: f64,
 }
 
 impl Default for LiveConfig {
@@ -34,6 +39,8 @@ impl Default for LiveConfig {
             max_remaining_goals: 8,
             red_card_self_penalty: 0.75,
             red_card_opponent_bonus: 1.15,
+            chase_boost: 0.20,
+            lead_drag: 0.15,
         }
     }
 }
@@ -85,9 +92,19 @@ pub fn remaining_rates(
             .red_card_opponent_bonus
             .powi(i32::from(state.home_red_cards));
 
+    // Score effects: a trailing team chases (scores more) and a leading team defends (scores
+    // less), saturating with the size of the lead. No effect when the game is level.
+    let margin = i32::from(state.current.home) - i32::from(state.current.away);
+    let g = (f64::from(margin.abs())).tanh();
+    let (home_state, away_state) = match margin.cmp(&0) {
+        std::cmp::Ordering::Greater => (1.0 - config.lead_drag * g, 1.0 + config.chase_boost * g),
+        std::cmp::Ordering::Less => (1.0 + config.chase_boost * g, 1.0 - config.lead_drag * g),
+        std::cmp::Ordering::Equal => (1.0, 1.0),
+    };
+
     (
-        base_lambda * fraction_left * home_mult,
-        base_mu * fraction_left * away_mult,
+        base_lambda * fraction_left * home_mult * home_state,
+        base_mu * fraction_left * away_mult * away_state,
     )
 }
 
@@ -169,6 +186,41 @@ mod tests {
         assert!(
             p_red.home_win < p_base.home_win,
             "a home red card should lower home's win probability"
+        );
+    }
+
+    #[test]
+    fn score_effects_lift_the_trailing_team_and_drag_the_leader() {
+        let cfg = LiveConfig::default();
+        // Home trails 0-1 at the hour mark. The chasing (home) side's remaining scoring rate
+        // should exceed, and the leading (away) side's fall below, the level-game rate.
+        let trailing = LiveState::new(Scoreline::new(0, 1), 60);
+        let level = LiveState::new(Scoreline::new(0, 0), 60);
+        let (rem_home_trailing, rem_away_leading) = remaining_rates(1.4, 1.4, &trailing, &cfg);
+        let (rem_home_level, rem_away_level) = remaining_rates(1.4, 1.4, &level, &cfg);
+        assert!(
+            rem_home_trailing > rem_home_level,
+            "trailing team should chase (higher remaining rate)"
+        );
+        assert!(
+            rem_away_leading < rem_away_level,
+            "leading team should defend (lower remaining rate)"
+        );
+    }
+
+    #[test]
+    fn score_effects_disabled_match_independent_poisson() {
+        // With both knobs at zero, the remaining rates ignore the scoreline.
+        let cfg = LiveConfig {
+            chase_boost: 0.0,
+            lead_drag: 0.0,
+            ..LiveConfig::default()
+        };
+        let leading = LiveState::new(Scoreline::new(2, 0), 70);
+        let level = LiveState::new(Scoreline::new(0, 0), 70);
+        assert_eq!(
+            remaining_rates(1.5, 1.2, &leading, &cfg),
+            remaining_rates(1.5, 1.2, &level, &cfg)
         );
     }
 }
