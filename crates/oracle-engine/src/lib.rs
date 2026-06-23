@@ -36,7 +36,7 @@ use oracle_ingest::DataProvider;
 use oracle_model::{
     implied_probabilities, live_score_grid, Ensemble, GoalModel, LiveConfig, LiveState,
 };
-use oracle_ratings::{EloConfig, RatingStore};
+use oracle_ratings::{EloConfig, RatingStore, StateSpaceRatings};
 use oracle_sim::{simulate_with_live, InProgress, LiveInputs, SimConfig, VenueAdj};
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -63,6 +63,9 @@ pub struct EngineDeps {
     /// Yellow cards that suspend a player for their team's next match. 0 disables suspension
     /// tracking. The World Cup group-stage rule is 2.
     pub suspension_threshold: u8,
+    /// State-space (Kalman) rating: a dynamic in-tournament rating that also supplies the
+    /// per-team uncertainty the Monte-Carlo resamples from.
+    pub state_space: StateSpaceRatings,
 }
 
 impl EngineDeps {
@@ -81,6 +84,7 @@ impl EngineDeps {
             },
             tournament_lr: 0.03,
             suspension_threshold: 2,
+            state_space: StateSpaceRatings::with_defaults(),
         }
     }
 
@@ -96,6 +100,11 @@ impl EngineDeps {
 
     pub fn with_suspension_threshold(mut self, threshold: u8) -> Self {
         self.suspension_threshold = threshold;
+        self
+    }
+
+    pub fn with_state_space(mut self, ratings: StateSpaceRatings) -> Self {
+        self.state_space = ratings;
         self
     }
 
@@ -369,6 +378,7 @@ struct EngineState {
     names: HashMap<TeamId, String>,
     match_index: HashMap<MatchId, usize>,
     ratings: RatingStore,
+    state_space: StateSpaceRatings,
     model: GoalModel,
     ensemble: Ensemble,
     live_config: LiveConfig,
@@ -415,6 +425,7 @@ impl EngineState {
             names,
             match_index,
             ratings,
+            state_space: deps.state_space,
             model: deps.model,
             ensemble: deps.ensemble,
             live_config: deps.live_config,
@@ -543,6 +554,9 @@ impl EngineState {
             self.ratings.record(home, away, score, true);
             self.model
                 .update_with_result(home, away, score, true, self.tournament_lr);
+            // The state-space rating learns too (age 0 = just now), updating both its mean
+            // and its per-team variance, which feeds the forecast's parameter uncertainty.
+            self.state_space.observe(home, away, score, 0.0, true);
             self.tournament.matches[pos].status = MatchStatus::Finished;
             self.tournament.matches[pos].score = score;
             return true;
@@ -656,7 +670,21 @@ impl EngineState {
             e.1 .0 += aa;
             e.1 .1 += ad;
         }
-        let inputs = LiveInputs { live, venue };
+        // Dynamic parameter uncertainty: map each team's state-space strength SD into the
+        // Monte-Carlo's log-rate units. This shrinks as a team plays more and grows with
+        // time, the principled replacement for the goal model's static fit-based uncertainty.
+        const STRENGTH_SD_TO_LOGRATE: f64 = 0.25;
+        let rating_sigma: HashMap<TeamId, f64> = self
+            .tournament
+            .teams
+            .iter()
+            .map(|t| (t.id, STRENGTH_SD_TO_LOGRATE * self.state_space.stddev(t.id)))
+            .collect();
+        let inputs = LiveInputs {
+            live,
+            venue,
+            rating_sigma,
+        };
         self.last_forecast = simulate_with_live(
             &self.tournament,
             &self.model,
@@ -701,15 +729,18 @@ impl EngineState {
             }
             MatchStatus::Finished => (one_hot(score.outcome()), None, None),
             MatchStatus::Scheduled | MatchStatus::Postponed => {
-                // Pre-match: blend the (lineup-adjusted) Dixon-Coles grid with Elo, plus the
-                // bookmaker market as a third member when odds are present. The ensemble has
-                // three weights; `blend` renormalizes, so two members is a clean fallback.
+                // Pre-match: blend the (lineup-adjusted) Dixon-Coles grid, Elo, and the
+                // state-space rating, plus the bookmaker market as a fourth member when odds
+                // are present. Member order matches `fit_baseline`: [DC, Elo, StateSpace,
+                // Market]; `blend` renormalizes its weights, so a missing market is a clean
+                // fallback to three members.
                 let grid = self
                     .model
                     .score_grid_adjusted(m.home, m.away, NEUTRAL, home_adj, away_adj);
                 let dc = grid.outcome_probabilities();
                 let elo = self.ratings.win_probabilities(m.home, m.away, NEUTRAL);
-                let mut members = vec![dc, elo];
+                let kalman = self.state_space.win_probabilities(m.home, m.away, NEUTRAL);
+                let mut members = vec![dc, elo, kalman];
                 if let Some(market) = lm.and_then(|l| l.market) {
                     members.push(market);
                 }
@@ -1144,5 +1175,45 @@ mod tests {
         );
         assert!((a.ratings.rating(m.home) - b.ratings.rating(m.home)).abs() < 1e-9);
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn state_space_rating_learns_from_results() {
+        let mut state = fresh_state();
+        let metrics = Metrics::default();
+        let team = state.tournament.matches[0].home;
+        let mean_before = state.state_space.mean(team);
+        let sd_before = state.state_space.stddev(team);
+
+        // Win two of the team's matches comfortably.
+        let ids: Vec<MatchId> = state
+            .tournament
+            .matches
+            .iter()
+            .filter(|m| m.home == team)
+            .take(2)
+            .map(|m| m.id)
+            .collect();
+        for id in ids {
+            state.apply_event(
+                &MatchEvent::new(
+                    id,
+                    90,
+                    EventKind::FullTime {
+                        score: Scoreline::new(3, 0),
+                    },
+                ),
+                &metrics,
+            );
+        }
+
+        assert!(
+            state.state_space.mean(team) > mean_before,
+            "wins should raise the Kalman mean"
+        );
+        assert!(
+            state.state_space.stddev(team) < sd_before,
+            "observing matches should reduce the Kalman uncertainty"
+        );
     }
 }

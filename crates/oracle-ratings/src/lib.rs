@@ -18,6 +18,9 @@
 //!    `E = P(home) + ½·P(draw)`.
 #![forbid(unsafe_code)]
 
+pub mod state_space;
+pub use state_space::{StateSpaceConfig, StateSpaceRatings};
+
 use oracle_domain::{Probabilities, Scoreline, TeamId};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;

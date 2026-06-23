@@ -67,6 +67,10 @@ pub type VenueAdj = ((f64, f64), (f64, f64));
 pub struct LiveInputs {
     pub live: HashMap<MatchId, InProgress>,
     pub venue: HashMap<MatchId, VenueAdj>,
+    /// Per-team strength uncertainty (log-rate SD) overriding `MatchSampler::rating_stderr`.
+    /// The engine fills this from the dynamic state-space rating; empty falls back to the
+    /// sampler's own (static, fit-based) uncertainty.
+    pub rating_sigma: HashMap<TeamId, f64>,
 }
 
 /// Supplies expected goals for a (neutral-venue) matchup. Implemented for the
@@ -346,9 +350,18 @@ impl Prepared {
 
         // Per-team strength uncertainty (scaled by the config multiplier), resampled per
         // iteration so the forecast carries parameter uncertainty, not just match variance.
+        // A per-team override (e.g. the engine's dynamic state-space SD) takes precedence over
+        // the sampler's own (static) uncertainty.
         let team_sigma: Vec<f64> = teams
             .iter()
-            .map(|&t| (config.rating_uncertainty * sampler.rating_stderr(t)).max(0.0))
+            .map(|&t| {
+                let base = inputs
+                    .rating_sigma
+                    .get(&t)
+                    .copied()
+                    .unwrap_or_else(|| sampler.rating_stderr(t));
+                (config.rating_uncertainty * base).max(0.0)
+            })
             .collect();
         let has_uncertainty = team_sigma.iter().any(|&s| s > 0.0);
 

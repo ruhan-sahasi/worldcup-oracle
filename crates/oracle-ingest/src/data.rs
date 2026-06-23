@@ -26,7 +26,7 @@ use oracle_model::{
     context_adjustment, implied_probabilities, DixonColesConfig, Ensemble, GoalModel, Host,
     MatchContext, Observation,
 };
-use oracle_ratings::RatingStore;
+use oracle_ratings::{RatingStore, StateSpaceRatings};
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 use rand_distr::{Distribution, Poisson};
@@ -694,10 +694,12 @@ pub fn venue_adjustments(tournament: &Tournament) -> HashMap<MatchId, VenueAdj> 
         .collect()
 }
 
-/// The offline-fitted baseline: a goal model, Elo seeds, and a **learned** ensemble.
+/// The offline-fitted baseline: a goal model, Elo seeds, a trained state-space rating, and a
+/// **learned** ensemble over all of them.
 pub struct Baseline {
     pub model: GoalModel,
     pub elo_seeds: Vec<(TeamId, f64)>,
+    pub state_space: StateSpaceRatings,
     pub ensemble: Ensemble,
 }
 
@@ -726,25 +728,30 @@ pub fn fit_baseline(seed: u64) -> Baseline {
     for &(team, rating) in &elo_seeds {
         ratings.seed(team, rating);
     }
+    // The state-space rating learns purely from the (chronological) training history.
+    let mut state_space = StateSpaceRatings::with_defaults();
     for r in train {
         ratings.record(r.obs.home, r.obs.away, r.obs.score, true);
+        state_space.observe(r.obs.home, r.obs.away, r.obs.score, r.obs.age_days, true);
     }
 
-    // Member predictions on the validation slice: [Dixon-Coles, Elo, Market].
+    // Member predictions on the validation slice: [Dixon-Coles, Elo, StateSpace, Market].
     let mut member_preds = Vec::with_capacity(validation.len());
     let mut actuals = Vec::with_capacity(validation.len());
     for r in validation {
         let dc = model.outcome_probabilities(r.obs.home, r.obs.away, true);
         let elo = ratings.win_probabilities(r.obs.home, r.obs.away, true);
+        let kalman = state_space.win_probabilities(r.obs.home, r.obs.away, true);
         let market = r.market.unwrap_or_else(Probabilities::uniform);
-        member_preds.push(vec![dc, elo, market]);
+        member_preds.push(vec![dc, elo, kalman, market]);
         actuals.push(r.obs.score.outcome());
     }
-    let ensemble = Ensemble::fit(&member_preds, &actuals, 3);
+    let ensemble = Ensemble::fit(&member_preds, &actuals, 4);
 
     Baseline {
         model,
         elo_seeds,
+        state_space,
         ensemble,
     }
 }

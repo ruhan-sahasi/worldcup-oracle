@@ -7,12 +7,13 @@ use oracle_ingest::{data, FootballDataProvider, ReplayProvider, SimProvider};
 use std::sync::Arc;
 use std::time::Duration;
 
-/// Apply the offline-fitted baseline (goal model, Elo seeds, **learned** ensemble) to
-/// a set of deps.
+/// Apply the offline-fitted baseline (goal model, Elo seeds, state-space rating, and the
+/// **learned** ensemble over all of them) to a set of deps.
 fn with_baseline(deps: EngineDeps) -> EngineDeps {
     let baseline = data::fit_baseline(7);
     deps.with_model(baseline.model)
         .with_elo_seeds(baseline.elo_seeds)
+        .with_state_space(baseline.state_space)
         .with_ensemble(baseline.ensemble)
 }
 
