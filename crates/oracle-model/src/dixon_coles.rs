@@ -148,6 +148,10 @@ pub struct GoalModel {
     max_goals: usize,
     attack: HashMap<TeamId, f64>,
     defense: HashMap<TeamId, f64>,
+    /// Total time-decay weight of the matches that informed each team, used to gauge how
+    /// confident the team's rating is (more data -> lower strength uncertainty).
+    #[serde(default)]
+    match_weight: HashMap<TeamId, f64>,
 }
 
 impl Default for GoalModel {
@@ -162,6 +166,7 @@ impl Default for GoalModel {
             max_goals: 10,
             attack: HashMap::new(),
             defense: HashMap::new(),
+            match_weight: HashMap::new(),
         }
     }
 }
@@ -192,6 +197,13 @@ impl GoalModel {
             .map(|o| (-config.xi * o.age_days).exp())
             .collect();
         let total_weight: f64 = weights.iter().sum();
+
+        // How much (time-decayed) data informed each team, for the strength-uncertainty.
+        let mut match_weight: HashMap<TeamId, f64> = teams.iter().map(|&t| (t, 0.0)).collect();
+        for (o, &w) in observations.iter().zip(&weights) {
+            *match_weight.get_mut(&o.home).unwrap() += w;
+            *match_weight.get_mut(&o.away).unwrap() += w;
+        }
 
         let mut attack: HashMap<TeamId, f64> = teams.iter().map(|&t| (t, 0.0)).collect();
         let mut defense: HashMap<TeamId, f64> = teams.iter().map(|&t| (t, 0.0)).collect();
@@ -333,7 +345,24 @@ impl GoalModel {
             max_goals: config.max_goals,
             attack,
             defense,
+            match_weight,
         }
+    }
+
+    /// Log-space standard deviation of a team's attack/defense rating, reflecting how much
+    /// data informed it: a team with little match history is more uncertain. Used by the
+    /// Monte-Carlo to resample team strength per iteration, so champion odds are not
+    /// over-concentrated (a point estimate treated as certain). Returns 0 for the default
+    /// (data-free) model.
+    pub fn strength_uncertainty(&self, team: TeamId) -> f64 {
+        // SE ~ sigma0 / sqrt(effective sample size), floored so a thin record stays bounded.
+        const SIGMA0: f64 = 1.0;
+        const CAP: f64 = 0.6;
+        let weight = self.match_weight.get(&team).copied().unwrap_or(0.0);
+        if weight <= 0.0 {
+            return 0.0;
+        }
+        (SIGMA0 / weight.max(1.0).sqrt()).min(CAP)
     }
 
     /// The fitted bivariate-Poisson covariance term (`0` for the independent model).
@@ -670,6 +699,23 @@ mod tests {
             "weakened home team is less favoured"
         );
         assert!((weak.sum() - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn strength_uncertainty_is_larger_for_data_poor_teams() {
+        // Teams 1-3 appear in many matches; team 9 appears in only two.
+        let mut obs = synthetic_history();
+        obs.push(Observation::new(t(9), t(2), Scoreline::new(1, 0), 1.0));
+        obs.push(Observation::new(t(2), t(9), Scoreline::new(0, 1), 1.0));
+        let model = GoalModel::fit(&obs, DixonColesConfig::default());
+        assert!(
+            model.strength_uncertainty(t(9)) > model.strength_uncertainty(t(1)),
+            "the data-poor team should be more uncertain ({} vs {})",
+            model.strength_uncertainty(t(9)),
+            model.strength_uncertainty(t(1)),
+        );
+        // The data-free default model claims no uncertainty.
+        assert_eq!(GoalModel::default().strength_uncertainty(t(1)), 0.0);
     }
 
     #[test]
