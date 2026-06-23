@@ -14,14 +14,17 @@
 //! - [`event`] - the live event stream ([`MatchEvent`])
 //! - [`probability`] - outcomes, win/draw/win probabilities, exact-score grids
 //! - [`tournament`] - groups, the tournament container, and forecast outputs
+//! - [`bracket`] - the fixed 2026 knockout bracket template
 #![forbid(unsafe_code)]
 
+pub mod bracket;
 pub mod event;
 pub mod fixture;
 pub mod probability;
 pub mod team;
 pub mod tournament;
 
+pub use bracket::{resolve_slot, BracketSlot, FIXED_R32};
 pub use event::{EventKind, MatchEvent};
 pub use fixture::{Match, MatchId, MatchStatus, Scoreline, Stage};
 pub use probability::{Outcome, Probabilities, ScoreGrid};

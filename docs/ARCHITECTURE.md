@@ -182,13 +182,22 @@ independent, so it fans out over `rayon`; per-iteration RNG seeds make a given
 `(seed, iterations)` perfectly reproducible. Each probability carries a Monte-Carlo
 standard error `sqrt(p(1-p)/N)`, surfaced by `simulate`.
 
-The knockout uses the **fixed 2026 bracket** (`FIXED_R32`) when the tournament has the real
-shape - 12 groups of four, top two plus the eight best thirds - placing each group winner,
-runner-up, and best third in its slot and playing a stable R32 -> R16 -> QF -> SF -> Final
-tree, so a strong group winner is correctly kept away from other winners until late. Other
-shapes (small test tournaments) fall back to generic reflection seeding. The best-third ->
-slot assignment is a fixed deterministic rule, not FIFA's full 495-row lookup table, and the
-team-to-group draw is synthetic.
+The knockout uses the **fixed 2026 bracket** (`oracle_domain::bracket::FIXED_R32`, shared with
+the ingest layer) when the tournament has the real shape - 12 groups of four, top two plus the
+eight best thirds - placing each group winner, runner-up, and best third in its slot and playing
+a stable R32 -> R16 -> QF -> SF -> Final tree, so a strong group winner is correctly kept away
+from other winners until late. Other shapes (small test tournaments) fall back to generic
+reflection seeding. The best-third -> slot assignment is a fixed deterministic rule, not FIFA's
+full 495-row lookup table, and the team-to-group draw is synthetic.
+
+Once the group stage is complete the **real bracket is materialized** (`data::materialize_knockout`
+fills the slots with the actual qualifiers; the engine appends the Round-of-32 fixtures when the
+last group result lands). From then on the simulator plays those fixtures rather than re-deriving
+a bracket each iteration: a **finished** knockout result stays fixed, an **in-progress** knockout
+match is conditioned on its live score exactly as a group match is, and a **scheduled** one is
+sampled. So a live upset in the Round of 16 immediately reshapes the champion odds. A finished
+knockout level on the scoreline (a penalty decision the event model does not record) is resolved
+to the home side - a small documented limitation.
 
 Crucially, each iteration also **resamples every team's strength** from its uncertainty, so the
 forecast carries **parameter uncertainty**, not just match variance. The engine supplies a

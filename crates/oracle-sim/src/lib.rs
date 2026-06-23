@@ -19,20 +19,25 @@
 //! The 2026 format is the default target: 12 groups of four, top two plus the eight
 //! best third-placed teams advance to a 32-team single-elimination knockout.
 //!
-//! In-progress **group** matches are conditioned on their live score/minute/red-cards
-//! (see [`simulate_with_live`] / [`InProgress`]) so the tournament forecast tracks live
-//! results. A level knockout tie goes to 30' of extra time at a reduced rate and then a
-//! near-50/50 penalty shootout (see [`SimConfig::extra_time_fraction`] /
-//! [`SimConfig::shootout_skill`]). When the tournament has the real 2026 shape (12 groups of
-//! four, top two plus eight best thirds) the knockout uses the **fixed 2026 bracket** template
-//! (see `FIXED_R32`); other shapes fall back to generic reflection seeding. Documented
-//! modelling choices: the best-third -> slot assignment is a fixed deterministic rule rather
-//! than FIFA's full 495-row lookup table, the team draw is synthetic, and in-progress
-//! *knockout* matches are still built fresh.
+//! In-progress matches - **group or knockout** - are conditioned on their live
+//! score/minute/red-cards (see [`simulate_with_live`] / [`InProgress`]) so the tournament
+//! forecast tracks live results. A level knockout tie goes to 30' of extra time at a reduced rate
+//! and then a near-50/50 penalty shootout (see [`SimConfig::extra_time_fraction`] /
+//! [`SimConfig::shootout_skill`]). When the tournament already contains knockout fixtures (the
+//! group stage is complete), the simulator plays that **real bracket** - finished ties stay
+//! fixed, in-progress ties are conditioned, scheduled ties are sampled - instead of re-deriving a
+//! bracket from a fresh group simulation. Until then, when the tournament has the real 2026 shape
+//! (12 groups of four, top two plus eight best thirds) the knockout uses the **fixed 2026
+//! bracket** template ([`oracle_domain::bracket::FIXED_R32`]); other shapes fall back to generic
+//! reflection seeding. Documented modelling choices: the best-third -> slot assignment is a fixed
+//! deterministic rule rather than FIFA's full 495-row lookup table, the team draw is synthetic,
+//! and a finished knockout tie level on the scoreline (decided on penalties, which the domain does
+//! not record) is resolved to the home side.
 #![forbid(unsafe_code)]
 
+use oracle_domain::bracket::{resolve_slot, FIXED_R32};
 use oracle_domain::{
-    MatchId, Scoreline, Stage, TeamForecast, TeamId, Tournament, TournamentForecast,
+    MatchId, MatchStatus, Scoreline, Stage, TeamForecast, TeamId, Tournament, TournamentForecast,
 };
 use oracle_model::{remaining_rates, LiveConfig, LiveState};
 use rand::rngs::StdRng;
@@ -208,6 +213,13 @@ struct Prepared {
     /// Whether the tournament has the 2026 shape (12 full groups, top-2 + 8 thirds), so the
     /// fixed bracket applies; otherwise the generic reflection seeding is used.
     fixed_bracket: bool,
+    /// Round-of-32 pairings (team-index pairs, in bracket order) when the tournament already
+    /// contains materialized knockout fixtures. Empty when the bracket is derived from a fresh
+    /// group simulation instead.
+    ko_r32: Vec<(usize, usize)>,
+    /// Per-pairing knockout outcomes (finished or live) for any materialized knockout fixture,
+    /// keyed by [`pair_key`]. Consulted by [`Self::play_ko_tie`] before sampling.
+    ko_outcomes: HashMap<(usize, usize), KoOutcome>,
     /// Knockout wins required to be credited with reaching each forecast stage:
     /// `[advanced, R16, QF, SF, Final, Champion]`. Derived from the bracket depth so
     /// the stages line up with the real 32-team format and degrade gracefully for
@@ -331,6 +343,81 @@ impl Prepared {
             })
             .collect::<Vec<GroupSim>>();
 
+        // Materialized knockout fixtures (present once the group stage is complete): record the
+        // Round-of-32 pairings in bracket order, and index every finished/in-progress knockout
+        // tie so the simulator plays the real bracket rather than re-deriving it from the groups.
+        let mut ko_r32: Vec<(usize, usize)> = Vec::new();
+        let mut ko_outcomes: HashMap<(usize, usize), KoOutcome> = HashMap::new();
+        for m in &tournament.matches {
+            if !m.stage.is_knockout() {
+                continue;
+            }
+            let (Some(&h), Some(&a)) = (index.get(&m.home), index.get(&m.away)) else {
+                continue;
+            };
+            if matches!(m.stage, Stage::RoundOf32) {
+                ko_r32.push((h, a));
+            }
+            if m.is_finished() {
+                // A knockout match cannot be drawn; the higher score won. A finished tie level on
+                // the scoreline was decided on penalties, which the domain does not record, so it
+                // is resolved deterministically to the home side (a documented limitation).
+                let winner = if m.score.away > m.score.home { a } else { h };
+                ko_outcomes.insert(pair_key(h, a), KoOutcome::Finished(winner));
+            } else if inputs.live.contains_key(&m.id)
+                || matches!(m.status, MatchStatus::Live { .. })
+            {
+                // In progress: condition on the live score exactly as in-progress group matches
+                // are. Prefer the explicit live-inputs entry; fall back to the match's own
+                // live status/score.
+                let ((vh_atk, vh_def), (va_atk, va_def)) =
+                    inputs.venue.get(&m.id).copied().unwrap_or_default();
+                let base_l = eg[h * n + a].0 * (vh_atk - va_def).exp();
+                let base_m = eg[h * n + a].1 * (va_atk - vh_def).exp();
+                let (rates, current) = match inputs.live.get(&m.id) {
+                    Some(ip) => {
+                        let adj_lambda = base_l * (ip.home_attack_adj - ip.away_defense_adj).exp();
+                        let adj_mu = base_m * (ip.away_attack_adj - ip.home_defense_adj).exp();
+                        let state = LiveState {
+                            current: ip.score,
+                            minute: ip.minute,
+                            home_red_cards: ip.home_reds,
+                            away_red_cards: ip.away_reds,
+                        };
+                        (
+                            remaining_rates(adj_lambda, adj_mu, &state, &live_config),
+                            ip.score,
+                        )
+                    }
+                    None => {
+                        let minute = match m.status {
+                            MatchStatus::Live { minute } => minute,
+                            _ => 0,
+                        };
+                        let state = LiveState {
+                            current: m.score,
+                            minute,
+                            home_red_cards: 0,
+                            away_red_cards: 0,
+                        };
+                        (
+                            remaining_rates(base_l, base_m, &state, &live_config),
+                            m.score,
+                        )
+                    }
+                };
+                ko_outcomes.insert(
+                    pair_key(h, a),
+                    KoOutcome::Live {
+                        home_ix: h,
+                        away_ix: a,
+                        rates,
+                        current,
+                    },
+                );
+            }
+        }
+
         // How many teams qualify (fixed across iterations) → bracket size → depth.
         let groups_with_third = groups
             .iter()
@@ -341,7 +428,13 @@ impl Prepared {
             .map(|g| g.members.len().min(config.advance_per_group))
             .sum::<usize>()
             + config.best_thirds.min(groups_with_third);
-        let bracket = next_pow2(qualifier_count.max(2));
+        // With a materialized bracket the field size is fixed by the Round-of-32 fixtures;
+        // otherwise it follows the group qualifiers.
+        let bracket = if ko_r32.is_empty() {
+            next_pow2(qualifier_count.max(2))
+        } else {
+            next_pow2((ko_r32.len() * 2).max(2))
+        };
         let total_rounds = bracket.trailing_zeros() as i64;
         // Stage k is reached by winning `total_rounds - (5 - k)` knockout matches,
         // i.e. counting back from the final. Clamped at 0; champion needs them all.
@@ -391,6 +484,8 @@ impl Prepared {
             team_sigma,
             has_uncertainty,
             fixed_bracket,
+            ko_r32,
+            ko_outcomes,
             required,
         }
     }
@@ -448,6 +543,67 @@ impl Prepared {
         }
     }
 
+    /// Play a knockout tie, respecting a materialized fixture for this exact pairing: a finished
+    /// fixture returns its winner, an in-progress fixture is conditioned on the live score, and a
+    /// pairing with no fixture (a scheduled or not-yet-materialized tie) is sampled fresh.
+    fn play_ko_tie(&self, rng: &mut StdRng, a: usize, b: usize, att: &[f64], def: &[f64]) -> usize {
+        if a == BYE {
+            return b;
+        }
+        if b == BYE {
+            return a;
+        }
+        match self.ko_outcomes.get(&pair_key(a, b)) {
+            Some(KoOutcome::Finished(w)) => *w,
+            Some(KoOutcome::Live {
+                home_ix,
+                away_ix,
+                rates,
+                current,
+            }) => self.sample_live_ko(rng, (*home_ix, *away_ix), *rates, *current, (att, def)),
+            None => self.sample_knockout(rng, a, b, att, def),
+        }
+    }
+
+    /// Sample the winner of an in-progress knockout tie: add the sampled remainder (at the
+    /// live-conditioned rates) to the score already on the board, then extra time and a shootout
+    /// if still level, mirroring [`Self::sample_knockout`]. `shifts` is this iteration's
+    /// `(attack, defense)` strength draw.
+    fn sample_live_ko(
+        &self,
+        rng: &mut StdRng,
+        (home_ix, away_ix): (usize, usize),
+        rem_rates: (f64, f64),
+        current: Scoreline,
+        (att, def): (&[f64], &[f64]),
+    ) -> usize {
+        let rate_h = rem_rates.0 * (att[home_ix] - def[away_ix]).exp();
+        let rate_a = rem_rates.1 * (att[away_ix] - def[home_ix]).exp();
+        let mut gh = i32::from(current.home) + Self::sample_goals(rng, rate_h);
+        let mut ga = i32::from(current.away) + Self::sample_goals(rng, rate_a);
+        // Extra time and the shootout use full-match strengths (the remaining-rate conditioning
+        // only governs the rest of regulation).
+        let (eg_h, eg_a) = self.eg[home_ix * self.n + away_ix];
+        let la = eg_h * (att[home_ix] - def[away_ix]).exp();
+        let ma = eg_a * (att[away_ix] - def[home_ix]).exp();
+        if gh == ga {
+            gh += Self::sample_goals(rng, la * self.extra_time_fraction);
+            ga += Self::sample_goals(rng, ma * self.extra_time_fraction);
+        }
+        match gh.cmp(&ga) {
+            std::cmp::Ordering::Greater => home_ix,
+            std::cmp::Ordering::Less => away_ix,
+            std::cmp::Ordering::Equal => {
+                let p = (0.5 + self.shootout_skill * (la - ma)).clamp(0.35, 0.65);
+                if rng.gen::<f64>() < p {
+                    home_ix
+                } else {
+                    away_ix
+                }
+            }
+        }
+    }
+
     /// Draw this iteration's per-team log-space `(attack, defense)` strength shifts from each
     /// team's uncertainty. Returns all-zero vectors when no uncertainty is configured.
     fn draw_strength_shifts(&self, rng: &mut StdRng) -> (Vec<f64>, Vec<f64>) {
@@ -482,106 +638,125 @@ impl Prepared {
         // zero when no uncertainty is configured, reproducing the deterministic forecast.
         let (att, def) = self.draw_strength_shifts(rng);
 
-        // ---- Group stage ----
-        let mut winners = Vec::new();
-        let mut runners = Vec::new();
-        let mut thirds: Vec<(usize, Standing)> = Vec::new();
-
-        for group in &self.groups {
-            let mut table: Vec<(usize, Standing)> =
-                group.members.iter().map(|&m| (m, self.base[m])).collect();
-            // Index within `table` by team-ix for quick mutation.
-            let pos: HashMap<usize, usize> = table
+        // `survivors` holds the 16 first-round winners in bracket order; the fold below plays
+        // out R16 -> Final by repeatedly pairing adjacent survivors.
+        let mut survivors: Vec<usize> = if !self.ko_r32.is_empty() {
+            // ---- Real knockout bracket present (group stage already complete) ----
+            // Play the materialized Round of 32 directly: a finished tie keeps its result, an
+            // in-progress tie is conditioned on its live score, a scheduled tie is sampled. The
+            // group stage is not re-simulated, so finished knockout results stay fixed.
+            self.ko_r32
                 .iter()
-                .enumerate()
-                .map(|(i, (ix, _))| (*ix, i))
-                .collect();
-            let mut standings: Vec<Standing> = table.iter().map(|(_, s)| *s).collect();
-
-            for rm in &group.remaining {
-                // Apply this iteration's strength shifts to the (venue/lineup-adjusted) rates.
-                let rate_h = rm.rates.0 * (att[rm.home_ix] - def[rm.away_ix]).exp();
-                let rate_a = rm.rates.1 * (att[rm.away_ix] - def[rm.home_ix]).exp();
-                // Final goals = already scored (0 unless in progress) + sampled remainder.
-                let gh = i32::from(rm.current.home) + Self::sample_goals(rng, rate_h);
-                let ga = i32::from(rm.current.away) + Self::sample_goals(rng, rate_a);
-                apply_result_at(&mut standings, pos[&rm.home_ix], pos[&rm.away_ix], gh, ga);
-            }
-            for (i, (_, s)) in table.iter_mut().enumerate() {
-                *s = standings[i];
-            }
-            rank(&mut table);
-
-            for (rank_ix, (team_ix, standing)) in table.into_iter().enumerate() {
-                if rank_ix < self.advance_per_group {
-                    if rank_ix == 0 {
-                        winners.push(team_ix);
-                    } else {
-                        runners.push(team_ix);
-                    }
-                } else if rank_ix == self.advance_per_group {
-                    thirds.push((team_ix, standing));
-                }
-            }
-        }
-
-        // Best third-placed teams.
-        thirds.sort_by(|a, b| cmp_standing(&b.1, &a.1));
-        let qualified_thirds: Vec<usize> = thirds
-            .into_iter()
-            .take(self.best_thirds)
-            .map(|(ix, _)| ix)
-            .collect();
-
-        // ---- Round of 32: the fixed 2026 bracket when the shape matches, else reflection ----
-        // `survivors` holds the 16 R32 winners in bracket order; the fold below plays out
-        // R16 -> Final by repeatedly pairing adjacent survivors.
-        let mut survivors: Vec<usize> = if self.fixed_bracket {
-            FIXED_R32
-                .iter()
-                .map(|(top, bottom)| {
-                    let a = resolve_slot(top, &winners, &runners, &qualified_thirds);
-                    let b = resolve_slot(bottom, &winners, &runners, &qualified_thirds);
+                .map(|&(a, b)| {
                     wins[a] = 0;
                     wins[b] = 0;
-                    let w = self.sample_knockout(rng, a, b, &att, &def);
+                    let w = self.play_ko_tie(rng, a, b, &att, &def);
                     wins[w] += 1;
                     w
                 })
                 .collect()
         } else {
-            // Fallback for non-2026 shapes (e.g. test tournaments): winners, then best
-            // thirds, then runners-up, paired by reflection to keep strong winners apart.
-            let mut seed_order: Vec<usize> = Vec::new();
-            seed_order.extend(&winners);
-            seed_order.extend(&qualified_thirds);
-            seed_order.extend(&runners);
-            for &ix in &seed_order {
-                wins[ix] = 0;
-            }
-            let bracket = next_pow2(seed_order.len().max(2));
-            seed_order.resize(bracket, BYE);
-            (0..bracket / 2)
-                .map(|i| {
-                    let w = self.sample_knockout(
-                        rng,
-                        seed_order[i],
-                        seed_order[bracket - 1 - i],
-                        &att,
-                        &def,
-                    );
-                    if w != BYE {
-                        wins[w] += 1;
+            // ---- Group stage ----
+            let mut winners = Vec::new();
+            let mut runners = Vec::new();
+            let mut thirds: Vec<(usize, Standing)> = Vec::new();
+
+            for group in &self.groups {
+                let mut table: Vec<(usize, Standing)> =
+                    group.members.iter().map(|&m| (m, self.base[m])).collect();
+                // Index within `table` by team-ix for quick mutation.
+                let pos: HashMap<usize, usize> = table
+                    .iter()
+                    .enumerate()
+                    .map(|(i, (ix, _))| (*ix, i))
+                    .collect();
+                let mut standings: Vec<Standing> = table.iter().map(|(_, s)| *s).collect();
+
+                for rm in &group.remaining {
+                    // Apply this iteration's strength shifts to the (venue/lineup-adjusted) rates.
+                    let rate_h = rm.rates.0 * (att[rm.home_ix] - def[rm.away_ix]).exp();
+                    let rate_a = rm.rates.1 * (att[rm.away_ix] - def[rm.home_ix]).exp();
+                    // Final goals = already scored (0 unless in progress) + sampled remainder.
+                    let gh = i32::from(rm.current.home) + Self::sample_goals(rng, rate_h);
+                    let ga = i32::from(rm.current.away) + Self::sample_goals(rng, rate_a);
+                    apply_result_at(&mut standings, pos[&rm.home_ix], pos[&rm.away_ix], gh, ga);
+                }
+                for (i, (_, s)) in table.iter_mut().enumerate() {
+                    *s = standings[i];
+                }
+                rank(&mut table);
+
+                for (rank_ix, (team_ix, standing)) in table.into_iter().enumerate() {
+                    if rank_ix < self.advance_per_group {
+                        if rank_ix == 0 {
+                            winners.push(team_ix);
+                        } else {
+                            runners.push(team_ix);
+                        }
+                    } else if rank_ix == self.advance_per_group {
+                        thirds.push((team_ix, standing));
                     }
-                    w
-                })
-                .collect()
+                }
+            }
+
+            // Best third-placed teams.
+            thirds.sort_by(|a, b| cmp_standing(&b.1, &a.1));
+            let qualified_thirds: Vec<usize> = thirds
+                .into_iter()
+                .take(self.best_thirds)
+                .map(|(ix, _)| ix)
+                .collect();
+
+            // ---- Round of 32: the fixed 2026 bracket when the shape matches, else reflection --
+            if self.fixed_bracket {
+                FIXED_R32
+                    .iter()
+                    .map(|(top, bottom)| {
+                        let a = resolve_slot(top, &winners, &runners, &qualified_thirds);
+                        let b = resolve_slot(bottom, &winners, &runners, &qualified_thirds);
+                        wins[a] = 0;
+                        wins[b] = 0;
+                        let w = self.sample_knockout(rng, a, b, &att, &def);
+                        wins[w] += 1;
+                        w
+                    })
+                    .collect()
+            } else {
+                // Fallback for non-2026 shapes (e.g. test tournaments): winners, then best
+                // thirds, then runners-up, paired by reflection to keep strong winners apart.
+                let mut seed_order: Vec<usize> = Vec::new();
+                seed_order.extend(&winners);
+                seed_order.extend(&qualified_thirds);
+                seed_order.extend(&runners);
+                for &ix in &seed_order {
+                    wins[ix] = 0;
+                }
+                let bracket = next_pow2(seed_order.len().max(2));
+                seed_order.resize(bracket, BYE);
+                (0..bracket / 2)
+                    .map(|i| {
+                        let w = self.sample_knockout(
+                            rng,
+                            seed_order[i],
+                            seed_order[bracket - 1 - i],
+                            &att,
+                            &def,
+                        );
+                        if w != BYE {
+                            wins[w] += 1;
+                        }
+                        w
+                    })
+                    .collect()
+            }
         };
+        // ---- Fold R16 -> Final ----. `play_ko_tie` respects any materialized later-round
+        // fixtures (finished/in-progress) and samples the rest.
         while survivors.len() > 1 {
             let mut next = Vec::with_capacity(survivors.len().div_ceil(2));
             let mut k = 0;
             while k + 1 < survivors.len() {
-                let w = self.sample_knockout(rng, survivors[k], survivors[k + 1], &att, &def);
+                let w = self.play_ko_tie(rng, survivors[k], survivors[k + 1], &att, &def);
                 if w != BYE {
                     wins[w] += 1;
                 }
@@ -598,53 +773,24 @@ impl Prepared {
 /// Sentinel team-index representing a bracket bye.
 const BYE: usize = usize::MAX;
 
-/// A Round-of-32 slot, referencing a finishing position by group index (0 = A .. 11 = L) or
-/// a best-third by rank (0 = best).
-#[derive(Debug, Clone, Copy)]
-enum BracketSlot {
-    Winner(usize),
-    RunnerUp(usize),
-    Third(usize),
+/// A materialized knockout fixture's bearing on the simulation, keyed by its (sorted) team-index
+/// pair. A `Finished` tie is settled; a `Live` tie supplies the live-conditioned remaining rates
+/// and the score already on the board so the simulator samples only the rest.
+enum KoOutcome {
+    /// Team-index that already won this tie.
+    Finished(usize),
+    Live {
+        home_ix: usize,
+        away_ix: usize,
+        /// Remaining-regulation goal rates (venue- and live-conditioned).
+        rates: (f64, f64),
+        current: Scoreline,
+    },
 }
 
-/// The fixed 2026 Round-of-32 pairings: 16 matches, each `(top, bottom)`, using all 12 group
-/// winners, 12 runners-up, and 8 best thirds exactly once and forming a stable bracket tree
-/// (R16 pairs adjacent matches). No group winner meets its own runner-up. The best-third ->
-/// slot assignment is a fixed deterministic rule, not FIFA's full 495-row lookup table.
-const FIXED_R32: [(BracketSlot, BracketSlot); 16] = {
-    use BracketSlot::{RunnerUp as R, Third as T, Winner as W};
-    [
-        (W(0), R(1)),
-        (W(2), T(4)),
-        (W(4), R(5)),
-        (W(6), T(5)),
-        (W(8), R(9)),
-        (W(10), T(6)),
-        (W(1), R(0)),
-        (W(3), T(7)),
-        (W(5), R(4)),
-        (W(7), R(3)),
-        (W(9), R(8)),
-        (W(11), R(7)),
-        (T(0), R(2)),
-        (T(1), R(6)),
-        (T(2), R(10)),
-        (T(3), R(11)),
-    ]
-};
-
-/// Resolve a bracket slot to a team-index from this iteration's group results.
-fn resolve_slot(
-    slot: &BracketSlot,
-    winners: &[usize],
-    runners: &[usize],
-    thirds: &[usize],
-) -> usize {
-    match *slot {
-        BracketSlot::Winner(g) => winners[g],
-        BracketSlot::RunnerUp(g) => runners[g],
-        BracketSlot::Third(r) => thirds[r],
-    }
+/// Order-independent key for a knockout pairing.
+fn pair_key(a: usize, b: usize) -> (usize, usize) {
+    (a.min(b), a.max(b))
 }
 
 fn next_pow2(x: usize) -> usize {
@@ -903,31 +1049,6 @@ mod tests {
     }
 
     #[test]
-    fn fixed_r32_uses_every_qualifier_slot_once() {
-        let mut winners = std::collections::HashSet::new();
-        let mut runners = std::collections::HashSet::new();
-        let mut thirds = std::collections::HashSet::new();
-        for (a, b) in FIXED_R32 {
-            for slot in [a, b] {
-                match slot {
-                    BracketSlot::Winner(g) => assert!(winners.insert(g), "winner {g} twice"),
-                    BracketSlot::RunnerUp(g) => assert!(runners.insert(g), "runner {g} twice"),
-                    BracketSlot::Third(r) => assert!(thirds.insert(r), "third {r} twice"),
-                }
-            }
-        }
-        assert_eq!(winners.len(), 12);
-        assert_eq!(runners.len(), 12);
-        assert_eq!(thirds.len(), 8);
-        // No group winner meets its own runner-up in the R32.
-        for (a, b) in FIXED_R32 {
-            if let (BracketSlot::Winner(g1), BracketSlot::RunnerUp(g2)) = (a, b) {
-                assert_ne!(g1, g2);
-            }
-        }
-    }
-
-    #[test]
     fn fixed_bracket_forecast_is_coherent() {
         let t = full_tournament();
         let f = simulate(
@@ -952,6 +1073,108 @@ mod tests {
         assert!(
             champ(0) > champ(47),
             "stronger team should win more under the fixed bracket"
+        );
+    }
+
+    /// 32 teams with 16 materialized Round-of-32 fixtures (pairing 2i vs 2i+1), no group stage,
+    /// so the simulator plays the real bracket instead of deriving one.
+    fn bracket_tournament() -> Tournament {
+        let mut t = Tournament::new("KO Cup");
+        for i in 0..32u32 {
+            t.teams.push(Team::new(
+                i,
+                format!("T{i}"),
+                format!("{i:03}"),
+                Confederation::Uefa,
+            ));
+        }
+        for i in 0..16u32 {
+            t.matches.push(Match {
+                id: MatchId(1 + i),
+                home: TeamId(2 * i),
+                away: TeamId(2 * i + 1),
+                stage: Stage::RoundOf32,
+                kickoff: epoch(),
+                status: MatchStatus::Scheduled,
+                score: Scoreline::new(0, 0),
+            });
+        }
+        t
+    }
+
+    fn reach_r16(f: &TournamentForecast, team: u32) -> f64 {
+        f.teams
+            .iter()
+            .find(|tf| tf.team == TeamId(team))
+            .unwrap()
+            .p_round_of_16
+    }
+
+    #[test]
+    fn live_knockout_match_conditions_the_forecast() {
+        let t = bracket_tournament();
+        let cfg = SimConfig {
+            iterations: 8000,
+            ..Default::default()
+        };
+
+        // Fresh: the away side of R32 match 0 (team 1) is the underdog against team 0.
+        let fresh = simulate(&t, &RankSampler, cfg);
+        let fresh_p = reach_r16(&fresh, 1);
+
+        // In progress: team 1 leads 2-0 at minute 85, so its chance of advancing should jump.
+        let mut live = HashMap::new();
+        live.insert(
+            MatchId(1),
+            InProgress {
+                score: Scoreline::new(0, 2),
+                minute: 85,
+                ..Default::default()
+            },
+        );
+        let inputs = LiveInputs {
+            live,
+            ..Default::default()
+        };
+        let conditioned = simulate_with_live(&t, &RankSampler, cfg, &inputs, LiveConfig::default());
+        let cond_p = reach_r16(&conditioned, 1);
+
+        assert!(
+            cond_p > fresh_p + 0.2,
+            "a live lead should lift the advance probability: {fresh_p:.3} -> {cond_p:.3}"
+        );
+        assert!(
+            cond_p > 0.7,
+            "a two-goal lead at 85' should usually hold: {cond_p:.3}"
+        );
+    }
+
+    #[test]
+    fn finished_knockout_result_is_respected() {
+        let mut t = bracket_tournament();
+        // R32 match 1 (id 2): team 2 vs team 3, finished 0-1 (the weaker side, team 3, won).
+        let m = t.matches.iter_mut().find(|m| m.id == MatchId(2)).unwrap();
+        m.status = MatchStatus::Finished;
+        m.score = Scoreline::new(0, 1);
+
+        let f = simulate(
+            &t,
+            &RankSampler,
+            SimConfig {
+                iterations: 4000,
+                ..Default::default()
+            },
+        );
+        // The actual winner reaches the Round of 16 with certainty; the loser never does.
+        assert!(
+            reach_r16(&f, 3) > 0.999,
+            "the actual winner always advances: {:.3}",
+            reach_r16(&f, 3)
+        );
+        assert!(
+            reach_r16(&f, 2) < 0.001,
+            "the actual loser never advances: {:.3}",
+            reach_r16(&f, 2)
         );
     }
 

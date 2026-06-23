@@ -559,6 +559,10 @@ impl EngineState {
             self.state_space.observe(home, away, score, 0.0, true);
             self.tournament.matches[pos].status = MatchStatus::Finished;
             self.tournament.matches[pos].score = score;
+            // If that was the last group result, the knockout participants are now known:
+            // materialize the real bracket so the forecast plays it (and live knockout matches
+            // are conditioned) instead of re-deriving it from a fresh group simulation.
+            self.materialize_knockout_if_ready();
             return true;
         }
 
@@ -581,6 +585,29 @@ impl EngineState {
             }
         }
         false
+    }
+
+    /// When the final group result lands the 32 knockout qualifiers are known: materialize the
+    /// Round-of-32 fixtures (the real 2026 bracket), append them, and re-index so they enter the
+    /// forecast and can be conditioned live as they play. A no-op when the bracket already exists,
+    /// the group stage is unfinished, or the tournament is not the 2026 shape (see
+    /// [`oracle_ingest::data::materialize_knockout`]).
+    fn materialize_knockout_if_ready(&mut self) {
+        let ko = oracle_ingest::data::materialize_knockout(&self.tournament);
+        if ko.is_empty() {
+            return;
+        }
+        tracing::info!(
+            fixtures = ko.len(),
+            "group stage complete - materialized the knockout bracket"
+        );
+        let start = self.tournament.matches.len();
+        self.tournament.matches.extend(ko);
+        for i in start..self.tournament.matches.len() {
+            self.match_index.insert(self.tournament.matches[i].id, i);
+        }
+        // Venue/travel context now covers the knockout fixtures too.
+        self.venue_adj = oracle_ingest::data::venue_adjustments(&self.tournament);
     }
 
     /// The team's next unplayed match by kickoff (where a suspension would be served).
@@ -927,6 +954,68 @@ mod tests {
             learned > frozen,
             "two 5-0 wins should raise the team's title odds via learning ({frozen:.4} -> {learned:.4})"
         );
+    }
+
+    #[test]
+    fn group_completion_materializes_the_knockout_bracket() {
+        let mut state = fresh_state();
+        let metrics = Metrics::default();
+
+        // Before: only the 72 group fixtures, no knockout matches.
+        assert_eq!(state.tournament.matches.len(), 72);
+        assert!(!state
+            .tournament
+            .matches
+            .iter()
+            .any(|m| m.stage.is_knockout()));
+
+        // Finish every group match (the stronger seed, the lower id, wins).
+        let group: Vec<(MatchId, TeamId, TeamId)> = state
+            .tournament
+            .matches
+            .iter()
+            .map(|m| (m.id, m.home, m.away))
+            .collect();
+        for (id, home, away) in group {
+            let score = if home.0 < away.0 {
+                Scoreline::new(2, 0)
+            } else {
+                Scoreline::new(0, 2)
+            };
+            state.apply_event(
+                &MatchEvent::new(id, 90, EventKind::FullTime { score }),
+                &metrics,
+            );
+        }
+
+        // After the last group result the engine materialized the real Round of 32.
+        let r32 = state
+            .tournament
+            .matches
+            .iter()
+            .filter(|m| m.stage == oracle_domain::Stage::RoundOf32)
+            .count();
+        assert_eq!(r32, 16, "16 R32 fixtures materialized");
+        assert_eq!(state.tournament.matches.len(), 88);
+
+        // The new fixtures are indexed, so live events addressed to them resolve.
+        for m in state
+            .tournament
+            .matches
+            .iter()
+            .filter(|m| m.stage.is_knockout())
+        {
+            assert!(
+                state.match_index.contains_key(&m.id),
+                "knockout fixture {} should be indexed",
+                m.id
+            );
+        }
+
+        // The forecast now plays the real bracket; champion mass stays coherent.
+        state.recompute_forecast();
+        let total: f64 = state.last_forecast.teams.iter().map(|t| t.p_champion).sum();
+        assert!((total - 1.0).abs() < 0.05, "champion mass = {total}");
     }
 
     fn state_with_threshold(threshold: u8) -> EngineState {

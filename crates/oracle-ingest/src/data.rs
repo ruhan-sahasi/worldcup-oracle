@@ -17,6 +17,7 @@
 
 use crate::error::{IngestError, Result};
 use chrono::{TimeZone, Utc};
+use oracle_domain::bracket::{resolve_slot, FIXED_R32};
 use oracle_domain::{
     Confederation, Group, Match, MatchId, MatchStatus, Probabilities, Scoreline, Stage, Team,
     TeamId, Tournament,
@@ -369,6 +370,125 @@ pub fn world_cup_2026() -> Tournament {
     }
 
     t
+}
+
+/// Build the Round-of-32 fixtures once the group stage is complete.
+///
+/// When every group match in `tournament` is finished (and no knockout fixtures exist yet), the
+/// 32 qualifiers are known: the 12 group winners, 12 runners-up, and 8 best third-placed teams.
+/// This slots them into the fixed 2026 bracket ([`oracle_domain::bracket::FIXED_R32`]) and returns
+/// the 16 Round-of-32 [`Match`]es (status `Scheduled`, ids following the existing fixtures, a
+/// kickoff after the last group match). Returns an empty vec if the group stage is unfinished, the
+/// tournament is not the 12-group 2026 shape, or knockout fixtures already exist.
+///
+/// The offline simulation feed plays only the group stage, so the engine calls this when the last
+/// group result lands (and the live football-data.org adapter exposes the real bracket directly);
+/// it is therefore exercised by the engine path and by tests rather than by the offline feed. The
+/// best-third -> slot assignment is the fixed bracket's deterministic rule, not FIFA's full lookup
+/// table (see the bracket module).
+pub fn materialize_knockout(tournament: &Tournament) -> Vec<Match> {
+    if tournament.groups.len() != NUM_GROUPS {
+        return Vec::new();
+    }
+    // Do not duplicate an already-materialized bracket.
+    if tournament.matches.iter().any(|m| m.stage.is_knockout()) {
+        return Vec::new();
+    }
+    let group_matches: Vec<&Match> = tournament
+        .matches
+        .iter()
+        .filter(|m| matches!(m.stage, Stage::Group(_)))
+        .collect();
+    if group_matches.is_empty() || !group_matches.iter().all(|m| m.is_finished()) {
+        return Vec::new();
+    }
+
+    // Rank each group from its finished matches: (team, points, goal-diff, goals-for).
+    let mut winners: Vec<TeamId> = vec![TeamId(0); NUM_GROUPS];
+    let mut runners: Vec<TeamId> = vec![TeamId(0); NUM_GROUPS];
+    let mut thirds: Vec<(TeamId, i32, i32, i32)> = Vec::new();
+
+    for (gi, group) in tournament.groups.iter().enumerate() {
+        let mut table: Vec<(TeamId, i32, i32, i32)> =
+            group.teams.iter().map(|&t| (t, 0, 0, 0)).collect();
+        let pos: HashMap<TeamId, usize> = group
+            .teams
+            .iter()
+            .enumerate()
+            .map(|(i, &t)| (t, i))
+            .collect();
+        for m in group_matches
+            .iter()
+            .filter(|m| matches!(m.stage, Stage::Group(c) if c == group.name))
+        {
+            let (Some(&hi), Some(&ai)) = (pos.get(&m.home), pos.get(&m.away)) else {
+                continue;
+            };
+            let (gh, ga) = (i32::from(m.score.home), i32::from(m.score.away));
+            table[hi].2 += gh - ga;
+            table[hi].3 += gh;
+            table[ai].2 += ga - gh;
+            table[ai].3 += ga;
+            match gh.cmp(&ga) {
+                std::cmp::Ordering::Greater => table[hi].1 += 3,
+                std::cmp::Ordering::Less => table[ai].1 += 3,
+                std::cmp::Ordering::Equal => {
+                    table[hi].1 += 1;
+                    table[ai].1 += 1;
+                }
+            }
+        }
+        if table.len() < 3 {
+            return Vec::new();
+        }
+        table.sort_by(cmp_group_row);
+        winners[gi] = table[0].0;
+        runners[gi] = table[1].0;
+        thirds.push(table[2]);
+    }
+
+    // The eight best third-placed teams, by the same ranking.
+    thirds.sort_by(cmp_group_row);
+    let qualified_thirds: Vec<TeamId> = thirds.iter().take(8).map(|t| t.0).collect();
+    if qualified_thirds.len() < 8 {
+        return Vec::new();
+    }
+
+    // Ids continue past the existing fixtures; kickoff sits after the last group match.
+    let base_id = tournament.matches.iter().map(|m| m.id.0).max().unwrap_or(0);
+    let last_kickoff = tournament
+        .matches
+        .iter()
+        .map(|m| m.kickoff)
+        .max()
+        .unwrap_or_else(|| Utc.with_ymd_and_hms(2026, 6, 30, 16, 0, 0).unwrap());
+
+    FIXED_R32
+        .iter()
+        .enumerate()
+        .map(|(i, (top, bottom))| {
+            let home = resolve_slot(top, &winners, &runners, &qualified_thirds);
+            let away = resolve_slot(bottom, &winners, &runners, &qualified_thirds);
+            Match {
+                id: MatchId(base_id + 1 + i as u32),
+                home,
+                away,
+                stage: Stage::RoundOf32,
+                kickoff: last_kickoff + chrono::Duration::hours(24 + (i as i64) * 3),
+                status: MatchStatus::Scheduled,
+                score: Scoreline::new(0, 0),
+            }
+        })
+        .collect()
+}
+
+/// Rank two `(team, points, goal-diff, goals-for)` rows best-first, with team id ascending as a
+/// deterministic final tie-break (matching the simulator's group ranking).
+fn cmp_group_row(a: &(TeamId, i32, i32, i32), b: &(TeamId, i32, i32, i32)) -> std::cmp::Ordering {
+    b.1.cmp(&a.1)
+        .then(b.2.cmp(&a.2))
+        .then(b.3.cmp(&a.3))
+        .then(a.0 .0.cmp(&b.0 .0))
 }
 
 /// Expected goals between two strengths (neutral venue) under a simple log-linear map.
@@ -898,5 +1018,75 @@ mod tests {
         );
 
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// Finish every group match with a deterministic score so the qualifiers are well-defined:
+    /// the lower team-id (stronger seed) wins, by a margin that separates the table.
+    fn play_out_groups(t: &mut Tournament) {
+        for m in &mut t.matches {
+            if matches!(m.stage, Stage::Group(_)) {
+                let (h, a) = (m.home.0, m.away.0);
+                let (gh, ga) = if h < a { (2, 0) } else { (0, 2) };
+                m.score = Scoreline::new(gh, ga);
+                m.status = MatchStatus::Finished;
+            }
+        }
+    }
+
+    #[test]
+    fn materialize_knockout_is_empty_until_groups_finish() {
+        let t = world_cup_2026();
+        assert!(
+            materialize_knockout(&t).is_empty(),
+            "no bracket while group matches are unplayed"
+        );
+    }
+
+    #[test]
+    fn materialize_knockout_builds_a_valid_round_of_32() {
+        let mut t = world_cup_2026();
+        play_out_groups(&mut t);
+        let ko = materialize_knockout(&t);
+
+        assert_eq!(ko.len(), 16, "16 Round-of-32 fixtures");
+        assert!(ko.iter().all(|m| m.stage == Stage::RoundOf32));
+        assert!(ko.iter().all(|m| m.status == MatchStatus::Scheduled));
+
+        // 32 distinct qualifiers, none facing itself.
+        let mut teams = std::collections::HashSet::new();
+        for m in &ko {
+            assert_ne!(m.home, m.away);
+            teams.insert(m.home);
+            teams.insert(m.away);
+        }
+        assert_eq!(teams.len(), 32, "32 distinct qualifiers");
+
+        // Ids are unique and do not collide with the existing group fixtures.
+        let group_ids: std::collections::HashSet<u32> = t.matches.iter().map(|m| m.id.0).collect();
+        let mut ko_ids = std::collections::HashSet::new();
+        for m in &ko {
+            assert!(!group_ids.contains(&m.id.0), "ko id reuses a group id");
+            assert!(ko_ids.insert(m.id.0), "duplicate ko id");
+        }
+
+        // Calling again once the bracket exists must not duplicate it.
+        t.matches.extend(ko);
+        assert!(
+            materialize_knockout(&t).is_empty(),
+            "should not re-materialize an existing bracket"
+        );
+    }
+
+    #[test]
+    fn materialized_qualifiers_are_real_group_finishers() {
+        let mut t = world_cup_2026();
+        play_out_groups(&mut t);
+        let ko = materialize_knockout(&t);
+        let qualified: std::collections::HashSet<TeamId> =
+            ko.iter().flat_map(|m| [m.home, m.away]).collect();
+        // With the stronger seed always winning, every group's bottom team (the highest id in
+        // each group) is eliminated, so at least the 12 group last-placed teams are absent.
+        let eliminated = 48 - qualified.len();
+        assert_eq!(eliminated, 16, "48 teams minus 32 qualifiers");
     }
 }

@@ -288,10 +288,15 @@ cargo bench -p oracle-sim       # Monte-Carlo throughput
   are derived from the real fixture schedule.
 - Knockout ties go to extra time and a near-50/50 shootout, and the simulator plays the **fixed
   2026 knockout bracket** (group winners/runners-up/best thirds placed in their real R32 slots)
-  when the tournament has the real shape. Two honest caveats: the best-third -> slot assignment
-  is a fixed deterministic rule, not FIFA's full 495-row lookup table, and the team-to-group
-  draw is synthetic. In-progress *knockout* matches are not yet conditioned on their live score
-  (in-progress *group* matches are). All documented in the code.
+  when the tournament has the real shape. Once the group stage finishes, the engine **materializes
+  the real bracket** from the actual qualifiers, and from then on the forecast plays those fixtures
+  - finished knockout results stay fixed and **in-progress knockout matches are conditioned on
+  their live score**, just like group matches. Three honest caveats: the best-third -> slot
+  assignment is a fixed deterministic rule, not FIFA's full 495-row lookup table; the team-to-group
+  draw is synthetic; and a finished knockout level on the scoreline (decided on penalties, which
+  the event model does not record) is resolved to the home side. The offline simulation feed plays
+  only the group stage, so the knockout path is driven by the live adapter and by tests. All
+  documented in the code.
 - The goal model **learns in-tournament** two ways: a one-step online Poisson update on the
   Dixon-Coles coefficients, and a full **state-space (Kalman) rating** that carries each team's
   strength as a Gaussian and updates its mean *and* variance from every result. That variance
