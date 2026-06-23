@@ -52,7 +52,7 @@ fully offline with **zero keys and zero network**.
 | **Lineup adjustment** | a confirmed XI shifts each team's attack and defense |
 | **Suspension tracking** | yellow-card accumulation drops a suspended starter from the next match before its lineup is known |
 | **Venue & travel context** | host advantage, altitude, and rest-day differential adjust each match |
-| **Monte-Carlo** (rayon-parallel, **conditions in-progress matches** on their live score; knockouts go to **extra time + a near-50/50 shootout**) | tournament-level champion odds that move with live results |
+| **Monte-Carlo** (rayon-parallel, **conditions in-progress matches** on their live score; knockouts go to **extra time + a near-50/50 shootout**; **resamples team strength each iteration**) | tournament-level champion odds that move with live results and carry parameter uncertainty |
 
 Calibration is measured with proper scoring rules (Brier, log-loss), benchmarked against
 the bookmaker's implied odds, and regression-tested. The maths are written up in
@@ -290,10 +290,11 @@ cargo bench -p oracle-sim       # Monte-Carlo throughput
   (in-progress *group* matches are). Both documented in the code.
 - The goal model now **learns in-tournament** from each finished match (a one-step online
   Poisson update); the deeper version, a full **dynamic / state-space (Kalman) rating** with
-  process noise, is still future work. Also open: full **posterior intervals** in the
-  Monte-Carlo (we propagate match variance and report its standard error, but not parameter
-  uncertainty in the team ratings). Deliberately deferred: **squad market value** (largely
-  redundant with the strength ratings offline) and **stakes / dead-rubber rotation**
+  process noise, is still future work. The Monte-Carlo now propagates **parameter
+  uncertainty** by resampling each team's strength per iteration from its fitted standard
+  error (so champion odds are not over-concentrated), though that is a Gaussian
+  approximation, not a full Bayesian posterior. Deliberately deferred: **squad market value**
+  (largely redundant with the strength ratings offline) and **stakes / dead-rubber rotation**
   (speculative).
 
 ## 📄 License

@@ -170,6 +170,15 @@ independent, so it fans out over `rayon`; per-iteration RNG seeds make a given
 `(seed, iterations)` perfectly reproducible. Each probability carries a Monte-Carlo
 standard error `sqrt(p(1-p)/N)`, surfaced by `simulate`.
 
+Crucially, each iteration also **resamples every team's strength** from its fitted
+uncertainty (`MatchSampler::rating_stderr`, log-space attack/defense shifts held fixed across
+that team's matches), so the forecast carries **parameter uncertainty**, not just match
+variance. Data-poor teams wobble more (their `GoalModel::strength_uncertainty` is larger),
+which fattens the tails and stops champion odds from being over-concentrated, the failure
+mode of treating point-estimate ratings as certain. The `SimConfig::rating_uncertainty`
+multiplier scales (or disables, at 0) the effect; it is a Gaussian approximation, not a full
+Bayesian posterior.
+
 ### Calibration (`oracle-model::reliability`)
 Beyond Brier and log loss, `reliability` bins predictions by confidence and compares
 predicted vs empirical frequency, with an expected calibration error (ECE). `backtest`
