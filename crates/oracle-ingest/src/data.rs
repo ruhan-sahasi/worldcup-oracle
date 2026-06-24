@@ -722,21 +722,157 @@ pub fn load_results_csv(path: impl AsRef<Path>) -> Result<Vec<MatchRecord>> {
 // the host/altitude/rest feature work offline. Rest days are derived from the real gaps
 // between a team's fixtures, so that part is genuine.
 
-/// `(city, host country code, altitude in metres)`.
-const VENUES: &[(&str, &str, f64)] = &[
-    ("Mexico City", "MEX", 2240.0),
-    ("Guadalajara", "MEX", 1566.0),
-    ("Monterrey", "MEX", 540.0),
-    ("Denver", "USA", 1609.0),
-    ("Atlanta", "USA", 320.0),
-    ("Dallas", "USA", 130.0),
-    ("Kansas City", "USA", 270.0),
-    ("Los Angeles", "USA", 93.0),
-    ("New York", "USA", 10.0),
-    ("Miami", "USA", 2.0),
-    ("Toronto", "CAN", 76.0),
-    ("Vancouver", "CAN", 4.0),
+/// A 2026 host venue: `(city, host country code, altitude_m, latitude, longitude, summer UTC
+/// offset in hours)`. Offsets are for June/July 2026: US/Canada observe daylight time, while
+/// Mexico does not (it abolished DST nationally in 2022), so its venues sit at UTC-6 year round.
+struct Venue {
+    /// Host city, kept for readability of the venue table (not used in the adjustment math).
+    #[allow(dead_code)]
+    city: &'static str,
+    country: &'static str,
+    altitude_m: f64,
+    lat: f64,
+    lon: f64,
+    utc_offset: f64,
+}
+
+const VENUES: &[Venue] = &[
+    Venue {
+        city: "Mexico City",
+        country: "MEX",
+        altitude_m: 2240.0,
+        lat: 19.43,
+        lon: -99.13,
+        utc_offset: -6.0,
+    },
+    Venue {
+        city: "Guadalajara",
+        country: "MEX",
+        altitude_m: 1566.0,
+        lat: 20.67,
+        lon: -103.35,
+        utc_offset: -6.0,
+    },
+    Venue {
+        city: "Monterrey",
+        country: "MEX",
+        altitude_m: 540.0,
+        lat: 25.69,
+        lon: -100.32,
+        utc_offset: -6.0,
+    },
+    Venue {
+        city: "Denver",
+        country: "USA",
+        altitude_m: 1609.0,
+        lat: 39.74,
+        lon: -104.99,
+        utc_offset: -6.0,
+    },
+    Venue {
+        city: "Atlanta",
+        country: "USA",
+        altitude_m: 320.0,
+        lat: 33.75,
+        lon: -84.39,
+        utc_offset: -4.0,
+    },
+    Venue {
+        city: "Dallas",
+        country: "USA",
+        altitude_m: 130.0,
+        lat: 32.78,
+        lon: -96.80,
+        utc_offset: -5.0,
+    },
+    Venue {
+        city: "Kansas City",
+        country: "USA",
+        altitude_m: 270.0,
+        lat: 39.10,
+        lon: -94.58,
+        utc_offset: -5.0,
+    },
+    Venue {
+        city: "Los Angeles",
+        country: "USA",
+        altitude_m: 93.0,
+        lat: 34.05,
+        lon: -118.24,
+        utc_offset: -7.0,
+    },
+    Venue {
+        city: "New York",
+        country: "USA",
+        altitude_m: 10.0,
+        lat: 40.71,
+        lon: -74.01,
+        utc_offset: -4.0,
+    },
+    Venue {
+        city: "Miami",
+        country: "USA",
+        altitude_m: 2.0,
+        lat: 25.76,
+        lon: -80.19,
+        utc_offset: -4.0,
+    },
+    Venue {
+        city: "Toronto",
+        country: "CAN",
+        altitude_m: 76.0,
+        lat: 43.65,
+        lon: -79.38,
+        utc_offset: -4.0,
+    },
+    Venue {
+        city: "Vancouver",
+        country: "CAN",
+        altitude_m: 4.0,
+        lat: 49.28,
+        lon: -123.12,
+        utc_offset: -7.0,
+    },
 ];
+
+/// Great-circle distance between two `(lat, lon)` points in kilometres (haversine).
+fn haversine_km(a: &Venue, b: &Venue) -> f64 {
+    let r = 6371.0_f64;
+    let (lat1, lat2) = (a.lat.to_radians(), b.lat.to_radians());
+    let dlat = (b.lat - a.lat).to_radians();
+    let dlon = (b.lon - a.lon).to_radians();
+    let h = (dlat / 2.0).sin().powi(2) + lat1.cos() * lat2.cos() * (dlon / 2.0).sin().powi(2);
+    2.0 * r * h.sqrt().asin()
+}
+
+/// How much of the crowd in a venue in `venue_country` is expected to back `team`, in `[0, 1]`.
+/// A literal host on home soil packs the stadium; Mexico draws near-home crowds across US venues;
+/// otherwise it is a confederation-level diaspora / traveling-fan pull, since 2026 sits in a
+/// region with very large Latin American and sizable European communities. Synthetic but reasoned
+/// (no real attendance data is bundled).
+fn crowd_pull(team: TeamId, venue_country: &str) -> f64 {
+    let Some(&(_, code, conf, _)) = TEAMS.get(team.0 as usize) else {
+        return 0.0;
+    };
+    if code == venue_country {
+        return 1.0; // literal host, at home
+    }
+    let host_cross: f64 = match (code, venue_country) {
+        ("MEX", "USA") => 0.85,
+        ("USA", "CAN") | ("CAN", "USA") => 0.5,
+        ("MEX", "CAN") | ("CAN", "MEX") | ("USA", "MEX") => 0.4,
+        _ => 0.0,
+    };
+    let diaspora: f64 = match conf {
+        Conmebol => 0.6,
+        Concacaf => 0.55,
+        Uefa => 0.35,
+        Caf => 0.3,
+        Afc => 0.3,
+        Ofc => 0.15,
+    };
+    host_cross.max(diaspora)
+}
 
 /// A per-team venue/travel adjustment: `((home_attack, home_defense), (away_attack,
 /// away_defense))` in log space.
@@ -750,26 +886,65 @@ fn host_country(id: TeamId) -> Option<&'static str> {
     }
 }
 
-/// Per-match venue/travel context for the tournament: a representative venue assignment
-/// plus rest days derived from the real gaps between each team's fixtures.
+/// Per-match venue/travel context for the tournament: a representative venue assignment, rest
+/// days, the continent-spanning travel/time-zone load between each team's fixtures, and the
+/// expected crowd partisanship.
 pub fn match_contexts(tournament: &Tournament) -> HashMap<MatchId, MatchContext> {
-    // Rest days: for each team, the gap to its previous fixture by kickoff.
-    let mut by_team: HashMap<TeamId, Vec<(MatchId, chrono::DateTime<Utc>)>> = HashMap::new();
+    // Assign a representative venue (index into VENUES) to each match. Hosts play in their own
+    // country; other matches round-robin across all venues.
+    let venue_of = |m: &Match| -> usize {
+        match host_country(m.home).or_else(|| host_country(m.away)) {
+            Some(c) => {
+                let in_country: Vec<usize> = VENUES
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, v)| v.country == c)
+                    .map(|(i, _)| i)
+                    .collect();
+                in_country[(m.id.0 as usize) % in_country.len().max(1)]
+            }
+            None => (m.id.0 as usize) % VENUES.len(),
+        }
+    };
+    let venue_ix: HashMap<MatchId, usize> = tournament
+        .matches
+        .iter()
+        .map(|m| (m.id, venue_of(m)))
+        .collect();
+
+    // Per team, the ordered (by kickoff) sequence of fixtures, to derive rest days and the
+    // travel distance + time-zone shift between consecutive venues.
+    let mut by_team: HashMap<TeamId, Vec<(MatchId, chrono::DateTime<Utc>, usize)>> = HashMap::new();
     for m in &tournament.matches {
-        by_team.entry(m.home).or_default().push((m.id, m.kickoff));
-        by_team.entry(m.away).or_default().push((m.id, m.kickoff));
+        let v = venue_ix[&m.id];
+        by_team
+            .entry(m.home)
+            .or_default()
+            .push((m.id, m.kickoff, v));
+        by_team
+            .entry(m.away)
+            .or_default()
+            .push((m.id, m.kickoff, v));
     }
-    let mut rest: HashMap<(TeamId, MatchId), u8> = HashMap::new();
+    // (team, match) -> (rest_days, travel_km, tz_shift).
+    let mut load: HashMap<(TeamId, MatchId), (u8, f64, f64)> = HashMap::new();
     for (team, mut fixtures) in by_team {
-        fixtures.sort_by_key(|(_, k)| *k);
-        let mut prev: Option<chrono::DateTime<Utc>> = None;
-        for (mid, k) in fixtures {
-            let days = match prev {
-                Some(p) => (k - p).num_days().clamp(1, 14) as u8,
-                None => 4,
+        fixtures.sort_by_key(|(_, k, _)| *k);
+        let mut prev: Option<(chrono::DateTime<Utc>, usize)> = None;
+        for (mid, k, v) in fixtures {
+            let entry = match prev {
+                Some((pk, pv)) => {
+                    let days = (k - pk).num_days().clamp(1, 14) as u8;
+                    let km = haversine_km(&VENUES[pv], &VENUES[v]);
+                    // Eastward (offset increases) is the harder, phase-advancing direction.
+                    let tz = VENUES[v].utc_offset - VENUES[pv].utc_offset;
+                    (days, km, tz)
+                }
+                // Before the first match a side has arrived early and acclimatized.
+                None => (4, 0.0, 0.0),
             };
-            rest.insert((team, mid), days);
-            prev = Some(k);
+            load.insert((team, mid), entry);
+            prev = Some((k, v));
         }
     }
 
@@ -777,28 +952,28 @@ pub fn match_contexts(tournament: &Tournament) -> HashMap<MatchId, MatchContext>
         .matches
         .iter()
         .map(|m| {
-            // Hosts play in their own country; otherwise round-robin across all venues.
-            let (_, country, altitude_m) =
-                match host_country(m.home).or_else(|| host_country(m.away)) {
-                    Some(c) => {
-                        let in_country: Vec<&(&str, &str, f64)> =
-                            VENUES.iter().filter(|v| v.1 == c).collect();
-                        *in_country[(m.id.0 as usize) % in_country.len()]
-                    }
-                    None => VENUES[(m.id.0 as usize) % VENUES.len()],
-                };
-            let host = if host_country(m.home) == Some(country) {
+            let v = &VENUES[venue_ix[&m.id]];
+            let host = if host_country(m.home) == Some(v.country) {
                 Host::HomeTeam
-            } else if host_country(m.away) == Some(country) {
+            } else if host_country(m.away) == Some(v.country) {
                 Host::AwayTeam
             } else {
                 Host::Neutral
             };
+            let (home_rest, home_km, home_tz) =
+                load.get(&(m.home, m.id)).copied().unwrap_or((4, 0.0, 0.0));
+            let (away_rest, away_km, away_tz) =
+                load.get(&(m.away, m.id)).copied().unwrap_or((4, 0.0, 0.0));
             let ctx = MatchContext {
                 host,
-                altitude_m,
-                home_rest_days: rest.get(&(m.home, m.id)).copied().unwrap_or(4),
-                away_rest_days: rest.get(&(m.away, m.id)).copied().unwrap_or(4),
+                altitude_m: v.altitude_m,
+                home_rest_days: home_rest,
+                away_rest_days: away_rest,
+                crowd_support: crowd_pull(m.home, v.country) - crowd_pull(m.away, v.country),
+                home_travel_km: home_km,
+                away_travel_km: away_km,
+                home_tz_shift: home_tz,
+                away_tz_shift: away_tz,
             };
             (m.id, ctx)
         })
@@ -997,6 +1172,51 @@ mod tests {
             .filter(|c| c.host != Host::Neutral)
             .count();
         assert!(hosted > 0, "expected some host-nation matches");
+    }
+
+    #[test]
+    fn crowd_pull_ranks_host_above_diaspora_above_distant() {
+        let id = |code: &str| TeamId(TEAMS.iter().position(|t| t.1 == code).unwrap() as u32);
+        // A literal host on home soil packs the stadium.
+        assert!((crowd_pull(id("MEX"), "MEX") - 1.0).abs() < 1e-9);
+        // Mexico still draws a near-home crowd across US venues, far more than a distant side.
+        assert!(crowd_pull(id("MEX"), "USA") > crowd_pull(id("JPN"), "USA"));
+        // Latin American diaspora pull beats an OFC minnow's.
+        assert!(crowd_pull(id("ARG"), "USA") > crowd_pull(id("NZL"), "USA"));
+    }
+
+    #[test]
+    fn contexts_carry_crowd_and_travel_signals() {
+        let t = world_cup_2026();
+        let ctx = match_contexts(&t);
+        assert_eq!(ctx.len(), t.matches.len());
+
+        // Crowd partisanship is a difference of two pulls in [0, 1], so within [-1, 1], and at
+        // least some matches are clearly partisan (a host on home soil).
+        assert!(ctx.values().all(|c| c.crowd_support.abs() <= 1.0 + 1e-9));
+        assert!(
+            ctx.values().any(|c| c.crowd_support.abs() > 0.5),
+            "expected some strongly partisan matches"
+        );
+
+        // Teams travel between fixtures, and continent-spanning trips shift time zones.
+        assert!(
+            ctx.values()
+                .any(|c| c.home_travel_km > 0.0 || c.away_travel_km > 0.0),
+            "expected some inter-venue travel"
+        );
+        assert!(
+            ctx.values()
+                .any(|c| c.home_tz_shift.abs() > 0.0 || c.away_tz_shift.abs() > 0.0),
+            "expected some time-zone shifts"
+        );
+    }
+
+    #[test]
+    fn haversine_matches_known_distance() {
+        // New York (idx 8) to Los Angeles (idx 7) is ~3,940 km.
+        let km = haversine_km(&VENUES[8], &VENUES[7]);
+        assert!((km - 3940.0).abs() < 150.0, "NY-LA distance was {km:.0} km");
     }
 
     #[test]

@@ -52,7 +52,7 @@ fully offline with **zero keys and zero network**.
 | **Bayesian live updater** with **score effects** | conditions on score, minute, and red cards; a trailing team chases and a leading team defends |
 | **Lineup adjustment** | a confirmed XI shifts each team's attack and defense |
 | **Suspension tracking** | yellow-card accumulation drops a suspended starter from the next match before its lineup is known |
-| **Venue & travel context** | host advantage, altitude, and rest-day differential adjust each match |
+| **Venue, crowd & travel context** | host advantage, altitude, rest-day differential, a continuous **crowd-partisanship** signal (diaspora / traveling fans, not just literal hosts), and **continental travel + time-zone load** (eastward trips bite harder) adjust each match |
 | **Monte-Carlo** (rayon-parallel, **conditions in-progress matches** on their live score; the **fixed 2026 knockout bracket**; knockouts go to **extra time + a near-50/50 shootout**; **resamples team strength each iteration**) | tournament-level champion odds that move with live results and carry parameter uncertainty |
 
 Calibration is measured with proper scoring rules (Brier, log-loss), benchmarked against
@@ -284,8 +284,11 @@ cargo bench -p oracle-sim       # Monte-Carlo throughput
 - Squads and venue assignments are **synthetic** for offline use, so the lineup and venue
   features are fully demonstrable via the simulation feed. The live football-data.org
   adapter ingests results (and **line-ups** on tiers that expose them); odds and xG are not
-  offered by that provider, so they come from the CSV path or a dedicated source. Rest days
-  are derived from the real fixture schedule.
+  offered by that provider, so they come from the CSV path or a dedicated source. Rest days,
+  inter-venue **travel distance**, and **time-zone shifts** are derived from the real fixture
+  schedule and venue coordinates; the **crowd-partisanship** signal is a reasoned synthetic model
+  (host on home soil, Mexico's reach across US venues, confederation-level diaspora pull), not
+  measured attendance data.
 - Knockout ties go to extra time and a near-50/50 shootout, and the simulator plays the **fixed
   2026 knockout bracket** (group winners/runners-up/best thirds placed in their real R32 slots)
   when the tournament has the real shape. Once the group stage finishes, the engine **materializes

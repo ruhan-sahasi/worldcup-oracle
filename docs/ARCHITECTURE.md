@@ -159,10 +159,22 @@ strongest available XI (a missing key player lowers that side and lifts the oppo
 threshold (2), drops that player from the team's next unplayed match. That match's prediction
 and forecast then carry the lineup penalty as a *pre-lineup prior*, superseded by the real
 lineup once it is announced (which on a live feed already excludes the suspended player).
-**Venue/travel (`MatchContext`)**: host-nation/crowd advantage, Mexico-City-style altitude,
-and rest-day differential. Venue (and any pre-lineup suspension penalty) applies to every
-Monte-Carlo fixture, so it reaches the champion odds. Squads, xG, and venue assignments are
-synthetic offline; rest days come from the real fixture schedule.
+**Venue/crowd/travel (`MatchContext`)**: host-nation familiarity, Mexico-City-style altitude,
+rest-day differential, plus two signals specific to a continent-spanning 2026:
+- **Crowd composition** - a continuous `crowd_support` in [-1, 1] derived from each side's
+  expected support in the venue's city (a literal host on home soil packs the stadium; Mexico
+  draws a near-home crowd across US venues; otherwise a confederation-level diaspora /
+  traveling-fan pull). This captures partisanship in nominally neutral games that the binary
+  host flag misses, and lifts the favored side while denting the other.
+- **Travel & circadian load** - distance (haversine between consecutive venues) and the
+  signed time-zone shift since a side's last match sap its attack, with **eastward** travel (a
+  phase advance) weighted harder than westward. The differential between the two sides is what
+  tilts the match, so a team camped in one region is fresher than one criss-crossing the map.
+
+All of these (and any pre-lineup suspension penalty) apply to every Monte-Carlo fixture, so they
+reach the champion odds. Squads, xG, venue assignments, and the crowd-pull model are synthetic
+offline; rest days, travel, and time-zone shifts come from the real fixture schedule and venue
+coordinates.
 
 ### Market prior & benchmark (`oracle-model::implied_probabilities`)
 Decimal odds are inverted and the overround normalized away to recover the bookmaker's
