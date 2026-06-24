@@ -27,7 +27,7 @@
 //! models positive correlation directly. The `wc-oracle tune` command picks between them,
 //! and the rest of the hyperparameters, by held-out log-loss.
 
-use crate::poisson::{bivariate_poisson_pmf, poisson_pmf};
+use crate::poisson::{bivariate_poisson_pmf, neg_binomial_pmf, poisson_pmf};
 use oracle_domain::{Probabilities, ScoreGrid, Scoreline, TeamId};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -143,6 +143,11 @@ pub struct GoalModel {
     /// Bivariate-Poisson covariance term λ3 (used by [`ScoreModel::Bivariate`]).
     #[serde(default)]
     covariance: f64,
+    /// Negative-binomial dispersion (the NB "size"/`r`) for the [`ScoreModel::Independent`]
+    /// margins, fitted from the data. `0` = Poisson (no overdispersion); a finite value gives
+    /// fatter scoreline tails. The variance of each margin is `mean + mean²/dispersion`.
+    #[serde(default)]
+    dispersion: f64,
     #[serde(default)]
     model: ScoreModel,
     max_goals: usize,
@@ -162,6 +167,7 @@ impl Default for GoalModel {
             home_advantage: 0.25, // exp(0.25) ≈ 1.28× at home
             rho: -0.05,
             covariance: 0.0,
+            dispersion: 0.0,
             model: ScoreModel::Independent,
             max_goals: 10,
             attack: HashMap::new(),
@@ -336,11 +342,27 @@ impl GoalModel {
             ),
         };
 
+        // Fit the goal-count overdispersion (a finite NB size if the data has fatter tails than
+        // Poisson, else 0). Applies to the Independent margins; the Bivariate model has its own
+        // dependence mechanism, so leave it Poisson-marginal.
+        let dispersion = match config.model {
+            ScoreModel::Independent => fit_dispersion(
+                observations,
+                &weights,
+                &attack,
+                &defense,
+                intercept,
+                home_advantage,
+            ),
+            ScoreModel::Bivariate => 0.0,
+        };
+
         GoalModel {
             intercept,
             home_advantage,
             rho,
             covariance,
+            dispersion,
             model: config.model,
             max_goals: config.max_goals,
             attack,
@@ -368,6 +390,12 @@ impl GoalModel {
     /// The fitted bivariate-Poisson covariance term (`0` for the independent model).
     pub fn covariance(&self) -> f64 {
         self.covariance
+    }
+
+    /// The fitted negative-binomial dispersion (the NB "size"/`r`); `0` means Poisson margins.
+    /// Smaller positive values mean more overdispersion (fatter scoreline tails).
+    pub fn dispersion(&self) -> f64 {
+        self.dispersion
     }
 
     pub fn home_advantage(&self) -> f64 {
@@ -451,8 +479,10 @@ impl GoalModel {
     fn grid_from(&self, lambda: f64, mu: f64) -> ScoreGrid {
         match self.model {
             ScoreModel::Independent => ScoreGrid::from_fn(self.max_goals, |h, a| {
-                poisson_pmf(h as u32, lambda)
-                    * poisson_pmf(a as u32, mu)
+                // Negative-binomial margins (Poisson when dispersion is 0) with the Dixon-Coles
+                // low-score correction; the grid is renormalized by `from_fn`.
+                neg_binomial_pmf(h as u32, lambda, self.dispersion)
+                    * neg_binomial_pmf(a as u32, mu, self.dispersion)
                     * tau(h, a, lambda, mu, self.rho)
             }),
             ScoreModel::Bivariate => {
@@ -636,12 +666,99 @@ fn fit_covariance(
     best
 }
 
+/// One-dimensional search for the negative-binomial dispersion (the "size"/`r`) that maximizes
+/// the time-weighted log-likelihood of the goal counts, given the fitted means. Returns `0`
+/// (Poisson) when the data shows no overdispersion, else the finite `r` that best fits the
+/// goal-count spread (smaller = more overdispersed). Both teams' goals contribute.
+fn fit_dispersion(
+    obs: &[Observation],
+    weights: &[f64],
+    attack: &HashMap<TeamId, f64>,
+    defense: &HashMap<TeamId, f64>,
+    intercept: f64,
+    home_advantage: f64,
+) -> f64 {
+    let ll = |size: f64| -> f64 {
+        obs.iter()
+            .zip(weights)
+            .map(|(o, &w)| {
+                let lambda =
+                    (intercept + attack[&o.home] - defense[&o.away] + home_advantage).exp();
+                let mu = (intercept + attack[&o.away] - defense[&o.home]).exp();
+                let ph = neg_binomial_pmf(o.score.home as u32, lambda, size).max(1e-12);
+                let pa = neg_binomial_pmf(o.score.away as u32, mu, size).max(1e-12);
+                w * (ph.ln() + pa.ln())
+            })
+            .sum()
+    };
+    // Candidate sizes: Poisson (0) plus finite sizes from heavy to light overdispersion. A large
+    // size is already indistinguishable from Poisson, so the grid need not extend further.
+    const SIZES: &[f64] = &[0.0, 2.0, 3.0, 5.0, 8.0, 12.0, 20.0, 40.0, 80.0];
+    let mut best = 0.0;
+    let mut best_ll = ll(0.0);
+    for &s in &SIZES[1..] {
+        let cur = ll(s);
+        if cur > best_ll {
+            best_ll = cur;
+            best = s;
+        }
+    }
+    best
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn t(n: u32) -> TeamId {
         TeamId(n)
+    }
+
+    #[test]
+    fn fit_learns_overdispersion_from_fat_tailed_scores() {
+        // The same matchup repeated with a high-variance goal pattern (blowouts and blanks),
+        // which a fixed-rate Poisson cannot fit: the fit should pick a finite NB dispersion.
+        let scores = [
+            (5, 0),
+            (0, 0),
+            (4, 1),
+            (0, 2),
+            (6, 0),
+            (0, 0),
+            (3, 0),
+            (1, 4),
+        ];
+        let obs: Vec<Observation> = (0..40)
+            .map(|i| {
+                let (h, a) = scores[i % scores.len()];
+                Observation::new(t(1), t(2), Scoreline::new(h, a), i as f64)
+            })
+            .collect();
+        let model = GoalModel::fit(&obs, DixonColesConfig::default());
+        assert!(
+            model.dispersion() > 0.0,
+            "fat-tailed scores should yield a finite NB dispersion, got {}",
+            model.dispersion()
+        );
+    }
+
+    #[test]
+    fn overdispersion_fattens_both_grid_tails() {
+        // Same means (the data-free default), Poisson vs negative-binomial margins.
+        let poisson = GoalModel::default();
+        let nb = GoalModel {
+            dispersion: 5.0,
+            ..GoalModel::default()
+        };
+        let gp = poisson.score_grid(t(1), t(2), false);
+        let gnb = nb.score_grid(t(1), t(2), false);
+        assert!(gnb.grid[0][0] > gp.grid[0][0], "NB lifts the 0-0 mass");
+        // Use a line well into the tail (mean total is ~3): overdispersion adds mass to the
+        // extremes, so the high-scoring tail is clearly fatter.
+        assert!(
+            gnb.prob_over(5.5) > gp.prob_over(5.5),
+            "NB lifts the blowout tail"
+        );
     }
 
     /// Build a synthetic history where team 1 is strong and team 2 is weak, then

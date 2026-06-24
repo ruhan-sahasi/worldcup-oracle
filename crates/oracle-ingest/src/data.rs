@@ -30,7 +30,7 @@ use oracle_model::{
 use oracle_ratings::{RatingStore, StateSpaceRatings};
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
-use rand_distr::{Distribution, Poisson};
+use rand_distr::{Distribution, Gamma, Poisson};
 use std::collections::HashMap;
 use std::path::Path;
 
@@ -491,6 +491,25 @@ fn cmp_group_row(a: &(TeamId, i32, i32, i32), b: &(TeamId, i32, i32, i32)) -> st
         .then(a.0 .0.cmp(&b.0 .0))
 }
 
+/// Match-level overdispersion of the synthetic data: a Gamma-Poisson "form on the day" with this
+/// negative-binomial size, matching the mild overdispersion of real football. Mean-preserving, so
+/// expected goals are unchanged, but the goal-count *spread* is fatter than Poisson - which lets
+/// the fitted goal model actually learn a finite dispersion offline.
+const SYNTHETIC_DISPERSION: f64 = 8.0;
+
+/// Sample a goal count from a Gamma-Poisson (negative binomial) with the given mean, capped at 12.
+fn sample_goals_overdispersed(rng: &mut StdRng, lambda: f64) -> u8 {
+    let r = SYNTHETIC_DISPERSION;
+    let rate = Gamma::new(r, lambda / r)
+        .ok()
+        .map(|g| g.sample(rng))
+        .unwrap_or(lambda)
+        .max(1e-9);
+    Poisson::new(rate)
+        .map(|d| (d.sample(rng) as u32).min(12) as u8)
+        .unwrap_or(0)
+}
+
 /// Expected goals between two strengths (neutral venue) under a simple log-linear map.
 fn rating_to_xg(home: f64, away: f64) -> (f64, f64) {
     let sup = (home - away) / 250.0;
@@ -508,12 +527,6 @@ pub fn synthetic_history(n_matches: usize, seed: u64) -> Vec<Observation> {
     let mut rng = StdRng::seed_from_u64(seed);
     let mut out = Vec::with_capacity(n_matches);
 
-    let sample = |rng: &mut StdRng, lambda: f64| -> u8 {
-        Poisson::new(lambda)
-            .map(|d| (d.sample(rng) as u32).min(12) as u8)
-            .unwrap_or(0)
-    };
-
     for k in 0..n_matches {
         let i = rng.gen_range(0..n);
         let mut j = rng.gen_range(0..n);
@@ -521,7 +534,10 @@ pub fn synthetic_history(n_matches: usize, seed: u64) -> Vec<Observation> {
             j = rng.gen_range(0..n);
         }
         let (lambda, mu) = rating_to_xg(strengths[i].1, strengths[j].1);
-        let score = Scoreline::new(sample(&mut rng, lambda), sample(&mut rng, mu));
+        let score = Scoreline::new(
+            sample_goals_overdispersed(&mut rng, lambda),
+            sample_goals_overdispersed(&mut rng, mu),
+        );
         // xG is a noisy estimate of the true rate, but much less noisy than the
         // Poisson-sampled scoreline, so fitting on it sharpens the model.
         let home_xg = (lambda * (1.0 + rng.gen_range(-0.15..0.15))).max(0.05);
@@ -590,11 +606,6 @@ pub fn synthetic_history_with_market(n_matches: usize, seed: u64) -> Vec<MatchRe
     let strengths = team_strengths();
     let n = strengths.len();
     let mut rng = StdRng::seed_from_u64(seed ^ 0xB00C);
-    let sample = |rng: &mut StdRng, lambda: f64| -> u8 {
-        Poisson::new(lambda)
-            .map(|d| (d.sample(rng) as u32).min(12) as u8)
-            .unwrap_or(0)
-    };
 
     (0..n_matches)
         .map(|k| {
@@ -604,7 +615,10 @@ pub fn synthetic_history_with_market(n_matches: usize, seed: u64) -> Vec<MatchRe
                 j = rng.gen_range(0..n);
             }
             let (lambda, mu) = rating_to_xg(strengths[i].1, strengths[j].1);
-            let score = Scoreline::new(sample(&mut rng, lambda), sample(&mut rng, mu));
+            let score = Scoreline::new(
+                sample_goals_overdispersed(&mut rng, lambda),
+                sample_goals_overdispersed(&mut rng, mu),
+            );
             let home_xg = (lambda * (1.0 + rng.gen_range(-0.15..0.15))).max(0.05);
             let away_xg = (mu * (1.0 + rng.gen_range(-0.15..0.15))).max(0.05);
             let age_days = 1100.0 * (1.0 - k as f64 / n_matches as f64);
@@ -1163,6 +1177,18 @@ mod tests {
         // Argentina (id 0, strongest) vs New Zealand (id 47, weakest).
         let p = model.outcome_probabilities(TeamId(0), TeamId(47), true);
         assert!(p.home_win > 0.6, "fit should rate Argentina well above NZ");
+    }
+
+    #[test]
+    fn baseline_model_learns_overdispersion_offline() {
+        // The synthetic history carries mild Gamma-Poisson overdispersion, so the fit should
+        // recover a finite negative-binomial dispersion rather than defaulting to Poisson.
+        let model = fit_baseline_model(7);
+        assert!(
+            model.dispersion() > 0.0,
+            "offline baseline should learn overdispersion, got {}",
+            model.dispersion()
+        );
     }
 
     #[test]

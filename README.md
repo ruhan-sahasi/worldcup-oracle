@@ -45,7 +45,7 @@ fully offline with **zero keys and zero network**.
 
 | Piece | What it contributes |
 |-------|---------------------|
-| **Dixon-Coles / bivariate-Poisson** goal model, MLE-fit (convergence-checked) with time decay + ridge, **fit on xG when available**, **updated online from results** | full exact-score distribution that sharpens as the tournament unfolds; the score model and fit hyperparameters are **tuned by held-out log-loss** |
+| **Dixon-Coles / bivariate-Poisson** goal model, MLE-fit (convergence-checked) with time decay + ridge, **fit on xG when available**, **updated online from results**, with **negative-binomial (overdispersed) margins** | full exact-score distribution that sharpens as the tournament unfolds, with the fatter blowout/goalless tails real football shows; the score model and fit hyperparameters are **tuned by held-out log-loss** |
 | **Elo** with home edge + margin-of-victory scaling | a complementary strength signal |
 | **State-space (Kalman) rating** - each team a Gaussian `N(mean, var)`, random-walk between matches + Kalman update from each result | principled in-tournament learning *and* a per-team uncertainty that the Monte-Carlo consumes |
 | **Log-opinion-pool ensemble** (`[Dixon-Coles, Elo, State-space, Market]` weights + temperature **learned by stacking**) | a single sharper forecast, anchored to the bookmaker when odds are present |
@@ -146,27 +146,30 @@ cargo run --release -p oracle-cli -- backtest --data path/to/football-data.csv
   Model                   Brier   LogLoss      Acc
   ------------------------------------------------
   Uniform baseline       0.6667    1.0986    33.3%
-  Dixon-Coles (goals)    0.6283    1.0433    46.2%
-  Dixon-Coles (xG)       0.6227    1.0360    48.2%
-  Elo                    0.6719    1.1273    46.4%
-  Ensemble (+Market)     0.6272    1.0427    47.5%
-  Market (bookmaker)     0.6197    1.0318    48.8%
+  Dixon-Coles (goals)    0.6192    1.0311    50.1%
+  Dixon-Coles (xG)       0.6171    1.0282    50.5%
+  Elo                    0.6515    1.1080    48.1%
+  Ensemble (+Market)     0.6179    1.0298    50.0%
+  Market (bookmaker)     0.6095    1.0180    50.5%
 
-  learned weights: DC 0.37 / Elo 0.22 / Market 0.41   temperature 0.77
+  learned weights: DC 0.37 / Elo 0.24 / Market 0.39   temperature 0.78
 
-  Ensemble calibration (ECE 0.017):
+  Ensemble calibration (ECE 0.030):
           bucket   predicted   empirical        n
-       0-20 %         18.3%      18.5%       54
-      20-40 %         29.6%      28.5%     1801
-      40-60 %         46.5%      50.2%      524
+       0-20 %         17.4%      21.1%      109
+      20-40 %         29.5%      27.8%     1744
+      40-60 %         47.6%      53.9%      512
+      60-80 %         64.5%      45.7%       35
 ```
 
 Three things are visible here. Fitting on **xG** beats fitting on goals (a lower-noise
 signal). Stacking learns to lean on the **market** (the heaviest weight), since the
 bookmaker's vig-free implied odds are the hard bar to beat: the engine approaches the
 market but does not clear it. And the **reliability table + ECE** confirm the ensemble is
-well-calibrated (predicted ≈ empirical in every bucket). `--data` runs the same split on a real
-[football-data.co.uk](https://www.football-data.co.uk) CSV (with closing odds, and xG
+well-calibrated (predicted ≈ empirical in every bucket). The synthetic results now carry
+mild **match-level overdispersion** (a Gamma-Poisson "form on the day"), so the negative-binomial
+goal model has fatter, more realistic scoreline tails to fit. `--data` runs the same split on a
+real [football-data.co.uk](https://www.football-data.co.uk) CSV (with closing odds, and xG
 columns if present).
 
 ```bash

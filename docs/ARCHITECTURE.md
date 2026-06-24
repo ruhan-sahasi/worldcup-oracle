@@ -111,6 +111,19 @@ shrinks the coefficients toward the mean; because a data-rich team accumulates a
 gradient, sparse-data teams are shrunk more, the regularization a sparse, unbalanced
 international schedule needs.
 
+The Independent model's margins are **negative-binomial**, not pure Poisson. Real football
+goals are mildly *overdispersed* (the variance exceeds the mean: blowouts and goalless games
+both happen more than Poisson predicts), which a fixed-rate Poisson cannot capture. The
+negative binomial is the Gamma-Poisson mixture - a team's rate varies match to match - and its
+dispersion (the NB "size" `r`; `r → ∞` is Poisson) is **fit from the data** by a 1-D likelihood
+search alongside `ρ`, so the score grid gets correctly fatter tails. The Monte-Carlo mirrors
+this, sampling each scoreline from the same Gamma-Poisson so the tournament forecast inherits the
+overdispersion rather than under-stating extreme results.
+
+The hand-tuning is removed by `wc-oracle tune`, which grid-searches the time decay `ξ`, the
+ridge strength, and the score model on a validation split (selecting by log-loss) and reports
+the winner's honest test-set loss, so these constants are optimized rather than guessed.
+
 The hand-tuning is removed by `wc-oracle tune`, which grid-searches the time decay `ξ`, the
 ridge strength, and the score model on a validation split (selecting by log-loss) and reports
 the winner's honest test-set loss, so these constants are optimized rather than guessed.

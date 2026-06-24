@@ -42,7 +42,7 @@ use oracle_domain::{
 use oracle_model::{remaining_rates, LiveConfig, LiveState};
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
-use rand_distr::{Distribution, Normal, Poisson};
+use rand_distr::{Distribution, Gamma, Normal, Poisson};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -94,6 +94,13 @@ pub trait MatchSampler: Sync {
     fn rating_stderr(&self, _team: TeamId) -> f64 {
         0.0
     }
+
+    /// Negative-binomial dispersion (the NB "size"/`r`) for sampled goal counts. The simulator
+    /// draws goals from a Gamma-Poisson mixture with this size, so scorelines have the same fatter
+    /// tails as the goal model's grid. Defaults to 0 (Poisson), reproducing the fixed-rate sampler.
+    fn dispersion(&self) -> f64 {
+        0.0
+    }
 }
 
 impl MatchSampler for oracle_model::GoalModel {
@@ -104,6 +111,10 @@ impl MatchSampler for oracle_model::GoalModel {
 
     fn rating_stderr(&self, team: TeamId) -> f64 {
         self.strength_uncertainty(team)
+    }
+
+    fn dispersion(&self) -> f64 {
+        oracle_model::GoalModel::dispersion(self)
     }
 }
 
@@ -206,6 +217,9 @@ struct Prepared {
     n: usize,
     extra_time_fraction: f64,
     shootout_skill: f64,
+    /// Negative-binomial dispersion for sampled goal counts (0 = Poisson). From the sampler, so
+    /// the simulated scorelines carry the same overdispersion the goal model fit.
+    dispersion: f64,
     /// Per-team log-space strength SD (indexed by team-index), resampled each iteration.
     team_sigma: Vec<f64>,
     /// Whether any team has non-zero strength uncertainty (skip the draw entirely if not).
@@ -481,6 +495,7 @@ impl Prepared {
             n,
             extra_time_fraction: config.extra_time_fraction,
             shootout_skill: config.shootout_skill,
+            dispersion: sampler.dispersion().max(0.0),
             team_sigma,
             has_uncertainty,
             fixed_bracket,
@@ -490,12 +505,24 @@ impl Prepared {
         }
     }
 
-    /// Sample a single goal count from Poisson(λ).
-    fn sample_goals(rng: &mut StdRng, lambda: f64) -> i32 {
+    /// Sample a single goal count. With a positive dispersion the rate is first drawn from a
+    /// Gamma (the negative-binomial / Gamma-Poisson mixture), so a team's effective rate varies
+    /// match to match and scorelines get the fatter tails real football shows; dispersion 0 is a
+    /// plain Poisson(λ).
+    fn sample_goals(&self, rng: &mut StdRng, lambda: f64) -> i32 {
         if lambda <= 1e-9 {
             return 0;
         }
-        match Poisson::new(lambda) {
+        let rate = if self.dispersion > 0.0 {
+            let r = self.dispersion;
+            Gamma::new(r, lambda / r)
+                .map(|g| g.sample(rng))
+                .unwrap_or(lambda)
+                .max(1e-9)
+        } else {
+            lambda
+        };
+        match Poisson::new(rate) {
             Ok(dist) => (dist.sample(rng) as i32).min(20),
             Err(_) => 0,
         }
@@ -521,12 +548,12 @@ impl Prepared {
         let (eg_a, eg_b) = self.eg[a * self.n + b];
         let la = eg_a * (att[a] - def[b]).exp();
         let ma = eg_b * (att[b] - def[a]).exp();
-        let mut gh = Self::sample_goals(rng, la);
-        let mut ga = Self::sample_goals(rng, ma);
+        let mut gh = self.sample_goals(rng, la);
+        let mut ga = self.sample_goals(rng, ma);
         if gh == ga {
             // Extra time: a third of a match, at lower scoring intensity.
-            gh += Self::sample_goals(rng, la * self.extra_time_fraction);
-            ga += Self::sample_goals(rng, ma * self.extra_time_fraction);
+            gh += self.sample_goals(rng, la * self.extra_time_fraction);
+            ga += self.sample_goals(rng, ma * self.extra_time_fraction);
         }
         match gh.cmp(&ga) {
             std::cmp::Ordering::Greater => a,
@@ -579,16 +606,16 @@ impl Prepared {
     ) -> usize {
         let rate_h = rem_rates.0 * (att[home_ix] - def[away_ix]).exp();
         let rate_a = rem_rates.1 * (att[away_ix] - def[home_ix]).exp();
-        let mut gh = i32::from(current.home) + Self::sample_goals(rng, rate_h);
-        let mut ga = i32::from(current.away) + Self::sample_goals(rng, rate_a);
+        let mut gh = i32::from(current.home) + self.sample_goals(rng, rate_h);
+        let mut ga = i32::from(current.away) + self.sample_goals(rng, rate_a);
         // Extra time and the shootout use full-match strengths (the remaining-rate conditioning
         // only governs the rest of regulation).
         let (eg_h, eg_a) = self.eg[home_ix * self.n + away_ix];
         let la = eg_h * (att[home_ix] - def[away_ix]).exp();
         let ma = eg_a * (att[away_ix] - def[home_ix]).exp();
         if gh == ga {
-            gh += Self::sample_goals(rng, la * self.extra_time_fraction);
-            ga += Self::sample_goals(rng, ma * self.extra_time_fraction);
+            gh += self.sample_goals(rng, la * self.extra_time_fraction);
+            ga += self.sample_goals(rng, ma * self.extra_time_fraction);
         }
         match gh.cmp(&ga) {
             std::cmp::Ordering::Greater => home_ix,
@@ -677,8 +704,8 @@ impl Prepared {
                     let rate_h = rm.rates.0 * (att[rm.home_ix] - def[rm.away_ix]).exp();
                     let rate_a = rm.rates.1 * (att[rm.away_ix] - def[rm.home_ix]).exp();
                     // Final goals = already scored (0 unless in progress) + sampled remainder.
-                    let gh = i32::from(rm.current.home) + Self::sample_goals(rng, rate_h);
-                    let ga = i32::from(rm.current.away) + Self::sample_goals(rng, rate_a);
+                    let gh = i32::from(rm.current.home) + self.sample_goals(rng, rate_h);
+                    let ga = i32::from(rm.current.away) + self.sample_goals(rng, rate_a);
                     apply_result_at(&mut standings, pos[&rm.home_ix], pos[&rm.away_ix], gh, ga);
                 }
                 for (i, (_, s)) in table.iter_mut().enumerate() {
@@ -916,6 +943,48 @@ mod tests {
         fn xg(&self, _home: TeamId, _away: TeamId) -> (f64, f64) {
             (1.3, 1.3)
         }
+    }
+
+    /// Even teams, with a configurable goal-count dispersion.
+    struct DispersedSampler(f64);
+    impl MatchSampler for DispersedSampler {
+        fn xg(&self, _home: TeamId, _away: TeamId) -> (f64, f64) {
+            (1.4, 1.4)
+        }
+        fn dispersion(&self) -> f64 {
+            self.0
+        }
+    }
+
+    #[test]
+    fn overdispersed_sampling_widens_goal_variance() {
+        let mean_var = |disp: f64| -> (f64, f64) {
+            let prep = Prepared::build(
+                &tiny_tournament(),
+                &DispersedSampler(disp),
+                SimConfig::default(),
+                &LiveInputs::default(),
+                LiveConfig::default(),
+            );
+            let mut rng = StdRng::seed_from_u64(1);
+            let n = 20_000;
+            let xs: Vec<f64> = (0..n)
+                .map(|_| prep.sample_goals(&mut rng, 1.4) as f64)
+                .collect();
+            let mean = xs.iter().sum::<f64>() / n as f64;
+            let var = xs.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / n as f64;
+            (mean, var)
+        };
+        let (mp, vp) = mean_var(0.0); // Poisson: variance ~ mean
+        let (mo, vo) = mean_var(4.0); // negative binomial: variance > mean
+        assert!(
+            (mp - 1.4).abs() < 0.1 && (mo - 1.4).abs() < 0.1,
+            "means preserved"
+        );
+        assert!(
+            vo > vp + 0.2,
+            "overdispersed variance {vo} should exceed Poisson {vp}"
+        );
     }
 
     fn epoch() -> chrono::DateTime<chrono::Utc> {
