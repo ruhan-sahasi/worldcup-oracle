@@ -34,6 +34,10 @@ pub struct MatchContext {
     /// (a phase advance, the harder direction to adjust to), negative = westward.
     pub home_tz_shift: f64,
     pub away_tz_shift: f64,
+    /// Match-time temperature in degrees Celsius (venue climate + kickoff hour). Above a comfort
+    /// threshold it suppresses tempo for both sides - a real factor for the midday/afternoon
+    /// kickoffs of a North American summer (Dallas, Monterrey, Miami). 0 is treated as benign.
+    pub temperature_c: f64,
 }
 
 impl Default for MatchContext {
@@ -48,6 +52,7 @@ impl Default for MatchContext {
             away_travel_km: 0.0,
             home_tz_shift: 0.0,
             away_tz_shift: 0.0,
+            temperature_c: 0.0,
         }
     }
 }
@@ -74,6 +79,10 @@ const TRAVEL_SATURATION_KM: f64 = 4000.0;
 const TZ_EAST_WEIGHT: f64 = 0.8; // eastward shift, per hour, toward saturation
 const TZ_WEST_WEIGHT: f64 = 0.4; // westward shift is gentler
 const TZ_SATURATION_HOURS: f64 = 3.0;
+// Heat: comfortable below the threshold; above it, every degree saps tempo, capped for extremes.
+const HEAT_COMFORT_C: f64 = 24.0;
+const HEAT_PER_DEGREE: f64 = 0.012;
+const HEAT_CAP: f64 = 0.12;
 
 /// Per-team `((home_attack, home_defense), (away_attack, away_defense))` log-space deltas
 /// implied by the match context (positive = stronger). Combines additively with lineup
@@ -137,6 +146,14 @@ pub fn context_adjustment(ctx: &MatchContext) -> ((f64, f64), (f64, f64)) {
     };
     home.0 -= fatigue(ctx.home_travel_km, ctx.home_tz_shift);
     away.0 -= fatigue(ctx.away_travel_km, ctx.away_tz_shift);
+
+    // Heat: above a comfort threshold, high temperatures suppress tempo for *both* sides (less
+    // running, more conservative play). Scaling both goal rates down by the same factor also
+    // flattens the favourite's edge - fewer goals make the scoreline noisier, so the underdog's
+    // chance rises. That leveling falls out of the Poisson variance; we model only the tempo cut.
+    let heat = ((ctx.temperature_c - HEAT_COMFORT_C).max(0.0) * HEAT_PER_DEGREE).min(HEAT_CAP);
+    home.0 -= heat;
+    away.0 -= heat;
 
     let clamp = |x: f64| x.clamp(-0.5, 0.5);
     (
@@ -233,5 +250,27 @@ mod tests {
             east < west && west < 0.0,
             "east {east} should be worse than west {west}"
         );
+    }
+
+    #[test]
+    fn heat_suppresses_tempo_for_both_above_comfort() {
+        // A comfortable temperature does nothing; a scorching one lowers both attacks equally.
+        let mild = context_adjustment(&MatchContext {
+            temperature_c: 20.0,
+            ..Default::default()
+        });
+        assert_eq!(mild, ((0.0, 0.0), (0.0, 0.0)));
+
+        let (home, away) = context_adjustment(&MatchContext {
+            temperature_c: 36.0,
+            ..Default::default()
+        });
+        assert!(home.0 < 0.0 && away.0 < 0.0, "heat lowers both attacks");
+        assert!(
+            (home.0 - away.0).abs() < 1e-9,
+            "heat hits both sides equally"
+        );
+        // Defense is untouched: it is a tempo effect, not a strength one.
+        assert_eq!(home.1, 0.0);
     }
 }

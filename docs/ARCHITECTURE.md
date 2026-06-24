@@ -159,8 +159,8 @@ strongest available XI (a missing key player lowers that side and lifts the oppo
 threshold (2), drops that player from the team's next unplayed match. That match's prediction
 and forecast then carry the lineup penalty as a *pre-lineup prior*, superseded by the real
 lineup once it is announced (which on a live feed already excludes the suspended player).
-**Venue/crowd/travel (`MatchContext`)**: host-nation familiarity, Mexico-City-style altitude,
-rest-day differential, plus two signals specific to a continent-spanning 2026:
+**Venue/crowd/travel/heat (`MatchContext`)**: host-nation familiarity, Mexico-City-style altitude,
+rest-day differential, plus three signals specific to a continent-spanning North American summer:
 - **Crowd composition** - a continuous `crowd_support` in [-1, 1] derived from each side's
   expected support in the venue's city (a literal host on home soil packs the stadium; Mexico
   draws a near-home crowd across US venues; otherwise a confederation-level diaspora /
@@ -170,11 +170,29 @@ rest-day differential, plus two signals specific to a continent-spanning 2026:
   signed time-zone shift since a side's last match sap its attack, with **eastward** travel (a
   phase advance) weighted harder than westward. The differential between the two sides is what
   tilts the match, so a team camped in one region is fresher than one criss-crossing the map.
+- **Heat** - the venue's summer high and the local kickoff hour give a match temperature; above a
+  comfort threshold it suppresses tempo for *both* sides. Scaling both goal rates down by the same
+  factor also *flattens the favourite's edge*: fewer goals make the scoreline noisier, so the
+  underdog's chance rises. That leveling falls out of the Poisson variance for free.
 
 All of these (and any pre-lineup suspension penalty) apply to every Monte-Carlo fixture, so they
-reach the champion odds. Squads, xG, venue assignments, and the crowd-pull model are synthetic
-offline; rest days, travel, and time-zone shifts come from the real fixture schedule and venue
-coordinates.
+reach the champion odds. Squads, xG, venue assignments, the crowd-pull model, and heat are
+synthetic offline; rest days, travel, and time-zone shifts come from the real fixture schedule
+and venue coordinates.
+
+### Style matchups (`oracle-model::style` + `oracle-ingest::data`)
+Every other strength signal is *additive* (a team's rating minus its opponent's), which cannot
+represent matchups that defy ratings - a low block frustrating a possession side, a high press
+rattling a slow builder. Each team gets a low-dimensional **style embedding** and a matchup is
+scored by a **bilinear** form `sₕᵀ M sₐ`. With an antisymmetric `M` the interaction is
+**non-transitive** - a rock-paper-scissors cycle (style A troubles B, B troubles C, C troubles A) -
+which is exactly what additive ratings miss. Here the embeddings are unit vectors (a style angle),
+so the form reduces to `K·sin(θₐ − θₕ)`: orthogonal styles give the maximum tilt, identical styles
+none, and swapping the teams flips the sign. The scalar tilts the goal difference and rides the
+same per-match adjustment path as venue/lineup (`data::matchup_adjustments` sums venue and style).
+The embeddings are reasoned-synthetic offline (regional style clusters with per-team jitter); on
+real data they would be fit from match residuals - a low-rank factorization of the part of the
+result that strength alone does not explain.
 
 ### Market prior & benchmark (`oracle-model::implied_probabilities`)
 Decimal odds are inverted and the overround normalized away to recover the bookmaker's

@@ -393,7 +393,8 @@ struct EngineState {
     suspended: HashMap<MatchId, Vec<(TeamId, String)>>,
     live: HashMap<MatchId, LiveMatch>,
     last_forecast: oracle_domain::TournamentForecast,
-    /// Per-match venue/travel adjustments (host, altitude, rest), precomputed once.
+    /// Per-match adjustments precomputed once: venue/crowd/travel/heat context plus the style
+    /// matchup (`data::matchup_adjustments`).
     venue_adj: HashMap<MatchId, VenueAdj>,
     /// Whether the data feed is currently healthy (updated by `SourceStatus` events).
     source_healthy: bool,
@@ -418,8 +419,9 @@ impl EngineState {
         for (team, rating) in deps.elo_seeds {
             ratings.seed(team, rating);
         }
-        // Venue/travel context is static for the tournament, so precompute it once.
-        let venue_adj = oracle_ingest::data::venue_adjustments(&tournament);
+        // Match context (venue/crowd/travel/heat) plus the style matchup is static for the
+        // tournament, so precompute it once.
+        let venue_adj = oracle_ingest::data::matchup_adjustments(&tournament);
         Self {
             tournament,
             names,
@@ -606,8 +608,8 @@ impl EngineState {
         for i in start..self.tournament.matches.len() {
             self.match_index.insert(self.tournament.matches[i].id, i);
         }
-        // Venue/travel context now covers the knockout fixtures too.
-        self.venue_adj = oracle_ingest::data::venue_adjustments(&self.tournament);
+        // Match context + style matchup now cover the knockout fixtures too.
+        self.venue_adj = oracle_ingest::data::matchup_adjustments(&self.tournament);
     }
 
     /// The team's next unplayed match by kickoff (where a suspension would be served).

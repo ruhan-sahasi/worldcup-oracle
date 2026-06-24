@@ -16,7 +16,7 @@
 //! > for real teams, fixtures, and results.
 
 use crate::error::{IngestError, Result};
-use chrono::{TimeZone, Utc};
+use chrono::{TimeZone, Timelike, Utc};
 use oracle_domain::bracket::{resolve_slot, FIXED_R32};
 use oracle_domain::{
     Confederation, Group, Match, MatchId, MatchStatus, Probabilities, Scoreline, Stage, Team,
@@ -24,8 +24,8 @@ use oracle_domain::{
 };
 use oracle_model::poisson::poisson_pmf;
 use oracle_model::{
-    context_adjustment, implied_probabilities, DixonColesConfig, Ensemble, GoalModel, Host,
-    MatchContext, Observation,
+    context_adjustment, implied_probabilities, style_adjustment, DixonColesConfig, Ensemble,
+    GoalModel, Host, MatchContext, Observation, StyleProfile,
 };
 use oracle_ratings::{RatingStore, StateSpaceRatings};
 use rand::rngs::StdRng;
@@ -722,9 +722,10 @@ pub fn load_results_csv(path: impl AsRef<Path>) -> Result<Vec<MatchRecord>> {
 // the host/altitude/rest feature work offline. Rest days are derived from the real gaps
 // between a team's fixtures, so that part is genuine.
 
-/// A 2026 host venue: `(city, host country code, altitude_m, latitude, longitude, summer UTC
-/// offset in hours)`. Offsets are for June/July 2026: US/Canada observe daylight time, while
-/// Mexico does not (it abolished DST nationally in 2022), so its venues sit at UTC-6 year round.
+/// A 2026 host venue. `utc_offset` is the June/July 2026 offset: US/Canada observe daylight time,
+/// while Mexico does not (it abolished DST nationally in 2022), so its venues sit at UTC-6 year
+/// round. `summer_high_c` is a typical June/July afternoon high, used with the kickoff hour to
+/// model match-time heat.
 struct Venue {
     /// Host city, kept for readability of the venue table (not used in the adjustment math).
     #[allow(dead_code)]
@@ -734,6 +735,7 @@ struct Venue {
     lat: f64,
     lon: f64,
     utc_offset: f64,
+    summer_high_c: f64,
 }
 
 const VENUES: &[Venue] = &[
@@ -744,6 +746,7 @@ const VENUES: &[Venue] = &[
         lat: 19.43,
         lon: -99.13,
         utc_offset: -6.0,
+        summer_high_c: 24.0,
     },
     Venue {
         city: "Guadalajara",
@@ -752,6 +755,7 @@ const VENUES: &[Venue] = &[
         lat: 20.67,
         lon: -103.35,
         utc_offset: -6.0,
+        summer_high_c: 30.0,
     },
     Venue {
         city: "Monterrey",
@@ -760,6 +764,7 @@ const VENUES: &[Venue] = &[
         lat: 25.69,
         lon: -100.32,
         utc_offset: -6.0,
+        summer_high_c: 35.0,
     },
     Venue {
         city: "Denver",
@@ -768,6 +773,7 @@ const VENUES: &[Venue] = &[
         lat: 39.74,
         lon: -104.99,
         utc_offset: -6.0,
+        summer_high_c: 31.0,
     },
     Venue {
         city: "Atlanta",
@@ -776,6 +782,7 @@ const VENUES: &[Venue] = &[
         lat: 33.75,
         lon: -84.39,
         utc_offset: -4.0,
+        summer_high_c: 31.0,
     },
     Venue {
         city: "Dallas",
@@ -784,6 +791,7 @@ const VENUES: &[Venue] = &[
         lat: 32.78,
         lon: -96.80,
         utc_offset: -5.0,
+        summer_high_c: 36.0,
     },
     Venue {
         city: "Kansas City",
@@ -792,6 +800,7 @@ const VENUES: &[Venue] = &[
         lat: 39.10,
         lon: -94.58,
         utc_offset: -5.0,
+        summer_high_c: 32.0,
     },
     Venue {
         city: "Los Angeles",
@@ -800,6 +809,7 @@ const VENUES: &[Venue] = &[
         lat: 34.05,
         lon: -118.24,
         utc_offset: -7.0,
+        summer_high_c: 28.0,
     },
     Venue {
         city: "New York",
@@ -808,6 +818,7 @@ const VENUES: &[Venue] = &[
         lat: 40.71,
         lon: -74.01,
         utc_offset: -4.0,
+        summer_high_c: 29.0,
     },
     Venue {
         city: "Miami",
@@ -816,6 +827,7 @@ const VENUES: &[Venue] = &[
         lat: 25.76,
         lon: -80.19,
         utc_offset: -4.0,
+        summer_high_c: 32.0,
     },
     Venue {
         city: "Toronto",
@@ -824,6 +836,7 @@ const VENUES: &[Venue] = &[
         lat: 43.65,
         lon: -79.38,
         utc_offset: -4.0,
+        summer_high_c: 27.0,
     },
     Venue {
         city: "Vancouver",
@@ -832,6 +845,7 @@ const VENUES: &[Venue] = &[
         lat: 49.28,
         lon: -123.12,
         utc_offset: -7.0,
+        summer_high_c: 22.0,
     },
 ];
 
@@ -872,6 +886,64 @@ fn crowd_pull(team: TeamId, venue_country: &str) -> f64 {
         Ofc => 0.15,
     };
     host_cross.max(diaspora)
+}
+
+/// Match-time temperature in Celsius: the venue's summer afternoon high, cooled toward mornings
+/// and evenings by distance from the ~16:00 local peak. Drives the model's heat tempo suppression.
+fn match_temperature(venue: &Venue, kickoff: chrono::DateTime<Utc>) -> f64 {
+    let local_hour = (f64::from(kickoff.hour()) + venue.utc_offset).rem_euclid(24.0);
+    let cooling = ((local_hour - 16.0).abs() * 1.3).min(12.0);
+    venue.summer_high_c - cooling
+}
+
+/// A team's synthetic playing-style embedding: confederations sit at different angles on the
+/// style circle (regional football cultures), with deterministic per-team jitter so teams within
+/// a confederation still differ. On real data these would be fit from match residuals; here they
+/// are reasoned-synthetic, like the squads and crowd model.
+fn style_profile(team: TeamId) -> StyleProfile {
+    let Some(&(_, _, conf, _)) = TEAMS.get(team.0 as usize) else {
+        return StyleProfile::neutral();
+    };
+    let conf_index: f64 = match conf {
+        Conmebol => 0.0,
+        Uefa => 1.0,
+        Caf => 2.0,
+        Afc => 3.0,
+        Concacaf => 4.0,
+        Ofc => 5.0,
+    };
+    let conf_angle = conf_index * std::f64::consts::TAU / 6.0;
+    let mut rng = StdRng::seed_from_u64(0x5713_2026 ^ u64::from(team.0));
+    let theta = conf_angle + rng.gen_range(-0.6..0.6);
+    StyleProfile::new([theta.cos(), theta.sin()])
+}
+
+/// Per-match style matchup adjustments (the bilinear style tilt from `oracle-model`), keyed by
+/// match id, in the same log-space `((home_atk, home_def), (away_atk, away_def))` shape as venue.
+pub fn style_adjustments(tournament: &Tournament) -> HashMap<MatchId, VenueAdj> {
+    tournament
+        .matches
+        .iter()
+        .map(|m| {
+            let adj = style_adjustment(&style_profile(m.home), &style_profile(m.away));
+            (m.id, adj)
+        })
+        .collect()
+}
+
+/// Every per-match log-space adjustment that applies to a fixture: venue/crowd/travel context
+/// plus the style matchup, summed componentwise. This is what the engine and CLI feed to the
+/// Monte-Carlo (and the engine's single-match prediction), so all context reaches the forecast.
+pub fn matchup_adjustments(tournament: &Tournament) -> HashMap<MatchId, VenueAdj> {
+    let mut adj = venue_adjustments(tournament);
+    for (id, ((sha, shd), (saa, sad))) in style_adjustments(tournament) {
+        let e = adj.entry(id).or_default();
+        e.0 .0 += sha;
+        e.0 .1 += shd;
+        e.1 .0 += saa;
+        e.1 .1 += sad;
+    }
+    adj
 }
 
 /// A per-team venue/travel adjustment: `((home_attack, home_defense), (away_attack,
@@ -974,6 +1046,7 @@ pub fn match_contexts(tournament: &Tournament) -> HashMap<MatchId, MatchContext>
                 away_travel_km: away_km,
                 home_tz_shift: home_tz,
                 away_tz_shift: away_tz,
+                temperature_c: match_temperature(v, m.kickoff),
             };
             (m.id, ctx)
         })
@@ -1217,6 +1290,58 @@ mod tests {
         // New York (idx 8) to Los Angeles (idx 7) is ~3,940 km.
         let km = haversine_km(&VENUES[8], &VENUES[7]);
         assert!((km - 3940.0).abs() < 150.0, "NY-LA distance was {km:.0} km");
+    }
+
+    #[test]
+    fn match_temperature_peaks_in_the_afternoon_and_tracks_the_venue() {
+        let dallas = &VENUES[5]; // hot: 36C high, UTC-5
+        let vancouver = &VENUES[11]; // mild: 22C high, UTC-7
+                                     // 21:00 UTC = 16:00 local in Dallas -> at the afternoon peak.
+        let mid = chrono::DateTime::from_timestamp(0, 0)
+            .unwrap()
+            .with_hour(21)
+            .unwrap();
+        let hot = match_temperature(dallas, mid);
+        assert!(
+            (hot - dallas.summer_high_c).abs() < 0.5,
+            "afternoon peak ~ high"
+        );
+        // A late-evening kickoff is cooler than the afternoon one at the same venue.
+        let late = mid.with_hour(3).unwrap(); // 22:00 local previous day
+        assert!(match_temperature(dallas, late) < hot, "evening is cooler");
+        // The mild venue is cooler than the hot one at the same instant.
+        assert!(match_temperature(vancouver, mid) < hot);
+    }
+
+    #[test]
+    fn style_profiles_are_unit_vectors_and_tilt_is_antisymmetric() {
+        let id = |code: &str| TeamId(TEAMS.iter().position(|t| t.1 == code).unwrap() as u32);
+        for code in ["ARG", "FRA", "JPN", "MAR", "NZL"] {
+            let s = style_profile(id(code));
+            let norm = (s.axes[0].powi(2) + s.axes[1].powi(2)).sqrt();
+            assert!((norm - 1.0).abs() < 1e-9, "{code} style is a unit vector");
+        }
+        // The matchup adjustment is antisymmetric: home's tilt is the negative of away's.
+        let adj =
+            oracle_model::style_adjustment(&style_profile(id("ARG")), &style_profile(id("JPN")));
+        assert!((adj.0 .0 + adj.1 .0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn matchup_adjustments_add_style_on_top_of_venue() {
+        let t = world_cup_2026();
+        let venue = venue_adjustments(&t);
+        let full = matchup_adjustments(&t);
+        assert_eq!(full.len(), t.matches.len());
+        // For at least one match the combined adjustment differs from venue alone (style added).
+        let changed = t
+            .matches
+            .iter()
+            .any(|m| full[&m.id].0 .0 != venue[&m.id].0 .0);
+        assert!(
+            changed,
+            "style should perturb some matches beyond venue context"
+        );
     }
 
     #[test]

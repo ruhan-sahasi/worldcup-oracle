@@ -52,7 +52,8 @@ fully offline with **zero keys and zero network**.
 | **Bayesian live updater** with **score effects** | conditions on score, minute, and red cards; a trailing team chases and a leading team defends |
 | **Lineup adjustment** | a confirmed XI shifts each team's attack and defense |
 | **Suspension tracking** | yellow-card accumulation drops a suspended starter from the next match before its lineup is known |
-| **Venue, crowd & travel context** | host advantage, altitude, rest-day differential, a continuous **crowd-partisanship** signal (diaspora / traveling fans, not just literal hosts), and **continental travel + time-zone load** (eastward trips bite harder) adjust each match |
+| **Venue, crowd, travel & heat context** | host advantage, altitude, rest-day differential, a continuous **crowd-partisanship** signal (diaspora / traveling fans, not just literal hosts), **continental travel + time-zone load** (eastward trips bite harder), and **match-time heat** (afternoon kickoffs in Dallas/Monterrey/Miami suppress tempo, which also flattens the favourite's edge) adjust each match |
+| **Style matchup** (a low-rank style embedding per team, scored by a **bilinear** `sₕᵀ M sₐ` form) | a **non-transitive** rock-paper-scissors edge that additive ratings cannot represent (style A troubles style B) |
 | **Monte-Carlo** (rayon-parallel, **conditions in-progress matches** on their live score; the **fixed 2026 knockout bracket**; knockouts go to **extra time + a near-50/50 shootout**; **resamples team strength each iteration**) | tournament-level champion odds that move with live results and carry parameter uncertainty |
 
 Calibration is measured with proper scoring rules (Brier, log-loss), benchmarked against
@@ -286,9 +287,12 @@ cargo bench -p oracle-sim       # Monte-Carlo throughput
   adapter ingests results (and **line-ups** on tiers that expose them); odds and xG are not
   offered by that provider, so they come from the CSV path or a dedicated source. Rest days,
   inter-venue **travel distance**, and **time-zone shifts** are derived from the real fixture
-  schedule and venue coordinates; the **crowd-partisanship** signal is a reasoned synthetic model
-  (host on home soil, Mexico's reach across US venues, confederation-level diaspora pull), not
-  measured attendance data.
+  schedule and venue coordinates. **Match-time heat** comes from each venue's typical summer high
+  and the local kickoff hour. The **crowd-partisanship** and **playing-style** signals are
+  reasoned-synthetic models (crowd: host on home soil, Mexico's reach across US venues,
+  confederation-level diaspora pull; style: regional style clusters with per-team jitter), not
+  measured attendance or fitted style embeddings - on real data the style vectors would be fit
+  from match residuals.
 - Knockout ties go to extra time and a near-50/50 shootout, and the simulator plays the **fixed
   2026 knockout bracket** (group winners/runners-up/best thirds placed in their real R32 slots)
   when the tournament has the real shape. Once the group stage finishes, the engine **materializes

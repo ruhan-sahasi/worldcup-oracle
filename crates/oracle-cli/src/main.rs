@@ -166,9 +166,10 @@ fn cmd_simulate(iters: u64, seed: u64, top: usize) -> anyhow::Result<()> {
         "Simulating {} - {} iterations (seed {})...\n",
         tournament.name, iters, seed
     );
-    // Apply the venue/travel context (host advantage, altitude, rest) to every fixture.
+    // Apply the full match context (host, crowd, altitude, rest, travel, heat) plus the style
+    // matchup to every fixture.
     let inputs = LiveInputs {
-        venue: data::venue_adjustments(&tournament),
+        venue: data::matchup_adjustments(&tournament),
         ..Default::default()
     };
     let start = Instant::now();
