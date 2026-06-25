@@ -319,12 +319,13 @@ cargo bench -p oracle-sim       # Monte-Carlo throughput
   documented in the code.
 - The goal model **learns in-tournament** two ways: a one-step online Poisson update on the
   Dixon-Coles coefficients, and a full **state-space (Kalman) rating** that carries each team's
-  strength as a Gaussian and updates its mean *and* variance from every result. That variance
-  feeds the Monte-Carlo, which propagates **parameter uncertainty** by resampling each team's
-  strength per iteration (so champion odds are not over-concentrated), though that is a Gaussian
-  approximation, not a full Bayesian posterior. Deliberately deferred: **squad market value**
-  (largely redundant with the strength ratings offline) and **stakes / dead-rubber rotation**
-  (speculative).
+  strength as a Gaussian and updates its mean *and* variance from every result. The Monte-Carlo
+  propagates **parameter uncertainty** by resampling each team's strength per iteration from a
+  **Laplace (Fisher-information) posterior** (`1/sqrt(ridge + Fisher info)`), so champion odds are
+  not over-concentrated. That is a Gaussian posterior around the MAP - the tractable, sampler-free
+  treatment; a full HMC / variational posterior is the deeper future version. Deliberately
+  deferred: **squad market value** (largely redundant with the strength ratings offline) and
+  **stakes / dead-rubber rotation** (speculative).
 
 ## 📄 License
 

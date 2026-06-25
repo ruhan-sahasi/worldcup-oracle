@@ -256,13 +256,16 @@ knockout level on the scoreline (a penalty decision the event model does not rec
 to the home side - a small documented limitation.
 
 Crucially, each iteration also **resamples every team's strength** from its uncertainty, so the
-forecast carries **parameter uncertainty**, not just match variance. The engine supplies a
-per-team log-rate SD from the dynamic state-space rating (`LiveInputs::rating_sigma`); absent
-that, the sampler's own static fit-based uncertainty (`MatchSampler::rating_stderr`) is used.
-Data-poor or thinly-observed teams wobble more, which fattens the tails and stops champion odds
-from being over-concentrated, the failure mode of treating point-estimate ratings as certain.
-The `SimConfig::rating_uncertainty` multiplier scales (or disables, at 0) the effect; it is a
-Gaussian approximation, not a full Bayesian posterior.
+forecast carries **parameter uncertainty**, not just match variance. The per-team log-rate SD is
+the goal model's **Laplace (Fisher-information) posterior** (`strength_uncertainty`): treating the
+ridge penalty as a Gaussian prior, the posterior precision is `prior + Fisher information`, so the
+SD is `1 / sqrt(ridge + Σ wᵢ·rateᵢ)` - principled, and tighter for a well-observed team than for a
+thinly-observed one. The engine can override this with the dynamic state-space rating's SD
+(`LiveInputs::rating_sigma`). Data-poor teams wobble more, which fattens the tails and stops
+champion odds from being over-concentrated, the failure mode of treating point-estimate ratings as
+certain. The `SimConfig::rating_uncertainty` multiplier scales (or disables, at 0) the effect. The
+Laplace approximation is a Gaussian posterior around the MAP - the tractable, sampler-free
+treatment; a full HMC/variational posterior is the deeper future version.
 
 ### Calibration (`oracle-model::reliability`)
 Beyond Brier and log loss, `reliability` bins predictions by confidence and compares

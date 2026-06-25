@@ -159,10 +159,16 @@ pub struct GoalModel {
     max_goals: usize,
     attack: HashMap<TeamId, f64>,
     defense: HashMap<TeamId, f64>,
-    /// Total time-decay weight of the matches that informed each team, used to gauge how
-    /// confident the team's rating is (more data -> lower strength uncertainty).
+    /// Per-team **Fisher information** at the fitted optimum (`Σ wᵢ · rateᵢ` over the team's
+    /// matches). With the ridge prior precision it gives a Laplace posterior standard deviation
+    /// per team (see [`strength_uncertainty`](Self::strength_uncertainty)): more (and more recent)
+    /// data means more information, hence a tighter posterior.
     #[serde(default)]
-    match_weight: HashMap<TeamId, f64>,
+    fisher_info: HashMap<TeamId, f64>,
+    /// Prior precision (the ridge strength) used in the fit, i.e. the precision of the Gaussian
+    /// prior the L2 penalty corresponds to. Adds to the Fisher information in the Laplace posterior.
+    #[serde(default)]
+    ridge_prior: f64,
     /// Each team's confederation (when supplied to the hierarchical fit), so the fitted
     /// confederation strength levels can be reported. Empty for the confederation-agnostic model.
     #[serde(default)]
@@ -182,7 +188,8 @@ impl Default for GoalModel {
             max_goals: 10,
             attack: HashMap::new(),
             defense: HashMap::new(),
-            match_weight: HashMap::new(),
+            fisher_info: HashMap::new(),
+            ridge_prior: 0.0,
             confederation: HashMap::new(),
         }
     }
@@ -238,13 +245,6 @@ impl GoalModel {
             .map(|o| (-config.xi * o.age_days).exp())
             .collect();
         let total_weight: f64 = weights.iter().sum();
-
-        // How much (time-decayed) data informed each team, for the strength-uncertainty.
-        let mut match_weight: HashMap<TeamId, f64> = teams.iter().map(|&t| (t, 0.0)).collect();
-        for (o, &w) in observations.iter().zip(&weights) {
-            *match_weight.get_mut(&o.home).unwrap() += w;
-            *match_weight.get_mut(&o.away).unwrap() += w;
-        }
 
         let mut attack: HashMap<TeamId, f64> = teams.iter().map(|&t| (t, 0.0)).collect();
         let mut defense: HashMap<TeamId, f64> = teams.iter().map(|&t| (t, 0.0)).collect();
@@ -354,6 +354,17 @@ impl GoalModel {
         }
         intercept += mean_a - mean_d;
 
+        // Per-team Fisher information at the fitted optimum: `Σ wᵢ · rateᵢ` over the team's
+        // matches (the Poisson information for its attacking log-rate). Feeds the Laplace
+        // posterior standard deviation the Monte-Carlo resamples from.
+        let mut fisher_info: HashMap<TeamId, f64> = teams.iter().map(|&t| (t, 0.0)).collect();
+        for (o, &w) in observations.iter().zip(&weights) {
+            let lambda = (intercept + attack[&o.home] - defense[&o.away] + home_advantage).exp();
+            let mu = (intercept + attack[&o.away] - defense[&o.home]).exp();
+            *fisher_info.get_mut(&o.home).unwrap() += w * lambda;
+            *fisher_info.get_mut(&o.away).unwrap() += w * mu;
+        }
+
         // ---- Fit the dependence parameter on the fully-corrected (integer-goal) likelihood.
         let (rho, covariance) = match config.model {
             ScoreModel::Independent => (
@@ -405,7 +416,8 @@ impl GoalModel {
             max_goals: config.max_goals,
             attack,
             defense,
-            match_weight,
+            fisher_info,
+            ridge_prior: config.ridge,
             confederation: confederations.clone(),
         }
     }
@@ -429,20 +441,20 @@ impl GoalModel {
             .collect()
     }
 
-    /// Log-space standard deviation of a team's attack/defense rating, reflecting how much
-    /// data informed it: a team with little match history is more uncertain. Used by the
-    /// Monte-Carlo to resample team strength per iteration, so champion odds are not
-    /// over-concentrated (a point estimate treated as certain). Returns 0 for the default
-    /// (data-free) model.
+    /// Log-space standard deviation of a team's strength: the **Laplace (Fisher-information)
+    /// posterior** standard deviation at the fitted optimum. Treating the ridge penalty as a
+    /// Gaussian prior, the posterior precision is `prior + Fisher information`, so the SD is
+    /// `1 / sqrt(ridge + Σ wᵢ·rateᵢ)` - it shrinks as a team accumulates (recent) data and is
+    /// wide for a thinly-observed team. The Monte-Carlo resamples each team's strength from this
+    /// once per iteration, so champion odds carry parameter uncertainty rather than treating a
+    /// point estimate as certain. Returns 0 for the default (data-free) model.
     pub fn strength_uncertainty(&self, team: TeamId) -> f64 {
-        // SE ~ sigma0 / sqrt(effective sample size), floored so a thin record stays bounded.
-        const SIGMA0: f64 = 1.0;
-        const CAP: f64 = 0.6;
-        let weight = self.match_weight.get(&team).copied().unwrap_or(0.0);
-        if weight <= 0.0 {
+        const CAP: f64 = 0.6; // a thinly-observed team stays bounded
+        let info = self.fisher_info.get(&team).copied().unwrap_or(0.0);
+        if info <= 0.0 {
             return 0.0;
         }
-        (SIGMA0 / weight.max(1.0).sqrt()).min(CAP)
+        (1.0 / (self.ridge_prior + info).sqrt()).min(CAP)
     }
 
     /// The fitted bivariate-Poisson covariance term (`0` for the independent model).
