@@ -99,11 +99,14 @@ Bivariate Poisson: a shared component `λ3` induces positive correlation directl
 recovers independence.
 
 Parameters are fit by **maximum likelihood** on historical results, each weighted by
-`exp(−ξ · age_days)` so recent form counts more. The attack/defense/intercept/home terms
-ascend the time-weighted Poisson log-likelihood, with a **backtracking, convergence-checked
-step**: a step that fails to improve the objective is rolled back and the learning rate
-halved, so the fit cannot oscillate or diverge and stops once it settles. The dependence
-parameter (`ρ` or `λ3`) is then fit by a 1-D search over the fully-corrected likelihood.
+`exp(−ξ · age_days)` so recent form counts more. The attack/defense/intercept/home terms are
+found by **L-BFGS** (`lbfgs`): the coefficients are packed into one vector and minimized against
+the penalized negative log-likelihood, with the last few curvature pairs approximating the
+inverse Hessian (two-loop recursion) and a backtracking Armijo line search guaranteeing descent.
+It converges in tens of iterations where the previous hand-rolled gradient ascent took hundreds,
+and finds a slightly better optimum (the backtest confirms it). The gauge is pinned afterward by
+folding the coefficient means into the intercept, which leaves every prediction unchanged. The
+dependence parameter (`ρ` or `λ3`) is then fit by a 1-D search over the fully-corrected likelihood.
 When **expected goals (xG)** are attached to an observation the fit regresses on them
 instead of the realized goals: xG is a much lower-noise signal (a team can dominate xG and
 lose), so the same estimating equation gives a sharper model. An **L2 (ridge)** penalty

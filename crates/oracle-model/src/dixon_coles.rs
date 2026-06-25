@@ -259,112 +259,100 @@ impl GoalModel {
         let mut intercept = avg_goals.max(0.2).ln();
         let mut home_advantage = 0.25_f64;
 
-        // The time-weighted Poisson mean-fit log-likelihood: exactly what the gradient step
-        // ascends (regressing the marginal rates on the targets), so it is the right
-        // objective to monitor for convergence and to guard against an overshooting step.
-        let mean_ll = |attack: &HashMap<TeamId, f64>,
-                       defense: &HashMap<TeamId, f64>,
-                       intercept: f64,
-                       home: f64|
-         -> f64 {
-            observations
+        // ---- Fit by L-BFGS on the penalized negative log-likelihood. The coefficients are
+        // packed into one vector `[attack.., defense.., intercept, home]`; the penalty is the
+        // ridge toward the (hierarchical) pooling target. An outer loop refreshes the
+        // confederation-mean targets between solves (a block-coordinate / MM scheme) so each
+        // inner objective is well defined and its gradient exact. L-BFGS converges in tens of
+        // iterations where the old hand-rolled gradient ascent took hundreds.
+        let index: HashMap<TeamId, usize> =
+            teams.iter().enumerate().map(|(i, &t)| (t, i)).collect();
+        let dim = 2 * teams.len() + 2;
+        let n_t = teams.len();
+        let ridge = config.ridge;
+
+        let mut x = vec![0.0; dim];
+        x[2 * n_t] = intercept;
+        x[2 * n_t + 1] = home_advantage;
+
+        // Pooling targets (toward 0 = plain ridge when there are no confederations).
+        let mut ta = vec![0.0; n_t];
+        let mut td = vec![0.0; n_t];
+        let outer_passes = if confederations.is_empty() { 1 } else { 4 };
+        for _ in 0..outer_passes {
+            {
+                // Penalized negative log-likelihood and its gradient at `xv`.
+                let eval = |xv: &[f64]| -> (f64, Vec<f64>) {
+                    let mut grad = vec![0.0; dim];
+                    let mut nll = 0.0;
+                    let (icpt, home) = (xv[2 * n_t], xv[2 * n_t + 1]);
+                    for (o, &w) in observations.iter().zip(&weights) {
+                        let (hi, ai) = (index[&o.home], index[&o.away]);
+                        let lambda = (icpt + xv[hi] - xv[n_t + ai] + home).exp();
+                        let mu = (icpt + xv[ai] - xv[n_t + hi]).exp();
+                        nll -= w
+                            * (o.target_home() * lambda.max(1e-12).ln() - lambda
+                                + o.target_away() * mu.max(1e-12).ln()
+                                - mu);
+                        let res_h = o.target_home() - lambda;
+                        let res_a = o.target_away() - mu;
+                        // Gradient of the negative log-likelihood (so the LL score is negated).
+                        grad[hi] -= w * res_h;
+                        grad[ai] -= w * res_a;
+                        grad[n_t + ai] += w * res_h;
+                        grad[n_t + hi] += w * res_a;
+                        grad[2 * n_t] -= w * (res_h + res_a);
+                        grad[2 * n_t + 1] -= w * res_h;
+                    }
+                    // Ridge penalty toward the (fixed-this-pass) pooling targets.
+                    for i in 0..n_t {
+                        let (ea, ed) = (xv[i] - ta[i], xv[n_t + i] - td[i]);
+                        nll += 0.5 * ridge * (ea * ea + ed * ed);
+                        grad[i] += ridge * ea;
+                        grad[n_t + i] += ridge * ed;
+                    }
+                    (nll, grad)
+                };
+                x = lbfgs(x, &eval, config.iterations, config.tol);
+            }
+            if confederations.is_empty() {
+                break;
+            }
+            // Refresh confederation-mean targets from the current solution.
+            let attack_now: HashMap<TeamId, f64> =
+                teams.iter().enumerate().map(|(i, &t)| (t, x[i])).collect();
+            let defense_now: HashMap<TeamId, f64> = teams
                 .iter()
-                .zip(&weights)
-                .map(|(o, &w)| {
-                    let lambda = (intercept + attack[&o.home] - defense[&o.away] + home).exp();
-                    let mu = (intercept + attack[&o.away] - defense[&o.home]).exp();
-                    w * (o.target_home() * lambda.max(1e-12).ln() - lambda
-                        + o.target_away() * mu.max(1e-12).ln()
-                        - mu)
-                })
-                .sum()
-        };
-
-        // ---- Gradient ascent to convergence, with an objective-monotone (backtracking)
-        // step: a step that fails to improve the objective is rolled back and the learning
-        // rate halved, so the fit cannot oscillate or diverge and stops once it has settled.
-        let mut lr = config.learning_rate;
-        let mut prev_ll = mean_ll(&attack, &defense, intercept, home_advantage);
-        for _ in 0..config.iterations {
-            let mut g_attack: HashMap<TeamId, f64> = teams.iter().map(|&t| (t, 0.0)).collect();
-            let mut g_defense: HashMap<TeamId, f64> = teams.iter().map(|&t| (t, 0.0)).collect();
-            let mut g_intercept = 0.0;
-            let mut g_home = 0.0;
-
-            for (o, &w) in observations.iter().zip(&weights) {
-                let a_h = attack[&o.home];
-                let a_a = attack[&o.away];
-                let d_h = defense[&o.home];
-                let d_a = defense[&o.away];
-                let lambda = (intercept + a_h - d_a + home_advantage).exp();
-                let mu = (intercept + a_a - d_h).exp();
-
-                // Regress on xG when present (sharper than goals); the Poisson score
-                // equation `target - rate` is a valid estimating equation either way.
-                let res_h = o.target_home() - lambda; // ∂/∂(logλ)
-                let res_a = o.target_away() - mu; // ∂/∂(logμ)
-
-                *g_attack.get_mut(&o.home).unwrap() += w * res_h;
-                *g_attack.get_mut(&o.away).unwrap() += w * res_a;
-                *g_defense.get_mut(&o.away).unwrap() -= w * res_h;
-                *g_defense.get_mut(&o.home).unwrap() -= w * res_a;
-                g_intercept += w * (res_h + res_a);
-                g_home += w * res_h;
-            }
-
-            // Snapshot so a non-improving step can be rolled back.
-            let (snap_a, snap_d, snap_i, snap_h) =
-                (attack.clone(), defense.clone(), intercept, home_advantage);
-
-            let step = lr / total_weight;
-            let shrink = lr * config.ridge;
-            // Hierarchical pooling target: each team is shrunk toward `POOL ×` its confederation
-            // mean (toward 0 when no confederations are supplied, recovering the plain ridge).
-            let (cm_attack, cm_defense) = if confederations.is_empty() {
-                (HashMap::new(), HashMap::new())
-            } else {
-                confederation_means(&teams, &attack, &defense, confederations)
-            };
-            let pool_target = |t: &TeamId, means: &HashMap<Confederation, f64>| -> f64 {
-                match confederations.get(t) {
-                    Some(c) => CONFEDERATION_POOL * means.get(c).copied().unwrap_or(0.0),
-                    None => 0.0,
+                .enumerate()
+                .map(|(i, &t)| (t, x[n_t + i]))
+                .collect();
+            let (cm_a, cm_d) =
+                confederation_means(&teams, &attack_now, &defense_now, confederations);
+            for (i, &t) in teams.iter().enumerate() {
+                if let Some(c) = confederations.get(&t) {
+                    ta[i] = CONFEDERATION_POOL * cm_a.get(c).copied().unwrap_or(0.0);
+                    td[i] = CONFEDERATION_POOL * cm_d.get(c).copied().unwrap_or(0.0);
                 }
-            };
-            for t in &teams {
-                let (a, d) = (attack[t], defense[t]);
-                let (ta, td) = (pool_target(t, &cm_attack), pool_target(t, &cm_defense));
-                // Gradient ascent on the log-likelihood, minus an L2 penalty toward the
-                // (confederation) pooling target.
-                *attack.get_mut(t).unwrap() += step * g_attack[t] - shrink * (a - ta);
-                *defense.get_mut(t).unwrap() += step * g_defense[t] - shrink * (d - td);
             }
-            intercept += step * g_intercept;
-            home_advantage += step * g_home;
-
-            // Identifiability: pin mean(attack) = mean(defense) = 0 so the levels are
-            // absorbed by the intercept rather than drifting freely.
-            recenter(&mut attack);
-            recenter(&mut defense);
-
-            let ll = mean_ll(&attack, &defense, intercept, home_advantage);
-            if !ll.is_finite() || ll < prev_ll {
-                // Overshoot: undo the step and take a smaller one next time.
-                attack = snap_a;
-                defense = snap_d;
-                intercept = snap_i;
-                home_advantage = snap_h;
-                lr *= 0.5;
-                if lr <= 1e-9 {
-                    break;
-                }
-                continue;
-            }
-            if ll - prev_ll <= config.tol * prev_ll.abs().max(1.0) {
-                break; // converged
-            }
-            prev_ll = ll;
         }
+
+        // Unpack and pin the gauge: fold the coefficient means into the intercept (which leaves
+        // every prediction unchanged) so mean(attack) = mean(defense) = 0.
+        for (i, &t) in teams.iter().enumerate() {
+            attack.insert(t, x[i]);
+            defense.insert(t, x[n_t + i]);
+        }
+        intercept = x[2 * n_t];
+        home_advantage = x[2 * n_t + 1];
+        let mean_a: f64 = attack.values().sum::<f64>() / n_t as f64;
+        let mean_d: f64 = defense.values().sum::<f64>() / n_t as f64;
+        for v in attack.values_mut() {
+            *v -= mean_a;
+        }
+        for v in defense.values_mut() {
+            *v -= mean_d;
+        }
+        intercept += mean_a - mean_d;
 
         // ---- Fit the dependence parameter on the fully-corrected (integer-goal) likelihood.
         let (rho, covariance) = match config.model {
@@ -621,14 +609,109 @@ fn tau(x: usize, y: usize, lambda: f64, mu: f64, rho: f64) -> f64 {
     .max(0.0001) // keep the likelihood strictly positive
 }
 
-fn recenter(map: &mut HashMap<TeamId, f64>) {
-    if map.is_empty() {
-        return;
+fn dot(a: &[f64], b: &[f64]) -> f64 {
+    a.iter().zip(b).map(|(x, y)| x * y).sum()
+}
+
+/// Minimize a smooth function by **limited-memory BFGS**. `eval(x) -> (value, gradient)` returns
+/// the objective and its gradient; the last `M` curvature pairs approximate the inverse Hessian
+/// via the two-loop recursion, and a backtracking Armijo line search guarantees descent. Curvature
+/// pairs with non-positive `sᵀy` are skipped (the standard safeguard). Converges in tens of
+/// iterations on the goal-model likelihood where plain gradient ascent needed hundreds.
+fn lbfgs<F: Fn(&[f64]) -> (f64, Vec<f64>)>(
+    mut x: Vec<f64>,
+    eval: &F,
+    max_iter: usize,
+    tol: f64,
+) -> Vec<f64> {
+    const M: usize = 8;
+    let n = x.len();
+    let (mut s_hist, mut y_hist, mut rho_hist): (Vec<Vec<f64>>, Vec<Vec<f64>>, Vec<f64>) =
+        (Vec::new(), Vec::new(), Vec::new());
+    let (mut f, mut g) = eval(&x);
+
+    for _ in 0..max_iter {
+        let gnorm = dot(&g, &g).sqrt();
+        if gnorm < tol {
+            break;
+        }
+        // Two-loop recursion: q := H·g, the (approximate) Newton direction's negative.
+        let mut q = g.clone();
+        let k = s_hist.len();
+        let mut alpha = vec![0.0; k];
+        for i in (0..k).rev() {
+            let a = rho_hist[i] * dot(&s_hist[i], &q);
+            alpha[i] = a;
+            for j in 0..n {
+                q[j] -= a * y_hist[i][j];
+            }
+        }
+        let gamma = if k > 0 {
+            (dot(&s_hist[k - 1], &y_hist[k - 1]) / dot(&y_hist[k - 1], &y_hist[k - 1]).max(1e-12))
+                .max(1e-8)
+        } else {
+            1.0
+        };
+        for v in q.iter_mut() {
+            *v *= gamma;
+        }
+        for i in 0..k {
+            let b = rho_hist[i] * dot(&y_hist[i], &q);
+            for j in 0..n {
+                q[j] += (alpha[i] - b) * s_hist[i][j];
+            }
+        }
+        let mut dir: Vec<f64> = q.iter().map(|v| -v).collect();
+        let mut dg = dot(&dir, &g);
+        if !dg.is_finite() || dg > 0.0 {
+            // Not a descent direction: fall back to steepest descent.
+            dir = g.iter().map(|v| -v).collect();
+            dg = dot(&dir, &g);
+        }
+
+        // Backtracking Armijo line search.
+        let mut step = if k == 0 { (1.0 / gnorm).min(1.0) } else { 1.0 };
+        let mut x_new = x.clone();
+        let mut accepted: Option<(f64, Vec<f64>)> = None;
+        for _ in 0..40 {
+            for j in 0..n {
+                x_new[j] = x[j] + step * dir[j];
+            }
+            let (fn_, gn_) = eval(&x_new);
+            if fn_.is_finite() && fn_ <= f + 1e-4 * step * dg {
+                accepted = Some((fn_, gn_));
+                break;
+            }
+            step *= 0.5;
+        }
+        let Some((f_new, g_new)) = accepted else {
+            break; // line search stalled: treat as converged
+        };
+
+        let s: Vec<f64> = (0..n).map(|j| step * dir[j]).collect();
+        let y: Vec<f64> = (0..n).map(|j| g_new[j] - g[j]).collect();
+        let sy = dot(&s, &y);
+        if sy > 1e-10 {
+            if s_hist.len() == M {
+                s_hist.remove(0);
+                y_hist.remove(0);
+                rho_hist.remove(0);
+            }
+            rho_hist.push(1.0 / sy);
+            s_hist.push(s);
+            y_hist.push(y);
+        }
+
+        let improved = (f - f_new).abs();
+        x = x_new.clone();
+        let prev_f = f;
+        f = f_new;
+        g = g_new;
+        if improved <= tol * prev_f.abs().max(1.0) {
+            break; // converged
+        }
     }
-    let mean: f64 = map.values().sum::<f64>() / map.len() as f64;
-    for v in map.values_mut() {
-        *v -= mean;
-    }
+    x
 }
 
 /// One-dimensional search for the ρ that maximizes the time-weighted corrected
@@ -850,14 +933,15 @@ mod tests {
             confs.insert(t(id), Afc); // weak confederation
         }
         let mut obs = Vec::new();
-        // Strong UEFA teams 1-3 thrash weak AFC teams 4-6 repeatedly.
+        // Strong UEFA teams 1-3 thrash weak AFC teams 4-6 repeatedly, alternating venue so the
+        // gap lands in attack/defense rather than being absorbed by home advantage.
         for i in 0..30u32 {
-            obs.push(Observation::new(
-                t(1 + i % 3),
-                t(4 + i % 3),
-                Scoreline::new(3, 0),
-                i as f64,
-            ));
+            let (uefa, afc) = (t(1 + i % 3), t(4 + i % 3));
+            if i % 2 == 0 {
+                obs.push(Observation::new(uefa, afc, Scoreline::new(3, 0), i as f64));
+            } else {
+                obs.push(Observation::new(afc, uefa, Scoreline::new(0, 3), i as f64));
+            }
         }
         // Team 7 (UEFA) is data-poor: two modest draws, so its own record looks average.
         obs.push(Observation::new(t(7), t(4), Scoreline::new(1, 1), 1.0));

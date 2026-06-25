@@ -147,27 +147,27 @@ cargo run --release -p oracle-cli -- backtest --cv 5   # rolling-origin CV with 
   Model                   Brier   LogLoss      Acc
   ------------------------------------------------
   Uniform baseline       0.6667    1.0986    33.3%
-  Dixon-Coles (goals)    0.6192    1.0311    50.1%
-  Dixon-Coles (xG)       0.6171    1.0282    50.5%
+  Dixon-Coles (goals)    0.6168    1.0284    50.1%
+  Dixon-Coles (xG)       0.6097    1.0182    50.7%
   Elo                    0.6515    1.1080    48.1%
-  Ensemble (+Market)     0.6179    1.0298    50.0%
+  Ensemble (+Market)     0.6170    1.0286    49.5%
   Market (bookmaker)     0.6095    1.0180    50.5%
 
-  learned weights: DC 0.37 / Elo 0.24 / Market 0.39   temperature 0.78
+  learned weights: DC 0.38 / Elo 0.24 / Market 0.38   temperature 0.73
 
   Ensemble calibration (ECE 0.030):
           bucket   predicted   empirical        n
-       0-20 %         17.4%      21.1%      109
-      20-40 %         29.5%      27.8%     1744
-      40-60 %         47.6%      53.9%      512
-      60-80 %         64.5%      45.7%       35
+       0-20 %         17.6%      21.8%      110
+      20-40 %         29.5%      27.7%     1745
+      40-60 %         47.6%      54.0%      502
+      60-80 %         64.2%      51.2%       43
 ```
 
 Three things are visible here. Fitting on **xG** beats fitting on goals (a lower-noise
-signal). Stacking learns to lean on the **market** (the heaviest weight), since the
-bookmaker's vig-free implied odds are the hard bar to beat: the engine approaches the
-market but does not clear it. And the **reliability table + ECE** confirm the ensemble is
-well-calibrated (predicted ≈ empirical in every bucket). The synthetic results now carry
+signal). The **L-BFGS** fit lands the Dixon-Coles (xG) model essentially level with the
+bookmaker's vig-free implied odds (Brier 0.610 vs 0.610) - the hard bar to beat - and stacking
+still leans on the market as the single sharpest signal. And the **reliability table + ECE**
+confirm the ensemble is well-calibrated (predicted ≈ empirical in every bucket). The synthetic results now carry
 mild **match-level overdispersion** (a Gamma-Poisson "form on the day"), so the negative-binomial
 goal model has fatter, more realistic scoreline tails to fit. `--data` runs the same split on a
 real [football-data.co.uk](https://www.football-data.co.uk) CSV (with closing odds, and xG
