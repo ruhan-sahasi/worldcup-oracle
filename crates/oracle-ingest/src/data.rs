@@ -114,6 +114,15 @@ pub fn team_strengths() -> Vec<(TeamId, f64)> {
         .collect()
 }
 
+/// Each team's confederation, for the goal model's hierarchical (confederation-aware) fit.
+pub fn confederations() -> HashMap<TeamId, Confederation> {
+    TEAMS
+        .iter()
+        .enumerate()
+        .map(|(i, &(_, _, conf, _))| (TeamId(i as u32), conf))
+        .collect()
+}
+
 // ----- Squads & lineups (synthetic, offline) -----
 //
 // Real player rosters are not bundled (the live adapter would supply real lineups). To
@@ -1086,10 +1095,10 @@ pub struct Baseline {
 }
 
 /// Fit the full baseline on synthetic history with a proper train→validation split:
-/// Dixon-Coles (on xG) and Elo are fit on the older 70%, then the ensemble weights +
-/// temperature are *learned* on the held-out 30%. The ensemble has three members
-/// `[Dixon-Coles, Elo, Market]`, so when a match has odds the engine anchors to the
-/// market, and degrades gracefully to two members when it does not.
+/// Dixon-Coles (confederation-aware, on xG) and Elo are fit on the older 70%, then the ensemble
+/// weights + temperature are *learned* on the held-out 30%. The ensemble has four members
+/// `[Dixon-Coles, Elo, State-space, Market]`, so when a match has odds the engine anchors to the
+/// market, and degrades gracefully to the three model members when it does not.
 pub fn fit_baseline(seed: u64) -> Baseline {
     let mut history = synthetic_history_with_market(4000, seed);
     // Oldest first, so we train on the past and validate on more recent matches.
@@ -1103,7 +1112,13 @@ pub fn fit_baseline(seed: u64) -> Baseline {
     let (train, validation) = history.split_at(split);
 
     let train_obs: Vec<Observation> = train.iter().map(|r| r.obs).collect();
-    let model = GoalModel::fit(&train_obs, DixonColesConfig::default());
+    // Confederation-aware: hierarchical pooling shrinks each team toward its confederation level
+    // rather than the global mean, the principled treatment for a sparse, unbalanced field.
+    let model = GoalModel::fit_with_confederations(
+        &train_obs,
+        DixonColesConfig::default(),
+        &confederations(),
+    );
 
     let elo_seeds = team_strengths();
     let mut ratings = RatingStore::with_defaults();
@@ -1177,6 +1192,22 @@ mod tests {
         // Argentina (id 0, strongest) vs New Zealand (id 47, weakest).
         let p = model.outcome_probabilities(TeamId(0), TeamId(47), true);
         assert!(p.home_win > 0.6, "fit should rate Argentina well above NZ");
+    }
+
+    #[test]
+    fn baseline_is_confederation_aware() {
+        // The offline baseline uses the hierarchical (confederation-aware) fit, so it reports a
+        // strength level per confederation, and the strong ones outrank the weak ones.
+        let model = fit_baseline_model(7);
+        let levels = model.confederation_levels();
+        assert_eq!(levels.len(), 6, "all six confederations represented");
+        // CONMEBOL (Argentina, Brazil, ...) should sit well above OFC (New Zealand).
+        assert!(
+            levels[&Confederation::Conmebol] > levels[&Confederation::Ofc],
+            "CONMEBOL level {:.3} should exceed OFC {:.3}",
+            levels[&Confederation::Conmebol],
+            levels[&Confederation::Ofc]
+        );
     }
 
     #[test]

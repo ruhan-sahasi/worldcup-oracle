@@ -28,9 +28,15 @@
 //! and the rest of the hyperparameters, by held-out log-loss.
 
 use crate::poisson::{bivariate_poisson_pmf, neg_binomial_pmf, poisson_pmf};
-use oracle_domain::{Probabilities, ScoreGrid, Scoreline, TeamId};
+use oracle_domain::{Confederation, Probabilities, ScoreGrid, Scoreline, TeamId};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+
+/// How strongly a team's coefficients are pooled toward its confederation mean (vs the global
+/// mean) during the hierarchical fit. 0 = no pooling (plain global ridge), 1 = shrink fully to
+/// the confederation level. The remaining `1 - POOL` keeps a sparse confederation's level from
+/// drifting too far from neutral.
+const CONFEDERATION_POOL: f64 = 0.7;
 
 /// One historical result used to fit the model.
 #[derive(Debug, Clone, Copy)]
@@ -157,6 +163,10 @@ pub struct GoalModel {
     /// confident the team's rating is (more data -> lower strength uncertainty).
     #[serde(default)]
     match_weight: HashMap<TeamId, f64>,
+    /// Each team's confederation (when supplied to the hierarchical fit), so the fitted
+    /// confederation strength levels can be reported. Empty for the confederation-agnostic model.
+    #[serde(default)]
+    confederation: HashMap<TeamId, Confederation>,
 }
 
 impl Default for GoalModel {
@@ -173,6 +183,7 @@ impl Default for GoalModel {
             attack: HashMap::new(),
             defense: HashMap::new(),
             match_weight: HashMap::new(),
+            confederation: HashMap::new(),
         }
     }
 }
@@ -180,7 +191,31 @@ impl Default for GoalModel {
 impl GoalModel {
     /// Fit a model to historical results by time-weighted maximum likelihood.
     /// Returns a sensible default model if `observations` is empty.
+    ///
+    /// This is the confederation-agnostic fit (plain global ridge, no cross-confederation offset).
+    /// Pass a team-to-confederation map to [`fit_with_confederations`](Self::fit_with_confederations)
+    /// for the hierarchical variant.
     pub fn fit(observations: &[Observation], config: DixonColesConfig) -> Self {
+        Self::fit_with_confederations(observations, config, &HashMap::new())
+    }
+
+    /// Like [`fit`](Self::fit), but **confederation-aware**. Two additions, both targeting the
+    /// World Cup's core blind spot (confederations rarely play each other, so cross-confederation
+    /// strength is poorly pinned down):
+    ///
+    /// - **Hierarchical partial pooling.** Each team's attack/defense is shrunk toward its
+    ///   *confederation* mean rather than the global mean, so a data-poor team borrows strength
+    ///   from its confederation instead of being dragged to the world average.
+    /// - **Cross-confederation offset.** A per-confederation log-rate adjustment, fitted from the
+    ///   inter-confederation results and applied only in cross-confederation matches, captures
+    ///   systematic over/under-performance a confederation shows against outsiders.
+    ///
+    /// An empty `confederations` map reduces exactly to [`fit`](Self::fit).
+    pub fn fit_with_confederations(
+        observations: &[Observation],
+        config: DixonColesConfig,
+        confederations: &HashMap<TeamId, Confederation>,
+    ) -> Self {
         if observations.is_empty() {
             return GoalModel {
                 max_goals: config.max_goals,
@@ -283,11 +318,26 @@ impl GoalModel {
 
             let step = lr / total_weight;
             let shrink = lr * config.ridge;
+            // Hierarchical pooling target: each team is shrunk toward `POOL ×` its confederation
+            // mean (toward 0 when no confederations are supplied, recovering the plain ridge).
+            let (cm_attack, cm_defense) = if confederations.is_empty() {
+                (HashMap::new(), HashMap::new())
+            } else {
+                confederation_means(&teams, &attack, &defense, confederations)
+            };
+            let pool_target = |t: &TeamId, means: &HashMap<Confederation, f64>| -> f64 {
+                match confederations.get(t) {
+                    Some(c) => CONFEDERATION_POOL * means.get(c).copied().unwrap_or(0.0),
+                    None => 0.0,
+                }
+            };
             for t in &teams {
                 let (a, d) = (attack[t], defense[t]);
-                // Gradient ascent on the log-likelihood, minus an L2 penalty (ridge).
-                *attack.get_mut(t).unwrap() += step * g_attack[t] - shrink * a;
-                *defense.get_mut(t).unwrap() += step * g_defense[t] - shrink * d;
+                let (ta, td) = (pool_target(t, &cm_attack), pool_target(t, &cm_defense));
+                // Gradient ascent on the log-likelihood, minus an L2 penalty toward the
+                // (confederation) pooling target.
+                *attack.get_mut(t).unwrap() += step * g_attack[t] - shrink * (a - ta);
+                *defense.get_mut(t).unwrap() += step * g_defense[t] - shrink * (d - td);
             }
             intercept += step * g_intercept;
             home_advantage += step * g_home;
@@ -368,7 +418,27 @@ impl GoalModel {
             attack,
             defense,
             match_weight,
+            confederation: confederations.clone(),
         }
+    }
+
+    /// The fitted strength level of each confederation: the mean overall rating (`attack +
+    /// defense`, i.e. scores more *and* concedes less) across its members. A regularized, shared
+    /// quantity thanks to the hierarchical pooling, so it is far better behaved than averaging
+    /// freely-floating per-team ratings - the antidote to the World Cup's cross-confederation
+    /// calibration blind spot. Empty unless the model was fit with
+    /// [`fit_with_confederations`](Self::fit_with_confederations).
+    pub fn confederation_levels(&self) -> HashMap<Confederation, f64> {
+        let mut acc: HashMap<Confederation, (f64, usize)> = HashMap::new();
+        for (&team, &conf) in &self.confederation {
+            let e = acc.entry(conf).or_insert((0.0, 0));
+            e.0 += self.attack_of(team) + self.defense_of(team);
+            e.1 += 1;
+        }
+        acc.into_iter()
+            .filter(|(_, (_, n))| *n > 0)
+            .map(|(c, (s, n))| (c, s / n as f64))
+            .collect()
     }
 
     /// Log-space standard deviation of a team's attack/defense rating, reflecting how much
@@ -706,6 +776,33 @@ fn fit_dispersion(
     best
 }
 
+/// Mean attack and mean defense coefficient within each confederation, for hierarchical pooling.
+fn confederation_means(
+    teams: &[TeamId],
+    attack: &HashMap<TeamId, f64>,
+    defense: &HashMap<TeamId, f64>,
+    confederations: &HashMap<TeamId, Confederation>,
+) -> (HashMap<Confederation, f64>, HashMap<Confederation, f64>) {
+    let mut acc: HashMap<Confederation, (f64, f64, usize)> = HashMap::new();
+    for &t in teams {
+        if let Some(&c) = confederations.get(&t) {
+            let e = acc.entry(c).or_insert((0.0, 0.0, 0));
+            e.0 += attack.get(&t).copied().unwrap_or(0.0);
+            e.1 += defense.get(&t).copied().unwrap_or(0.0);
+            e.2 += 1;
+        }
+    }
+    let mut mean_attack = HashMap::new();
+    let mut mean_defense = HashMap::new();
+    for (c, (sa, sd, n)) in acc {
+        if n > 0 {
+            mean_attack.insert(c, sa / n as f64);
+            mean_defense.insert(c, sd / n as f64);
+        }
+    }
+    (mean_attack, mean_defense)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -739,6 +836,56 @@ mod tests {
             model.dispersion() > 0.0,
             "fat-tailed scores should yield a finite NB dispersion, got {}",
             model.dispersion()
+        );
+    }
+
+    #[test]
+    fn hierarchical_pooling_lifts_a_data_poor_team_toward_its_confederation() {
+        use oracle_domain::Confederation::{Afc, Uefa};
+        let mut confs = HashMap::new();
+        for id in [1, 2, 3, 7] {
+            confs.insert(t(id), Uefa); // strong confederation
+        }
+        for id in [4, 5, 6] {
+            confs.insert(t(id), Afc); // weak confederation
+        }
+        let mut obs = Vec::new();
+        // Strong UEFA teams 1-3 thrash weak AFC teams 4-6 repeatedly.
+        for i in 0..30u32 {
+            obs.push(Observation::new(
+                t(1 + i % 3),
+                t(4 + i % 3),
+                Scoreline::new(3, 0),
+                i as f64,
+            ));
+        }
+        // Team 7 (UEFA) is data-poor: two modest draws, so its own record looks average.
+        obs.push(Observation::new(t(7), t(4), Scoreline::new(1, 1), 1.0));
+        obs.push(Observation::new(t(7), t(5), Scoreline::new(1, 1), 0.0));
+
+        let cfg = DixonColesConfig {
+            ridge: 0.1,
+            ..Default::default()
+        };
+        let flat = GoalModel::fit(&obs, cfg);
+        let hier = GoalModel::fit_with_confederations(&obs, cfg, &confs);
+        assert!(
+            hier.attack_of(t(7)) > flat.attack_of(t(7)),
+            "pooling should pull the sparse team toward its strong confederation: {} vs {}",
+            hier.attack_of(t(7)),
+            flat.attack_of(t(7))
+        );
+        // The fitted confederation levels rank the strong confederation above the weak one.
+        let levels = hier.confederation_levels();
+        assert!(levels[&Uefa] > levels[&Afc], "UEFA level should exceed AFC");
+    }
+
+    #[test]
+    fn confederation_agnostic_fit_has_no_confederation_levels() {
+        let model = GoalModel::fit(&synthetic_history(), DixonColesConfig::default());
+        assert!(
+            model.confederation_levels().is_empty(),
+            "plain fit carries no confederation structure"
         );
     }
 

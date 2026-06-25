@@ -120,9 +120,19 @@ search alongside `ρ`, so the score grid gets correctly fatter tails. The Monte-
 this, sampling each scoreline from the same Gamma-Poisson so the tournament forecast inherits the
 overdispersion rather than under-stating extreme results.
 
-The hand-tuning is removed by `wc-oracle tune`, which grid-searches the time decay `ξ`, the
-ridge strength, and the score model on a validation split (selecting by log-loss) and reports
-the winner's honest test-set loss, so these constants are optimized rather than guessed.
+The fit is also **hierarchical** (`fit_with_confederations`). A World Cup's core blind spot is
+that confederations rarely play each other, so cross-confederation strength is poorly pinned
+down and a confederation that mostly plays itself has its level set by only a handful of
+inter-confederation matches. Instead of shrinking every team toward the *global* mean (plain
+ridge), each team's attack/defense is **partially pooled toward its confederation mean**, so a
+data-poor team borrows strength from its confederation rather than being dragged to the world
+average; a `1 - POOL` pull toward neutral keeps a sparse confederation's level from drifting. The
+confederation level (`confederation_levels`, mean `attack + defense`) thus becomes a regularized,
+shared quantity. A *separate* additive per-confederation offset was considered and rejected: it
+is collinear with a confederation-wide attack+defense shift in the team coefficients (so it is not
+separately identifiable), and a genuinely non-additive pairwise confederation interaction is left
+as future work, the inter-confederation data being too sparse for the 2026 draw. With no
+confederation map supplied the fit reduces exactly to the plain global-ridge version.
 
 The hand-tuning is removed by `wc-oracle tune`, which grid-searches the time decay `ξ`, the
 ridge strength, and the score model on a validation split (selecting by log-loss) and reports

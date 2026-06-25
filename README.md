@@ -45,7 +45,7 @@ fully offline with **zero keys and zero network**.
 
 | Piece | What it contributes |
 |-------|---------------------|
-| **Dixon-Coles / bivariate-Poisson** goal model, MLE-fit (convergence-checked) with time decay + ridge, **fit on xG when available**, **updated online from results**, with **negative-binomial (overdispersed) margins** | full exact-score distribution that sharpens as the tournament unfolds, with the fatter blowout/goalless tails real football shows; the score model and fit hyperparameters are **tuned by held-out log-loss** |
+| **Dixon-Coles / bivariate-Poisson** goal model, MLE-fit (convergence-checked) with time decay + ridge, **fit on xG when available**, **updated online from results**, **negative-binomial (overdispersed) margins**, and **hierarchical confederation pooling** | full exact-score distribution that sharpens as the tournament unfolds, with the fatter blowout/goalless tails real football shows; sparse teams borrow strength from their confederation; the score model and fit hyperparameters are **tuned by held-out log-loss** |
 | **Elo** with home edge + margin-of-victory scaling | a complementary strength signal |
 | **State-space (Kalman) rating** - each team a Gaussian `N(mean, var)`, random-walk between matches + Kalman update from each result | principled in-tournament learning *and* a per-team uncertainty that the Monte-Carlo consumes |
 | **Log-opinion-pool ensemble** (`[Dixon-Coles, Elo, State-space, Market]` weights + temperature **learned by stacking**) | a single sharper forecast, anchored to the bookmaker when odds are present |
