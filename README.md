@@ -140,6 +140,7 @@ cargo run --release -p oracle-cli -- watch          # press q to quit
 # 5. Backtest and benchmark against the bookmaker (synthetic data, or --data a real CSV):
 cargo run --release -p oracle-cli -- backtest
 cargo run --release -p oracle-cli -- backtest --data path/to/football-data.csv
+cargo run --release -p oracle-cli -- backtest --cv 5   # rolling-origin CV with 95% CIs
 ```
 
 ```text
@@ -171,6 +172,15 @@ mild **match-level overdispersion** (a Gamma-Poisson "form on the day"), so the 
 goal model has fatter, more realistic scoreline tails to fit. `--data` runs the same split on a
 real [football-data.co.uk](https://www.football-data.co.uk) CSV (with closing odds, and xG
 columns if present).
+
+A single split is one noisy draw, so `backtest --cv N` runs **rolling-origin (expanding-window)
+cross-validation**: the first half of the matches is always training, the rest is split into `N`
+consecutive future blocks, and each fold refits the goal model, Elo, and ensemble on everything
+*before* its block (no look-ahead). The pooled out-of-fold predictions are scored with a
+**bootstrap 95% confidence interval** on each metric, so skill is reported as `Brier 0.625
+[0.616, 0.633]` rather than a single number. Non-overlapping intervals are the test for whether a
+change actually helped or is within noise: in practice the ensemble's interval **overlaps the
+bookmaker's**, the honest read that it matches but does not beat the market.
 
 ```bash
 # 6. Tune the goal-model hyperparameters (time decay, ridge, score model) by held-out

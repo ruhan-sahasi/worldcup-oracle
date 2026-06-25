@@ -15,7 +15,7 @@
 mod watch;
 
 use clap::{Parser, Subcommand};
-use oracle_domain::{ScoreGrid, Team, TeamId};
+use oracle_domain::{Outcome, Probabilities, ScoreGrid, Team, TeamId};
 use oracle_ingest::data;
 use oracle_model::{Ensemble, GoalModel, LiveConfig};
 use oracle_ratings::RatingStore;
@@ -77,6 +77,10 @@ enum Command {
         /// overrides the synthetic dataset.
         #[arg(long)]
         data: Option<std::path::PathBuf>,
+        /// Rolling-origin cross-validation with this many folds (>= 2), reporting each metric
+        /// with a bootstrap 95% confidence interval instead of a single train/test split.
+        #[arg(long)]
+        cv: Option<usize>,
     },
     /// Search goal-model hyperparameters, picking the best by held-out log-loss.
     Tune {
@@ -123,7 +127,11 @@ async fn main() -> anyhow::Result<()> {
             matches,
             seed,
             data,
-        } => cmd_backtest(matches, seed, data),
+            cv,
+        } => match cv {
+            Some(folds) if folds >= 2 => cmd_backtest_cv(matches, seed, data, folds),
+            _ => cmd_backtest(matches, seed, data),
+        },
         Command::Tune {
             matches,
             seed,
@@ -512,6 +520,180 @@ fn cmd_backtest(
         );
     }
     println!("    (predicted ≈ empirical in every bucket means well-calibrated)\n");
+    Ok(())
+}
+
+/// Print one model's Brier and log-loss with bootstrap 95% confidence intervals.
+fn cv_row(label: &str, preds: &[(Probabilities, Outcome)], seed: u64) {
+    const N_BOOT: usize = 2000;
+    if preds.is_empty() {
+        println!("  {label:<20}   (no predictions)");
+        return;
+    }
+    let (brier, log_loss, _acc) = oracle_model::bootstrap_score_ci(preds, N_BOOT, seed);
+    println!(
+        "  {:<20}  {:.4} [{:.4}, {:.4}]   {:.4} [{:.4}, {:.4}]",
+        label, brier.point, brier.lo, brier.hi, log_loss.point, log_loss.lo, log_loss.hi
+    );
+}
+
+/// Rolling-origin (expanding-window) cross-validation. The first half of the chronologically
+/// ordered matches is always training; the rest is split into `folds` consecutive evaluation
+/// blocks. Each fold refits the goal model, Elo, and ensemble on everything *before* its block
+/// and predicts the block, so there is never any look-ahead. The out-of-fold predictions are
+/// pooled and each model's skill is reported with a bootstrap 95% confidence interval - a far
+/// more honest read on skill (and on whether a change actually helped) than a single split.
+fn cmd_backtest_cv(
+    n_matches: usize,
+    seed: u64,
+    data_path: Option<std::path::PathBuf>,
+    folds: usize,
+) -> anyhow::Result<()> {
+    use oracle_model::{DixonColesConfig, Observation};
+
+    let (mut records, source, real_data) = match &data_path {
+        Some(p) => (data::load_results_csv(p)?, format!("{}", p.display()), true),
+        None => (
+            data::synthetic_history_with_market(n_matches, seed),
+            format!("{n_matches} synthetic matches"),
+            false,
+        ),
+    };
+    if records.len() < 200 {
+        anyhow::bail!(
+            "need at least 200 matches for cross-validation (got {})",
+            records.len()
+        );
+    }
+    // Oldest first (chronological): each fold trains on the past, evaluates on the future.
+    records.sort_by(|a, b| {
+        b.obs
+            .age_days
+            .partial_cmp(&a.obs.age_days)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    let n = records.len();
+    let neutral = !real_data;
+    let market_present = records.iter().any(|r| r.market.is_some());
+
+    let anchor = n / 2;
+    let block = (n - anchor) / folds;
+    if block == 0 {
+        anyhow::bail!("too few matches ({n}) for {folds} folds");
+    }
+
+    let mut dc_oof: Vec<(Probabilities, Outcome)> = Vec::new();
+    let mut elo_oof: Vec<(Probabilities, Outcome)> = Vec::new();
+    let mut ens_oof: Vec<(Probabilities, Outcome)> = Vec::new();
+    let mut market_oof: Vec<(Probabilities, Outcome)> = Vec::new();
+    let mut fold_sizes: Vec<usize> = Vec::new();
+
+    for fold in 0..folds {
+        let fit_end = anchor + fold * block;
+        let eval_end = if fold + 1 == folds {
+            n
+        } else {
+            anchor + (fold + 1) * block
+        };
+        // Hold out the last quarter of the training portion to learn the ensemble weights.
+        let inner_train_end = (fit_end * 3 / 4).max(1);
+
+        let train_obs: Vec<Observation> =
+            records[..inner_train_end].iter().map(|r| r.obs).collect();
+        let model = GoalModel::fit(&train_obs, DixonColesConfig::default());
+        let mut ratings = RatingStore::with_defaults();
+        if !real_data {
+            for (team, rating) in data::team_strengths() {
+                ratings.seed(team, rating);
+            }
+        }
+        for r in &records[..inner_train_end] {
+            ratings.record(r.obs.home, r.obs.away, r.obs.score, neutral);
+        }
+
+        let mut val_preds = Vec::new();
+        let mut val_actuals = Vec::new();
+        for r in &records[inner_train_end..fit_end] {
+            let dc = model.outcome_probabilities(r.obs.home, r.obs.away, neutral);
+            let elo = ratings.win_probabilities(r.obs.home, r.obs.away, neutral);
+            match (market_present, r.market) {
+                (true, Some(m)) => {
+                    val_preds.push(vec![dc, elo, m]);
+                    val_actuals.push(r.obs.score.outcome());
+                }
+                (false, _) => {
+                    val_preds.push(vec![dc, elo]);
+                    val_actuals.push(r.obs.score.outcome());
+                }
+                _ => {}
+            }
+        }
+        let n_members = if market_present { 3 } else { 2 };
+        let ensemble = Ensemble::fit(&val_preds, &val_actuals, n_members);
+
+        let mut count = 0;
+        for r in &records[fit_end..eval_end] {
+            let actual = r.obs.score.outcome();
+            let dc = model.outcome_probabilities(r.obs.home, r.obs.away, neutral);
+            let elo = ratings.win_probabilities(r.obs.home, r.obs.away, neutral);
+            dc_oof.push((dc, actual));
+            elo_oof.push((elo, actual));
+            let mut members = vec![dc, elo];
+            if let Some(market) = r.market {
+                members.push(market);
+                market_oof.push((market, actual));
+            }
+            ens_oof.push((ensemble.blend(&members), actual));
+            count += 1;
+        }
+        fold_sizes.push(count);
+    }
+
+    println!(
+        "\nRolling-origin cross-validation on {}  ({} expanding-window folds, {} out-of-fold predictions)\n",
+        source,
+        folds,
+        ens_oof.len()
+    );
+    println!("  fold eval sizes: {fold_sizes:?}");
+    println!(
+        "\n  {:<20}  {:<24}   {:<24}",
+        "Model", "Brier [95% CI]", "LogLoss [95% CI]"
+    );
+    println!("  {}", "-".repeat(72));
+    let base = oracle_model::CalibrationReport::uniform_baseline(ens_oof.len());
+    println!(
+        "  {:<20}  {:.4}                    {:.4}",
+        "Uniform baseline", base.brier, base.log_loss
+    );
+    cv_row(
+        if real_data {
+            "Dixon-Coles"
+        } else {
+            "Dixon-Coles (xG)"
+        },
+        &dc_oof,
+        seed,
+    );
+    cv_row("Elo", &elo_oof, seed);
+    cv_row(
+        if market_present {
+            "Ensemble (+Market)"
+        } else {
+            "Ensemble (DC+Elo)"
+        },
+        &ens_oof,
+        seed,
+    );
+    if market_oof.is_empty() {
+        println!("  {:<20}   (no odds in this dataset)", "Market (bookmaker)");
+    } else {
+        cv_row("Market (bookmaker)", &market_oof, seed);
+    }
+    println!(
+        "\n  Out-of-fold over {folds} folds; 95% CI from 2000 bootstrap resamples (seeded, reproducible)."
+    );
+    println!("  Non-overlapping intervals mean the skill gap is not a single-split fluke.\n");
     Ok(())
 }
 

@@ -266,6 +266,18 @@ Beyond Brier and log loss, `reliability` bins predictions by confidence and comp
 predicted vs empirical frequency, with an expected calibration error (ECE). `backtest`
 prints this so the ensemble's calibration is explicit, not assumed.
 
+### Cross-validation & uncertainty (`oracle-model::bootstrap_score_ci`)
+A single train/test split is one noisy draw, so `backtest --cv N` runs **rolling-origin
+(expanding-window) cross-validation**: the first half of the chronologically ordered matches is
+always training, the rest is split into `N` consecutive future blocks, and each fold refits the
+goal model, Elo, and the ensemble on everything *before* its block (so there is never any
+look-ahead) and predicts the block. The out-of-fold predictions are pooled and each model's Brier
+and log-loss are reported with a **bootstrap 95% confidence interval** - resampling driven by a
+seeded SplitMix64 generator, so the intervals are reproducible with no `rand` dependency.
+Non-overlapping intervals are the honest test of whether a change is a real improvement or within
+noise; it is also the instrument that makes future model overhauls measurable rather than
+eyeballed.
+
 ### Durable event store (`oracle-engine::event_log`)
 With `EngineConfig.event_log` set, every consumed event is appended as one JSON line and
 the log is replayed on startup to rebuild state, so a restart mid-tournament recovers

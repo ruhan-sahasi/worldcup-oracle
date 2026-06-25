@@ -87,6 +87,84 @@ pub fn score(predictions: &[(Probabilities, Outcome)]) -> CalibrationReport {
     }
 }
 
+/// A skill metric with a bootstrap confidence interval: the point estimate on the full sample
+/// plus the 2.5th and 97.5th percentiles over the resamples.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct MetricCi {
+    pub point: f64,
+    pub lo: f64,
+    pub hi: f64,
+}
+
+/// Bootstrap 95% confidence intervals for Brier, log-loss, and accuracy over a set of
+/// `(prediction, actual)` pairs (e.g. the pooled out-of-fold predictions of a rolling-origin
+/// cross-validation). Resampling with replacement is driven by a seeded SplitMix64 generator, so
+/// the intervals are fully reproducible for a given `(seed, n_boot)` - no `rand` dependency and
+/// no nondeterminism. Non-overlapping intervals between two models are evidence the skill gap is
+/// real rather than a single-split fluke.
+pub fn bootstrap_score_ci(
+    predictions: &[(Probabilities, Outcome)],
+    n_boot: usize,
+    seed: u64,
+) -> (MetricCi, MetricCi, MetricCi) {
+    let point = score(predictions);
+    let n = predictions.len();
+    if n == 0 || n_boot == 0 {
+        let z = MetricCi {
+            point: 0.0,
+            lo: 0.0,
+            hi: 0.0,
+        };
+        return (z, z, z);
+    }
+
+    // SplitMix64: a tiny, well-distributed seeded PRNG (no external dependency).
+    let mut state = seed.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    let mut next_u64 = || {
+        state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = state;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    };
+
+    let (mut briers, mut losses, mut accs) = (
+        Vec::with_capacity(n_boot),
+        Vec::with_capacity(n_boot),
+        Vec::with_capacity(n_boot),
+    );
+    let mut sample: Vec<(Probabilities, Outcome)> = Vec::with_capacity(n);
+    for _ in 0..n_boot {
+        sample.clear();
+        for _ in 0..n {
+            let idx = (next_u64() % n as u64) as usize;
+            sample.push(predictions[idx]);
+        }
+        let r = score(&sample);
+        briers.push(r.brier);
+        losses.push(r.log_loss);
+        accs.push(r.accuracy);
+    }
+
+    let ci = |point: f64, mut v: Vec<f64>| -> MetricCi {
+        v.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let pct = |q: f64| {
+            let idx = ((q * (v.len() - 1) as f64).round() as usize).min(v.len() - 1);
+            v[idx]
+        };
+        MetricCi {
+            point,
+            lo: pct(0.025),
+            hi: pct(0.975),
+        }
+    };
+    (
+        ci(point.brier, briers),
+        ci(point.log_loss, losses),
+        ci(point.accuracy, accs),
+    )
+}
+
 /// One probability bin of a reliability (calibration) curve.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct ReliabilityBin {
@@ -197,6 +275,33 @@ mod tests {
             "shortest odds = favourite"
         );
         assert!(p.home_win > p.draw && p.home_win > p.away_win);
+    }
+
+    #[test]
+    fn bootstrap_ci_brackets_the_point_estimate_and_is_reproducible() {
+        let preds: Vec<(Probabilities, Outcome)> = (0..300)
+            .map(|i| {
+                let actual = match i % 3 {
+                    0 => Outcome::HomeWin,
+                    1 => Outcome::Draw,
+                    _ => Outcome::AwayWin,
+                };
+                (Probabilities::new(0.5, 0.3, 0.2), actual)
+            })
+            .collect();
+        let point = score(&preds);
+        let (brier, log_loss, _acc) = bootstrap_score_ci(&preds, 400, 7);
+        // The point estimate matches `score`, and the interval brackets it.
+        assert!((brier.point - point.brier).abs() < 1e-12);
+        assert!(brier.lo <= brier.point && brier.point <= brier.hi);
+        assert!(log_loss.lo <= log_loss.point && log_loss.point <= log_loss.hi);
+        assert!(
+            brier.lo < brier.hi,
+            "a non-degenerate sample has a real interval"
+        );
+        // Same seed reproduces exactly.
+        let again = bootstrap_score_ci(&preds, 400, 7);
+        assert_eq!(brier, again.0);
     }
 
     #[test]

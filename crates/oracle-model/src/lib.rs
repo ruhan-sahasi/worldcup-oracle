@@ -22,7 +22,8 @@ pub mod poisson;
 pub mod style;
 
 pub use calibration::{
-    implied_probabilities, reliability, score, CalibrationReport, ReliabilityBin, ReliabilityReport,
+    bootstrap_score_ci, implied_probabilities, reliability, score, CalibrationReport, MetricCi,
+    ReliabilityBin, ReliabilityReport,
 };
 pub use context::{context_adjustment, Host, MatchContext};
 pub use dixon_coles::{DixonColesConfig, GoalModel, Observation, ScoreModel};
