@@ -173,9 +173,13 @@ to come" gives live win/draw/win probabilities that move on every event.
 A temperature-scaled **logarithmic opinion pool** blends up to four members,
 `[Dixon-Coles, Elo, State-space, Market]`: `q(o) ∝ exp(τ · Σ_k a_k · ln p_k(o))`. The mixture
 weights `a_k` and temperature `τ` are **learned by stacking** (gradient descent on held-out log
-loss in `Ensemble::fit`), so the blend is provably no worse than its best member. When a
-match has bookmaker odds they enter as the fourth member and the ensemble anchors to them;
-with no odds it degrades cleanly to the three model members (`blend` renormalizes the weights).
+loss in `Ensemble::fit`), so the blend is provably no worse than its best member. The offline
+baseline learns them by **out-of-fold stacking** (`data::fit_baseline`): with K interleaved folds
+each member is fit on the other folds and predicts the held-out fold, so the weights are trained
+on leakage-free predictions spanning the whole dataset rather than a single held-out tail, and the
+members are then refit on all the data for deployment. When a match has bookmaker odds they enter
+as the fourth member and the ensemble anchors to them; with no odds it degrades cleanly to the
+three model members (`blend` renormalizes the weights).
 
 ### Lineup, suspension & venue adjustments (`oracle-ingest::data` + `oracle-model`)
 Three context signals produce log-space per-team `(attack, defense)` deltas that sum and

@@ -1094,56 +1094,75 @@ pub struct Baseline {
     pub ensemble: Ensemble,
 }
 
-/// Fit the full baseline on synthetic history with a proper train→validation split:
-/// Dixon-Coles (confederation-aware, on xG) and Elo are fit on the older 70%, then the ensemble
-/// weights + temperature are *learned* on the held-out 30%. The ensemble has four members
-/// `[Dixon-Coles, Elo, State-space, Market]`, so when a match has odds the engine anchors to the
+/// Fit the full baseline on synthetic history via **out-of-fold stacking**. The four ensemble
+/// members `[Dixon-Coles (confederation-aware, on xG), Elo, State-space, Market]` are evaluated
+/// out-of-fold (members fit on K-1 folds, predicting the held-out fold) so the ensemble weights +
+/// temperature are learned on leakage-free predictions over the whole dataset; the members are
+/// then refit on all the data for deployment. When a match has odds the engine anchors to the
 /// market, and degrades gracefully to the three model members when it does not.
 pub fn fit_baseline(seed: u64) -> Baseline {
     let mut history = synthetic_history_with_market(4000, seed);
-    // Oldest first, so we train on the past and validate on more recent matches.
+    // Oldest first (chronological).
     history.sort_by(|a, b| {
         b.obs
             .age_days
             .partial_cmp(&a.obs.age_days)
             .unwrap_or(std::cmp::Ordering::Equal)
     });
-    let split = history.len() * 7 / 10;
-    let (train, validation) = history.split_at(split);
+    let confs = confederations();
+    let elo_seeds = team_strengths();
 
-    let train_obs: Vec<Observation> = train.iter().map(|r| r.obs).collect();
+    // Fit the three learnable members (Dixon-Coles, Elo, state-space) on a set of records.
     // Confederation-aware: hierarchical pooling shrinks each team toward its confederation level
     // rather than the global mean, the principled treatment for a sparse, unbalanced field.
-    let model = GoalModel::fit_with_confederations(
-        &train_obs,
-        DixonColesConfig::default(),
-        &confederations(),
-    );
+    let fit_members = |records: &[MatchRecord]| -> (GoalModel, RatingStore, StateSpaceRatings) {
+        let obs: Vec<Observation> = records.iter().map(|r| r.obs).collect();
+        let model = GoalModel::fit_with_confederations(&obs, DixonColesConfig::default(), &confs);
+        let mut ratings = RatingStore::with_defaults();
+        for &(team, rating) in &elo_seeds {
+            ratings.seed(team, rating);
+        }
+        let mut state_space = StateSpaceRatings::with_defaults();
+        for r in records {
+            ratings.record(r.obs.home, r.obs.away, r.obs.score, true);
+            state_space.observe(r.obs.home, r.obs.away, r.obs.score, r.obs.age_days, true);
+        }
+        (model, ratings, state_space)
+    };
+    let member_preds =
+        |r: &MatchRecord, m: &GoalModel, rt: &RatingStore, ss: &StateSpaceRatings| {
+            vec![
+                m.outcome_probabilities(r.obs.home, r.obs.away, true),
+                rt.win_probabilities(r.obs.home, r.obs.away, true),
+                ss.win_probabilities(r.obs.home, r.obs.away, true),
+                r.market.unwrap_or_else(Probabilities::uniform),
+            ]
+        };
 
-    let elo_seeds = team_strengths();
-    let mut ratings = RatingStore::with_defaults();
-    for &(team, rating) in &elo_seeds {
-        ratings.seed(team, rating);
+    // Out-of-fold **stacking**: with K interleaved folds, each fold's members are fit on the other
+    // folds and predict the held-out fold, so the ensemble weights are learned on leakage-free
+    // predictions covering the *whole* dataset (not just a held-out tail). Members are [Dixon-Coles,
+    // Elo, State-space, Market]; the market needs no fitting so it is the same in or out of fold.
+    const K: usize = 5;
+    let mut oof_preds = Vec::with_capacity(history.len());
+    let mut oof_actuals = Vec::with_capacity(history.len());
+    for fold in 0..K {
+        let train_subset: Vec<MatchRecord> = history
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| i % K != fold)
+            .map(|(_, r)| r.clone())
+            .collect();
+        let (m, rt, ss) = fit_members(&train_subset);
+        for r in history.iter().skip(fold).step_by(K) {
+            oof_preds.push(member_preds(r, &m, &rt, &ss));
+            oof_actuals.push(r.obs.score.outcome());
+        }
     }
-    // The state-space rating learns purely from the (chronological) training history.
-    let mut state_space = StateSpaceRatings::with_defaults();
-    for r in train {
-        ratings.record(r.obs.home, r.obs.away, r.obs.score, true);
-        state_space.observe(r.obs.home, r.obs.away, r.obs.score, r.obs.age_days, true);
-    }
+    let ensemble = Ensemble::fit(&oof_preds, &oof_actuals, 4);
 
-    // Member predictions on the validation slice: [Dixon-Coles, Elo, StateSpace, Market].
-    let mut member_preds = Vec::with_capacity(validation.len());
-    let mut actuals = Vec::with_capacity(validation.len());
-    for r in validation {
-        let dc = model.outcome_probabilities(r.obs.home, r.obs.away, true);
-        let elo = ratings.win_probabilities(r.obs.home, r.obs.away, true);
-        let kalman = state_space.win_probabilities(r.obs.home, r.obs.away, true);
-        let market = r.market.unwrap_or_else(Probabilities::uniform);
-        member_preds.push(vec![dc, elo, kalman, market]);
-        actuals.push(r.obs.score.outcome());
-    }
-    let ensemble = Ensemble::fit(&member_preds, &actuals, 4);
+    // Final members fit on *all* the data, for deployment.
+    let (model, _ratings, state_space) = fit_members(&history);
 
     Baseline {
         model,
