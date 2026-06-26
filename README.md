@@ -183,8 +183,8 @@ change actually helped or is within noise: in practice the ensemble's interval *
 bookmaker's**, the honest read that it matches but does not beat the market.
 
 ```bash
-# 6. Tune the goal-model hyperparameters (time decay, ridge, score model) by held-out
-#    log-loss, replacing hand-picked constants with searched ones:
+# 6. Tune the goal-model hyperparameters (time decay, ridge, score model) by Bayesian
+#    optimization on held-out log-loss, replacing hand-picked constants with searched ones:
 cargo run --release -p oracle-cli -- tune
 ```
 
@@ -195,10 +195,12 @@ cargo run --release -p oracle-cli -- tune
   tuned   (xi 0.001, ridge 0.000, bivariate)         1.0604       1.0361
 ```
 
-`tune` grid-searches the goal-model fit (time-decay ξ, ridge, and the score model:
-independent-Poisson-plus-Dixon-Coles vs **bivariate Poisson**), selecting on a validation
-split and reporting the winner's honest test-set loss, so the constants are optimized rather
-than guessed.
+`tune` runs **Bayesian optimization** over the goal-model fit (the continuous time-decay ξ and
+ridge, per score model: independent-Poisson-plus-Dixon-Coles vs **bivariate Poisson**): a Gaussian-
+process surrogate with Expected-Improvement acquisition decides where to look next, selecting on a
+validation split and reporting the winner's honest test-set loss. It reaches a better optimum in
+fewer fits than a grid, over continuous values a grid could never land on, so the constants are
+optimized rather than guessed.
 
 > **Validated on real data.** On 1,520 real Premier League matches with real Bet365 closing
 > odds, the stacked ensemble (Brier **0.5416**) matches the bookmaker's closing line (0.5421)

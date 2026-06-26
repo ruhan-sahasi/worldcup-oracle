@@ -137,9 +137,12 @@ separately identifiable), and a genuinely non-additive pairwise confederation in
 as future work, the inter-confederation data being too sparse for the 2026 draw. With no
 confederation map supplied the fit reduces exactly to the plain global-ridge version.
 
-The hand-tuning is removed by `wc-oracle tune`, which grid-searches the time decay `ξ`, the
-ridge strength, and the score model on a validation split (selecting by log-loss) and reports
-the winner's honest test-set loss, so these constants are optimized rather than guessed.
+The hand-tuning is removed by `wc-oracle tune`, which runs **Bayesian optimization**
+(`oracle-model::bayes_opt`: a Gaussian-process surrogate with Expected-Improvement acquisition)
+over the continuous time-decay `ξ` and ridge strength, once per score model, selecting on a
+validation split by log-loss and reporting the winner's honest test-set loss. It reaches a better
+optimum in fewer fits than a grid - and over continuous values a fixed lattice cannot land on -
+so these constants are optimized rather than guessed.
 
 The model also **learns in-tournament**: `update_with_result` applies one online
 gradient step (the per-observation step of the fit, residual-clamped, on just the two

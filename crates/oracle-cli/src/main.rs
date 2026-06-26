@@ -748,32 +748,46 @@ fn cmd_tune(
         score(&preds).log_loss
     };
 
-    // The hand-picked constants we are replacing with searched values.
-    const XIS: &[f64] = &[0.001, 0.002, 0.003, 0.005, 0.008];
-    const RIDGES: &[f64] = &[0.0, 0.005, 0.01, 0.02, 0.05];
-    const MODELS: &[(ScoreModel, &str)] = &[
-        (ScoreModel::Independent, "independent"),
-        (ScoreModel::Bivariate, "bivariate"),
-    ];
+    // Bayesian optimization over the *continuous* (xi, ridge) space, run once per score model.
+    // A GP surrogate + Expected-Improvement picks where to look next, so it finds a better optimum
+    // in fewer fits than the old grid - and over values the grid could never land on exactly.
+    use oracle_model::bayes_opt::{minimize, BoConfig};
+    const MODELS: &[ScoreModel] = &[ScoreModel::Independent, ScoreModel::Bivariate];
+    // (xi, ridge) search box.
+    let bounds = [(0.0005_f64, 0.01_f64), (0.0_f64, 0.08_f64)];
 
     let base = DixonColesConfig::default();
     let mut best = (base, evaluate(base, &validation));
     let mut evaluated = 0usize;
-    for &xi in XIS {
-        for &ridge in RIDGES {
-            for &(model, _) in MODELS {
+    for (mi, &model) in MODELS.iter().enumerate() {
+        let res = minimize(
+            &bounds,
+            BoConfig {
+                n_init: 6,
+                n_iter: 16,
+                seed: seed.wrapping_add(mi as u64),
+            },
+            |x| {
                 let cfg = DixonColesConfig {
-                    xi,
-                    ridge,
+                    xi: x[0],
+                    ridge: x[1],
                     model,
                     ..base
                 };
-                let ll = evaluate(cfg, &validation);
-                evaluated += 1;
-                if ll < best.1 {
-                    best = (cfg, ll);
-                }
-            }
+                evaluate(cfg, &validation)
+            },
+        );
+        evaluated += res.evaluations;
+        if res.best_value < best.1 {
+            best = (
+                DixonColesConfig {
+                    xi: res.best_x[0],
+                    ridge: res.best_x[1],
+                    model,
+                    ..base
+                },
+                res.best_value,
+            );
         }
     }
 
@@ -782,7 +796,7 @@ fn cmd_tune(
         ScoreModel::Bivariate => "bivariate",
     };
     println!(
-        "\nTuning on {}  (train {} / validation {} / test {}); {} configs searched\n",
+        "\nTuning on {}  (train {} / validation {} / test {}); {} fits via Bayesian optimization\n",
         source,
         train.len(),
         validation.len(),
@@ -817,8 +831,9 @@ fn cmd_tune(
         evaluate(best.0, &test),
     );
     println!(
-        "\n  Searched goal-model hyperparameters (xi, ridge, score model) by held-out\n  \
-         log-loss. Lower is better; the test column is the honest out-of-sample number.\n"
+        "\n  Bayesian optimization (GP surrogate + Expected Improvement) over the continuous\n  \
+         (xi, ridge) space per score model, selecting by held-out validation log-loss. Lower is\n  \
+         better; the test column is the honest out-of-sample number.\n"
     );
     Ok(())
 }

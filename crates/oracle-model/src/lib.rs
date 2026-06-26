@@ -13,6 +13,7 @@
 //! and regression-test all of the above.
 #![forbid(unsafe_code)]
 
+pub mod bayes_opt;
 pub mod calibration;
 pub mod context;
 pub mod dixon_coles;
