@@ -117,9 +117,11 @@ cargo run --release -p oracle-cli -- simulate --iters 50000
 ```
 
 ```bash
-# 3. Predict a matchup. Pass --*-odds to anchor the ensemble to a bookmaker line:
+# 3. Predict a matchup. Pass --*-odds to anchor the ensemble to a bookmaker line;
+#    pass --posterior for HMC 90% credible intervals (the model's uncertainty about itself):
 cargo run --release -p oracle-cli -- predict --home Brazil --away Argentina \
     --home-odds 2.4 --draw-odds 3.2 --away-odds 2.9
+cargo run --release -p oracle-cli -- predict --home Brazil --away Argentina --posterior
 ```
 
 ```text
@@ -324,8 +326,9 @@ cargo bench -p oracle-sim       # Monte-Carlo throughput
   strength as a Gaussian and updates its mean *and* variance from every result. The Monte-Carlo
   propagates **parameter uncertainty** by resampling each team's strength per iteration from a
   **Laplace (Fisher-information) posterior** (`1/sqrt(ridge + Fisher info)`), so champion odds are
-  not over-concentrated. That is a Gaussian posterior around the MAP - the tractable, sampler-free
-  treatment; a full HMC / variational posterior is the deeper future version. Deliberately
+  not over-concentrated. That is the fast Gaussian posterior used on the live hot path; the **full
+  posterior** is available by **Hamiltonian Monte Carlo** (`predict --posterior` prints 90%
+  credible intervals on the win/draw/win probabilities) for offline analysis. Deliberately
   deferred: **squad market value** (largely redundant with the strength ratings offline) and
   **stakes / dead-rubber rotation** (speculative).
 

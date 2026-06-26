@@ -65,6 +65,10 @@ enum Command {
         draw_odds: Option<f64>,
         #[arg(long)]
         away_odds: Option<f64>,
+        /// Also sample the goal model's posterior by HMC and print 90% credible intervals on the
+        /// win/draw/win probabilities (the model's uncertainty about its own forecast).
+        #[arg(long)]
+        posterior: bool,
     },
     /// Backtest the model and benchmark it against the bookmaker.
     Backtest {
@@ -122,7 +126,8 @@ async fn main() -> anyhow::Result<()> {
             home_odds,
             draw_odds,
             away_odds,
-        } => cmd_predict(&home, &away, (home_odds, draw_odds, away_odds)),
+            posterior,
+        } => cmd_predict(&home, &away, (home_odds, draw_odds, away_odds), posterior),
         Command::Backtest {
             matches,
             seed,
@@ -231,6 +236,7 @@ fn cmd_predict(
     home_q: &str,
     away_q: &str,
     odds: (Option<f64>, Option<f64>, Option<f64>),
+    posterior: bool,
 ) -> anyhow::Result<()> {
     let teams = data::teams();
     let home =
@@ -299,6 +305,67 @@ fn cmd_predict(
     println!("\n  Top scorelines:");
     for (h, a, p) in top_scorelines(&grid, 5) {
         println!("    {h}–{a}   {:>5.1}%", p * 100.0);
+    }
+
+    if posterior {
+        // Sample the goal model's posterior by HMC to show its uncertainty about its own forecast.
+        // The model was fit (in `baseline`) on this synthetic history; reconstruct it for the
+        // likelihood.
+        let obs: Vec<oracle_model::Observation> = data::synthetic_history_with_market(4000, 7)
+            .iter()
+            .map(|r| r.obs)
+            .collect();
+        let samples = model.posterior_outcome_samples(
+            &obs,
+            &data::confederations(),
+            home,
+            away,
+            true,
+            oracle_model::hmc::HmcConfig {
+                n_samples: 800,
+                n_warmup: 200,
+                step_size: 0.2,
+                n_leapfrog: 16,
+                seed: 7,
+            },
+        );
+        // 90% credible interval per outcome from the posterior draws.
+        let ci = |pick: fn(&oracle_domain::Probabilities) -> f64| -> (f64, f64, f64) {
+            let mut v: Vec<f64> = samples.iter().map(pick).collect();
+            v.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            let mean = v.iter().sum::<f64>() / v.len() as f64;
+            let pct = |q: f64| v[((q * (v.len() - 1) as f64).round() as usize).min(v.len() - 1)];
+            (mean, pct(0.05), pct(0.95))
+        };
+        let (hm, hlo, hhi) = ci(|p| p.home_win);
+        let (dm, dlo, dhi) = ci(|p| p.draw);
+        let (am, alo, ahi) = ci(|p| p.away_win);
+        println!(
+            "\n  Posterior (HMC, {} samples) - the model's uncertainty about its own",
+            samples.len()
+        );
+        println!("  forecast, as a 90% credible interval:");
+        println!(
+            "    {:<11} win  {:>5.1}%  [{:>4.1}%, {:>4.1}%]",
+            name(home),
+            hm * 100.0,
+            hlo * 100.0,
+            hhi * 100.0
+        );
+        println!(
+            "    {:<11} draw {:>5.1}%  [{:>4.1}%, {:>4.1}%]",
+            "",
+            dm * 100.0,
+            dlo * 100.0,
+            dhi * 100.0
+        );
+        println!(
+            "    {:<11} win  {:>5.1}%  [{:>4.1}%, {:>4.1}%]",
+            name(away),
+            am * 100.0,
+            alo * 100.0,
+            ahi * 100.0
+        );
     }
     println!();
     Ok(())

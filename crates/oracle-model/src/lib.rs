@@ -18,6 +18,7 @@ pub mod calibration;
 pub mod context;
 pub mod dixon_coles;
 pub mod ensemble;
+pub mod hmc;
 pub mod live;
 pub mod poisson;
 pub mod style;

@@ -169,6 +169,10 @@ pub struct GoalModel {
     /// prior the L2 penalty corresponds to. Adds to the Fisher information in the Laplace posterior.
     #[serde(default)]
     ridge_prior: f64,
+    /// Time-decay rate `ξ` used in the fit, kept so the posterior sampler can reconstruct the same
+    /// time-weighted likelihood.
+    #[serde(default)]
+    xi: f64,
     /// Each team's confederation (when supplied to the hierarchical fit), so the fitted
     /// confederation strength levels can be reported. Empty for the confederation-agnostic model.
     #[serde(default)]
@@ -190,6 +194,7 @@ impl Default for GoalModel {
             defense: HashMap::new(),
             fisher_info: HashMap::new(),
             ridge_prior: 0.0,
+            xi: 0.0,
             confederation: HashMap::new(),
         }
     }
@@ -418,6 +423,7 @@ impl GoalModel {
             defense,
             fisher_info,
             ridge_prior: config.ridge,
+            xi: config.xi,
             confederation: confederations.clone(),
         }
     }
@@ -474,6 +480,129 @@ impl GoalModel {
 
     pub fn rho(&self) -> f64 {
         self.rho
+    }
+
+    /// Draw the **posterior distribution of a matchup's win/draw/win probabilities** via
+    /// Hamiltonian Monte Carlo, returning one [`Probabilities`] per HMC sample. Where
+    /// [`outcome_probabilities`](Self::outcome_probabilities) gives a single point forecast, this
+    /// reflects the model's *uncertainty about its own forecast* (a credible interval), sampling
+    /// the full posterior over the attack/defense/intercept/home parameters rather than the
+    /// Gaussian Laplace approximation. The dependence parameter (`ρ`/`λ3`) and dispersion are held
+    /// at their fitted values. `observations` must be the data the model was fit on; `neutral`
+    /// drops the home edge. Returns empty for a data-free model or an unknown team.
+    pub fn posterior_outcome_samples(
+        &self,
+        observations: &[Observation],
+        confederations: &HashMap<TeamId, Confederation>,
+        home: TeamId,
+        away: TeamId,
+        neutral: bool,
+        hmc: crate::hmc::HmcConfig,
+    ) -> Vec<Probabilities> {
+        let mut teams: Vec<TeamId> = self.attack.keys().copied().collect();
+        teams.sort_by_key(|t| t.0);
+        let index: HashMap<TeamId, usize> =
+            teams.iter().enumerate().map(|(i, &t)| (t, i)).collect();
+        let (Some(&hx), Some(&ax)) = (index.get(&home), index.get(&away)) else {
+            return Vec::new();
+        };
+        let n_t = teams.len();
+        let dim = 2 * n_t + 2;
+
+        // Same time-decay weighting the fit used.
+        let weights: Vec<f64> = observations
+            .iter()
+            .map(|o| (-self.xi * o.age_days).exp())
+            .collect();
+
+        // Fixed (empirical-Bayes) pooling targets from the MAP confederation means.
+        let (mut ta, mut td) = (vec![0.0; n_t], vec![0.0; n_t]);
+        if !confederations.is_empty() {
+            let (cm_a, cm_d) =
+                confederation_means(&teams, &self.attack, &self.defense, confederations);
+            for (i, &t) in teams.iter().enumerate() {
+                if let Some(c) = confederations.get(&t) {
+                    ta[i] = CONFEDERATION_POOL * cm_a.get(c).copied().unwrap_or(0.0);
+                    td[i] = CONFEDERATION_POOL * cm_d.get(c).copied().unwrap_or(0.0);
+                }
+            }
+        }
+        let ridge = self.ridge_prior;
+
+        // Initialize the chain at the MAP (the fitted coefficients).
+        let mut init = vec![0.0; dim];
+        for (i, &t) in teams.iter().enumerate() {
+            init[i] = self.attack_of(t);
+            init[n_t + i] = self.defense_of(t);
+        }
+        init[2 * n_t] = self.intercept;
+        init[2 * n_t + 1] = self.home_advantage;
+
+        // Log-posterior and its gradient: the negative of the penalized NLL the fit minimizes.
+        let target = |x: &[f64]| -> (f64, Vec<f64>) {
+            let mut grad = vec![0.0; dim];
+            let mut nll = 0.0;
+            let (icpt, hadv) = (x[2 * n_t], x[2 * n_t + 1]);
+            for (o, &w) in observations.iter().zip(&weights) {
+                let (Some(&hi), Some(&ai)) = (index.get(&o.home), index.get(&o.away)) else {
+                    continue;
+                };
+                let lambda = (icpt + x[hi] - x[n_t + ai] + hadv).exp();
+                let mu = (icpt + x[ai] - x[n_t + hi]).exp();
+                nll -= w
+                    * (o.target_home() * lambda.max(1e-12).ln() - lambda
+                        + o.target_away() * mu.max(1e-12).ln()
+                        - mu);
+                let (res_h, res_a) = (o.target_home() - lambda, o.target_away() - mu);
+                grad[hi] -= w * res_h;
+                grad[ai] -= w * res_a;
+                grad[n_t + ai] += w * res_h;
+                grad[n_t + hi] += w * res_a;
+                grad[2 * n_t] -= w * (res_h + res_a);
+                grad[2 * n_t + 1] -= w * res_h;
+            }
+            for i in 0..n_t {
+                let (ea, ed) = (x[i] - ta[i], x[n_t + i] - td[i]);
+                nll += 0.5 * ridge * (ea * ea + ed * ed);
+                grad[i] += ridge * ea;
+                grad[n_t + i] += ridge * ed;
+            }
+            (-nll, grad.iter().map(|g| -g).collect())
+        };
+
+        // Diagonal preconditioner = Laplace posterior variances (1 / precision) at the MAP.
+        let mut precision = vec![0.0; dim];
+        for i in 0..n_t {
+            precision[i] = ridge;
+            precision[n_t + i] = ridge;
+        }
+        for (o, &w) in observations.iter().zip(&weights) {
+            let (Some(&hi), Some(&ai)) = (index.get(&o.home), index.get(&o.away)) else {
+                continue;
+            };
+            let lambda = (self.intercept + self.attack_of(o.home) - self.defense_of(o.away)
+                + self.home_advantage)
+                .exp();
+            let mu = (self.intercept + self.attack_of(o.away) - self.defense_of(o.home)).exp();
+            precision[hi] += w * lambda;
+            precision[ai] += w * mu;
+            precision[n_t + ai] += w * lambda;
+            precision[n_t + hi] += w * mu;
+            precision[2 * n_t] += w * (lambda + mu);
+            precision[2 * n_t + 1] += w * lambda;
+        }
+        let inv_mass: Vec<f64> = precision.iter().map(|p| 1.0 / p.max(1e-9)).collect();
+
+        let res = crate::hmc::sample(init, &inv_mass, hmc, target);
+        res.samples
+            .iter()
+            .map(|x| {
+                let hadv = if neutral { 0.0 } else { x[2 * n_t + 1] };
+                let lambda = (x[2 * n_t] + x[hx] - x[n_t + ax] + hadv).exp();
+                let mu = (x[2 * n_t] + x[ax] - x[n_t + hx]).exp();
+                self.grid_from(lambda, mu).outcome_probabilities()
+            })
+            .collect()
     }
 
     fn attack_of(&self, t: TeamId) -> f64 {
@@ -1027,6 +1156,45 @@ mod tests {
         let s3 = model.attack_of(t(3)) - model.defense_of(t(3));
         assert!(s1 > s3, "team 1 should outrank team 3");
         assert!(s3 > s2, "team 3 should outrank team 2");
+    }
+
+    #[test]
+    fn posterior_samples_center_on_the_point_estimate_with_spread() {
+        let obs = synthetic_history();
+        let model = GoalModel::fit(&obs, DixonColesConfig::default());
+        let point = model.outcome_probabilities(t(1), t(2), true);
+        let samples = model.posterior_outcome_samples(
+            &obs,
+            &HashMap::new(),
+            t(1),
+            t(2),
+            true,
+            crate::hmc::HmcConfig {
+                n_samples: 500,
+                n_warmup: 150,
+                step_size: 0.25,
+                n_leapfrog: 12,
+                seed: 3,
+            },
+        );
+        assert_eq!(samples.len(), 500);
+        for p in &samples {
+            assert!((p.sum() - 1.0).abs() < 1e-9);
+        }
+        let mean_home = samples.iter().map(|p| p.home_win).sum::<f64>() / samples.len() as f64;
+        // The posterior mean of the win probability sits near the MAP point estimate ...
+        assert!(
+            (mean_home - point.home_win).abs() < 0.06,
+            "posterior mean {mean_home} vs point {}",
+            point.home_win
+        );
+        // ... and there is genuine spread: the model is uncertain about its own forecast.
+        let var = samples
+            .iter()
+            .map(|p| (p.home_win - mean_home).powi(2))
+            .sum::<f64>()
+            / samples.len() as f64;
+        assert!(var > 1e-5, "posterior should have real spread, var = {var}");
     }
 
     #[test]

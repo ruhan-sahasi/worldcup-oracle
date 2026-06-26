@@ -271,8 +271,21 @@ thinly-observed one. The engine can override this with the dynamic state-space r
 (`LiveInputs::rating_sigma`). Data-poor teams wobble more, which fattens the tails and stops
 champion odds from being over-concentrated, the failure mode of treating point-estimate ratings as
 certain. The `SimConfig::rating_uncertainty` multiplier scales (or disables, at 0) the effect. The
-Laplace approximation is a Gaussian posterior around the MAP - the tractable, sampler-free
-treatment; a full HMC/variational posterior is the deeper future version.
+Laplace approximation is a Gaussian posterior around the MAP - the fast treatment used in the hot
+path.
+
+### Full posterior by HMC (`oracle-model::hmc`)
+Beyond the Gaussian Laplace approximation, `GoalModel::posterior_outcome_samples` draws the **full
+posterior** of a matchup's win/draw/win probabilities by **Hamiltonian Monte Carlo**. HMC augments
+the parameters with a momentum, rolls the pair forward with the leapfrog integrator using the
+log-posterior gradient (the negative of the exact penalized-NLL gradient the L-BFGS fit already
+computes), and Metropolis-corrects for the integrator's discretization error - so it follows the
+geometry instead of random-walking. A **diagonal mass matrix set to the Laplace variances**
+preconditions the dynamics (the very different scales of team vs intercept parameters become
+roughly isotropic, so one step size mixes well), the chain starts at the MAP, and the trajectory
+length is jittered to avoid harmonic resonances. `wc-oracle predict --posterior` surfaces it as a
+**90% credible interval** on each outcome - the model's uncertainty about its own forecast. It runs
+offline (CLI), off the live hot path.
 
 ### Calibration (`oracle-model::reliability`)
 Beyond Brier and log loss, `reliability` bins predictions by confidence and compares
