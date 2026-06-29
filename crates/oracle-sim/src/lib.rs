@@ -23,10 +23,12 @@
 //! score/minute/red-cards (see [`simulate_with_live`] / [`InProgress`]) so the tournament
 //! forecast tracks live results. A level knockout tie goes to 30' of extra time at a reduced rate
 //! and then a near-50/50 penalty shootout (see [`SimConfig::extra_time_fraction`] /
-//! [`SimConfig::shootout_skill`]). Knockout ties also carry two per-team factors that open-play
+//! [`SimConfig::shootout_skill`]). Knockout ties also carry per-team factors that open-play
 //! strength cannot represent (they act only in the knockout stage): a **shootout skill** that
-//! tilts the shootout, and a **knockout pedigree** that tilts the scoring rates (see
-//! [`LiveInputs::shootout_rating`] / [`LiveInputs::knockout_pedigree`]). When the tournament already contains knockout fixtures (the
+//! tilts the shootout, a **knockout pedigree** that tilts the scoring rates (see
+//! [`LiveInputs::shootout_rating`] / [`LiveInputs::knockout_pedigree`]), and a one-round
+//! **extra-time fatigue** carry-over - a side whose previous tie needed extra time is dampened in
+//! the next round. When the tournament already contains knockout fixtures (the
 //! group stage is complete), the simulator plays that **real bracket** - finished ties stay
 //! fixed, in-progress ties are conditioned, scheduled ties are sampled - instead of re-deriving a
 //! bracket from a fresh group simulation. Until then, when the tournament has the real 2026 shape
@@ -557,6 +559,8 @@ impl Prepared {
 
     /// Sample the winner's team-index of a knockout tie: 90 minutes, then 30 of extra time
     /// at a reduced rate, then a penalty shootout that is close to a coin flip.
+    /// Returns `(winner, went_to_extra_time)`. `fatigue` is a log-attack penalty per side carried
+    /// from a previous round's extra time.
     fn sample_knockout(
         &self,
         rng: &mut StdRng,
@@ -564,26 +568,31 @@ impl Prepared {
         b: usize,
         att: &[f64],
         def: &[f64],
-    ) -> usize {
+        fatigue: (f64, f64),
+    ) -> (usize, bool) {
         if a == BYE {
-            return b;
+            return (b, false);
         }
         if b == BYE {
-            return a;
+            return (a, false);
         }
         // Apply this iteration's resampled team strengths to the base expected goals, plus the
-        // knockout-pedigree tilt (this is a knockout tie, where temperament/experience tells).
+        // knockout-pedigree tilt (this is a knockout tie, where temperament/experience tells) and
+        // any carried-over extra-time fatigue.
         let (eg_a, eg_b) = self.eg[a * self.n + b];
-        let la = eg_a * (att[a] - def[b] + KO_PEDIGREE_SCALE * self.ko_pedigree[a]).exp();
-        let ma = eg_b * (att[b] - def[a] + KO_PEDIGREE_SCALE * self.ko_pedigree[b]).exp();
+        let la =
+            eg_a * (att[a] - def[b] + KO_PEDIGREE_SCALE * self.ko_pedigree[a] - fatigue.0).exp();
+        let ma =
+            eg_b * (att[b] - def[a] + KO_PEDIGREE_SCALE * self.ko_pedigree[b] - fatigue.1).exp();
         let mut gh = self.sample_goals(rng, la);
         let mut ga = self.sample_goals(rng, ma);
-        if gh == ga {
+        let extra_time = gh == ga;
+        if extra_time {
             // Extra time: a third of a match, at lower scoring intensity.
             gh += self.sample_goals(rng, la * self.extra_time_fraction);
             ga += self.sample_goals(rng, ma * self.extra_time_fraction);
         }
-        match gh.cmp(&ga) {
+        let winner = match gh.cmp(&ga) {
             std::cmp::Ordering::Greater => a,
             std::cmp::Ordering::Less => b,
             std::cmp::Ordering::Equal => {
@@ -598,28 +607,47 @@ impl Prepared {
                     b
                 }
             }
-        }
+        };
+        (winner, extra_time)
     }
 
     /// Play a knockout tie, respecting a materialized fixture for this exact pairing: a finished
     /// fixture returns its winner, an in-progress fixture is conditioned on the live score, and a
     /// pairing with no fixture (a scheduled or not-yet-materialized tie) is sampled fresh.
-    fn play_ko_tie(&self, rng: &mut StdRng, a: usize, b: usize, att: &[f64], def: &[f64]) -> usize {
+    /// Returns `(winner, went_to_extra_time)`. A finished (materialized) tie reports `false` (its
+    /// course is unknown), so it carries no fatigue forward.
+    fn play_ko_tie(
+        &self,
+        rng: &mut StdRng,
+        a: usize,
+        b: usize,
+        att: &[f64],
+        def: &[f64],
+        fatigue: (f64, f64),
+    ) -> (usize, bool) {
         if a == BYE {
-            return b;
+            return (b, false);
         }
         if b == BYE {
-            return a;
+            return (a, false);
         }
         match self.ko_outcomes.get(&pair_key(a, b)) {
-            Some(KoOutcome::Finished(w)) => *w,
+            Some(KoOutcome::Finished(w)) => (*w, false),
             Some(KoOutcome::Live {
                 home_ix,
                 away_ix,
                 rates,
                 current,
-            }) => self.sample_live_ko(rng, (*home_ix, *away_ix), *rates, *current, (att, def)),
-            None => self.sample_knockout(rng, a, b, att, def),
+            }) => {
+                // `fatigue` is ordered (a, b); re-orient it to the fixture's (home, away).
+                let fat = if *home_ix == a {
+                    fatigue
+                } else {
+                    (fatigue.1, fatigue.0)
+                };
+                self.sample_live_ko(rng, (*home_ix, *away_ix), *rates, *current, (att, def), fat)
+            }
+            None => self.sample_knockout(rng, a, b, att, def, fatigue),
         }
     }
 
@@ -627,6 +655,7 @@ impl Prepared {
     /// live-conditioned rates) to the score already on the board, then extra time and a shootout
     /// if still level, mirroring [`Self::sample_knockout`]. `shifts` is this iteration's
     /// `(attack, defense)` strength draw.
+    /// Returns `(winner, went_to_extra_time)`. `fatigue` is `(home, away)` log-attack penalties.
     fn sample_live_ko(
         &self,
         rng: &mut StdRng,
@@ -634,24 +663,26 @@ impl Prepared {
         rem_rates: (f64, f64),
         current: Scoreline,
         (att, def): (&[f64], &[f64]),
-    ) -> usize {
-        // Knockout-pedigree tilt applies here too (this is a knockout tie).
-        let ped_h = KO_PEDIGREE_SCALE * self.ko_pedigree[home_ix];
-        let ped_a = KO_PEDIGREE_SCALE * self.ko_pedigree[away_ix];
-        let rate_h = rem_rates.0 * (att[home_ix] - def[away_ix] + ped_h).exp();
-        let rate_a = rem_rates.1 * (att[away_ix] - def[home_ix] + ped_a).exp();
+        fatigue: (f64, f64),
+    ) -> (usize, bool) {
+        // Knockout-pedigree tilt and carried-over fatigue apply here too (this is a knockout tie).
+        let ph = KO_PEDIGREE_SCALE * self.ko_pedigree[home_ix] - fatigue.0;
+        let pa = KO_PEDIGREE_SCALE * self.ko_pedigree[away_ix] - fatigue.1;
+        let rate_h = rem_rates.0 * (att[home_ix] - def[away_ix] + ph).exp();
+        let rate_a = rem_rates.1 * (att[away_ix] - def[home_ix] + pa).exp();
         let mut gh = i32::from(current.home) + self.sample_goals(rng, rate_h);
         let mut ga = i32::from(current.away) + self.sample_goals(rng, rate_a);
         // Extra time and the shootout use full-match strengths (the remaining-rate conditioning
         // only governs the rest of regulation).
         let (eg_h, eg_a) = self.eg[home_ix * self.n + away_ix];
-        let la = eg_h * (att[home_ix] - def[away_ix] + ped_h).exp();
-        let ma = eg_a * (att[away_ix] - def[home_ix] + ped_a).exp();
-        if gh == ga {
+        let la = eg_h * (att[home_ix] - def[away_ix] + ph).exp();
+        let ma = eg_a * (att[away_ix] - def[home_ix] + pa).exp();
+        let extra_time = gh == ga;
+        if extra_time {
             gh += self.sample_goals(rng, la * self.extra_time_fraction);
             ga += self.sample_goals(rng, ma * self.extra_time_fraction);
         }
-        match gh.cmp(&ga) {
+        let winner = match gh.cmp(&ga) {
             std::cmp::Ordering::Greater => home_ix,
             std::cmp::Ordering::Less => away_ix,
             std::cmp::Ordering::Equal => {
@@ -666,7 +697,8 @@ impl Prepared {
                     away_ix
                 }
             }
-        }
+        };
+        (winner, extra_time)
     }
 
     /// Draw this iteration's per-team log-space `(attack, defense)` strength shifts from each
@@ -696,6 +728,9 @@ impl Prepared {
     /// `total_rounds` = champion.
     fn simulate_once(&self, rng: &mut StdRng) -> Vec<i64> {
         let mut wins = vec![-1i64; self.n];
+        // Per-team log-attack penalty carried into a team's *next* knockout tie when its last tie
+        // went to extra time (reset to 0 after a tie settled in regulation).
+        let mut fatigue = vec![0.0f64; self.n];
 
         // Resample each team's strength for this simulated universe (log-space attack and
         // defense shifts). Held fixed across all of the team's matches this iteration, so a
@@ -715,8 +750,9 @@ impl Prepared {
                 .map(|&(a, b)| {
                     wins[a] = 0;
                     wins[b] = 0;
-                    let w = self.play_ko_tie(rng, a, b, &att, &def);
+                    let (w, et) = self.play_ko_tie(rng, a, b, &att, &def, (0.0, 0.0));
                     wins[w] += 1;
+                    fatigue[w] = if et { KO_FATIGUE_PENALTY } else { 0.0 };
                     w
                 })
                 .collect()
@@ -781,8 +817,9 @@ impl Prepared {
                         let b = resolve_slot(bottom, &winners, &runners, &qualified_thirds);
                         wins[a] = 0;
                         wins[b] = 0;
-                        let w = self.sample_knockout(rng, a, b, &att, &def);
+                        let (w, et) = self.sample_knockout(rng, a, b, &att, &def, (0.0, 0.0));
                         wins[w] += 1;
+                        fatigue[w] = if et { KO_FATIGUE_PENALTY } else { 0.0 };
                         w
                     })
                     .collect()
@@ -800,15 +837,17 @@ impl Prepared {
                 seed_order.resize(bracket, BYE);
                 (0..bracket / 2)
                     .map(|i| {
-                        let w = self.sample_knockout(
+                        let (w, et) = self.sample_knockout(
                             rng,
                             seed_order[i],
                             seed_order[bracket - 1 - i],
                             &att,
                             &def,
+                            (0.0, 0.0),
                         );
                         if w != BYE {
                             wins[w] += 1;
+                            fatigue[w] = if et { KO_FATIGUE_PENALTY } else { 0.0 };
                         }
                         w
                     })
@@ -816,14 +855,21 @@ impl Prepared {
             }
         };
         // ---- Fold R16 -> Final ----. `play_ko_tie` respects any materialized later-round
-        // fixtures (finished/in-progress) and samples the rest.
+        // fixtures (finished/in-progress) and samples the rest. A side that needed extra time last
+        // round carries a fatigue penalty into this one.
         while survivors.len() > 1 {
             let mut next = Vec::with_capacity(survivors.len().div_ceil(2));
             let mut k = 0;
             while k + 1 < survivors.len() {
-                let w = self.play_ko_tie(rng, survivors[k], survivors[k + 1], &att, &def);
+                let (a, b) = (survivors[k], survivors[k + 1]);
+                let fat = (
+                    if a == BYE { 0.0 } else { fatigue[a] },
+                    if b == BYE { 0.0 } else { fatigue[b] },
+                );
+                let (w, et) = self.play_ko_tie(rng, a, b, &att, &def, fat);
                 if w != BYE {
                     wins[w] += 1;
+                    fatigue[w] = if et { KO_FATIGUE_PENALTY } else { 0.0 };
                 }
                 next.push(w);
                 k += 2;
@@ -844,6 +890,10 @@ const KO_PEDIGREE_SCALE: f64 = 0.10;
 /// Shootout win-probability tilt per unit of shootout-skill difference, on top of the
 /// expected-goal edge. Kept modest so a shootout stays mostly a coin flip.
 const SHOOTOUT_RATING_SCALE: f64 = 0.06;
+/// Log-attack penalty carried into the *next* knockout round by a side whose previous tie went to
+/// extra time (the extra 30 minutes plus less recovery sap a team). One round of memory: a side
+/// whose next tie is settled in 90 is recovered for the one after.
+const KO_FATIGUE_PENALTY: f64 = 0.07;
 
 /// A materialized knockout fixture's bearing on the simulation, keyed by its (sorted) team-index
 /// pair. A `Finished` tie is settled; a `Live` tie supplies the live-conditioned remaining rates
@@ -1018,7 +1068,7 @@ mod tests {
         let z = vec![0.0; prep.n];
         let trials = 30_000;
         let wins = (0..trials)
-            .filter(|_| prep.sample_knockout(&mut rng, 0, 1, &z, &z) == 0)
+            .filter(|_| prep.sample_knockout(&mut rng, 0, 1, &z, &z, (0.0, 0.0)).0 == 0)
             .count();
         let rate = wins as f64 / trials as f64;
         assert!(
@@ -1045,12 +1095,51 @@ mod tests {
         let z = vec![0.0; prep.n];
         let trials = 30_000;
         let wins = (0..trials)
-            .filter(|_| prep.sample_knockout(&mut rng, 0, 1, &z, &z) == 0)
+            .filter(|_| prep.sample_knockout(&mut rng, 0, 1, &z, &z, (0.0, 0.0)).0 == 0)
             .count();
         let rate = wins as f64 / trials as f64;
         assert!(
             rate > 0.53,
             "knockout pedigree should favour team 0: {rate:.3}"
+        );
+    }
+
+    #[test]
+    fn extra_time_fatigue_handicaps_the_tired_side() {
+        let t = tiny_tournament();
+        let prep = Prepared::build(
+            &t,
+            &EvenSampler,
+            SimConfig::default(),
+            &LiveInputs::default(),
+            LiveConfig::default(),
+        );
+        let z = vec![0.0; prep.n];
+        let trials = 40_000;
+
+        // Even ties reach extra time a non-trivial share of the time (so fatigue can be carried).
+        let mut rng = StdRng::seed_from_u64(3);
+        let et = (0..trials)
+            .filter(|_| prep.sample_knockout(&mut rng, 0, 1, &z, &z, (0.0, 0.0)).1)
+            .count();
+        assert!(
+            et > trials / 20,
+            "even ties should reach extra time sometimes: {et}/{trials}"
+        );
+
+        // A side carrying extra-time fatigue wins fewer ties than when fresh (same RNG stream).
+        let win = |fatigue: (f64, f64), seed: u64| -> f64 {
+            let mut r = StdRng::seed_from_u64(seed);
+            (0..trials)
+                .filter(|_| prep.sample_knockout(&mut r, 0, 1, &z, &z, fatigue).0 == 0)
+                .count() as f64
+                / trials as f64
+        };
+        let fresh = win((0.0, 0.0), 1);
+        let tired = win((KO_FATIGUE_PENALTY, 0.0), 1);
+        assert!(
+            tired < fresh - 0.01,
+            "a fatigued side should win less: tired {tired:.3} vs fresh {fresh:.3}"
         );
     }
 
@@ -1146,7 +1235,7 @@ mod tests {
         let z = vec![0.0; prep.n];
         let trials = 20_000;
         let a_wins = (0..trials)
-            .filter(|_| prep.sample_knockout(&mut rng, 0, 1, &z, &z) == 0)
+            .filter(|_| prep.sample_knockout(&mut rng, 0, 1, &z, &z, (0.0, 0.0)).0 == 0)
             .count();
         let rate = a_wins as f64 / trials as f64;
         assert!(
@@ -1171,7 +1260,7 @@ mod tests {
         let z = vec![0.0; prep.n];
         let trials = 20_000;
         let strong_wins = (0..trials)
-            .filter(|_| prep.sample_knockout(&mut rng, 3, 4, &z, &z) == 3)
+            .filter(|_| prep.sample_knockout(&mut rng, 3, 4, &z, &z, (0.0, 0.0)).0 == 3)
             .count();
         let rate = strong_wins as f64 / trials as f64;
         assert!(

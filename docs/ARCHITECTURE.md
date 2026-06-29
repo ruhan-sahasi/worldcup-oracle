@@ -243,9 +243,12 @@ shootout** that is close to a coin flip (tilted by the expected-goal edge and pe
 **shootout skill**, clamped to [0.35, 0.65]), instead of being decided by relative strength.
 The knockout rounds also carry a per-team **knockout pedigree** - a log-rate tilt applied only to
 knockout ties (single-elimination temperament/experience), an effect open-play strength, which
-acts in every match, structurally cannot represent. Both knockout factors are reasoned-synthetic
-offline (real: historical shootout conversion and knockout history) and feed in via
-`LiveInputs`. Iterations are independent, so it fans out over `rayon`; per-iteration RNG seeds make
+acts in every match, structurally cannot represent (both knockout factors are reasoned-synthetic
+offline - real: historical shootout conversion and knockout history - and feed in via
+`LiveInputs`). And because the bracket is played round by round, a side whose tie goes to **extra
+time** carries a one-round **fatigue** penalty into the next round - a genuinely dynamic
+within-tournament state the per-tie sampling tracks. Iterations are independent, so it fans out
+over `rayon`; per-iteration RNG seeds make
 a given `(seed, iterations)` perfectly reproducible. Each probability carries a Monte-Carlo
 standard error `sqrt(p(1-p)/N)`, surfaced by `simulate`.
 
