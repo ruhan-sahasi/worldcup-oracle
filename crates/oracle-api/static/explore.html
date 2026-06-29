@@ -64,6 +64,12 @@
   .ci-range { position: absolute; height: 100%; background: rgba(88,166,255,.35); border-radius: 6px; }
   .ci-mean { position: absolute; width: 3px; height: 100%; background: var(--accent); }
   .note { color: var(--muted); font-size: 12px; margin-top: 10px; }
+  .verdict { font-size: 13px; margin: 4px 0 2px; }
+  .chip { font-size: 11px; font-weight: 600; padding: 3px 9px; border-radius: 999px; background: rgba(63,185,80,.15); color: var(--home); }
+  #swap { padding: 8px 10px; }
+  .grid td.ml { outline: 2px solid var(--accent); outline-offset: -2px; font-weight: 700; }
+  #rfilter { width: 220px; margin-bottom: 10px; }
+  kbd { background: #0d1424; border: 1px solid var(--line); border-radius: 4px; padding: 1px 5px; font-size: 11px; }
   footer { text-align: center; color: var(--muted); font-size: 12px; padding: 16px 0 24px; }
 </style>
 </head>
@@ -87,7 +93,7 @@
         <h2>Predict a matchup</h2>
         <div class="row">
           <select id="home"></select>
-          <span class="muted">vs</span>
+          <button class="ghost" id="swap" title="Swap home and away">⇄</button>
           <select id="away"></select>
           <label>odds (optional):</label>
           <input class="odds" id="oh" placeholder="H" />
@@ -95,7 +101,10 @@
           <input class="odds" id="oa" placeholder="A" />
           <button id="predict">Predict</button>
           <button class="ghost" id="posterior">Posterior (HMC)</button>
+          <button class="ghost" id="share" title="Copy a shareable link to this matchup">Copy link</button>
+          <span id="share-ok" class="chip hidden">copied</span>
         </div>
+        <div class="note">Press <kbd>Enter</kbd> to predict. Links are shareable.</div>
         <div id="predict-out" class="hidden"></div>
         <div id="posterior-out" class="hidden"></div>
       </div>
@@ -109,6 +118,10 @@
           <label>iterations</label><input class="num" id="iters" value="20000" />
           <label>seed</label><input class="num" id="seed" value="42" />
           <button id="run-sim">Run</button>
+          <span class="muted">presets:</span>
+          <button class="ghost preset" data-iters="10000">10k</button>
+          <button class="ghost preset" data-iters="50000">50k</button>
+          <button class="ghost preset" data-iters="100000">100k</button>
           <span id="sim-status" class="muted"></span>
         </div>
         <div id="sim-out"></div>
@@ -123,6 +136,7 @@
       </div>
       <div class="panel">
         <h2>Team ratings</h2>
+        <input id="rfilter" placeholder="filter by team or confederation…" />
         <div id="ratings-out" class="muted">loading…</div>
       </div>
     </section>
@@ -151,14 +165,29 @@
   });
 
   // ----- team list (also seeds the ratings cache) -----
-  let teams = [];
   async function loadTeams() {
     const data = await api("/api/ratings");
-    teams = data.teams;
-    const opts = teams.map(t => `<option value="${esc(t.code)}">${esc(t.team)}</option>`).join("");
+    const opts = data.teams.map(t => `<option value="${esc(t.code)}">${esc(t.team)}</option>`).join("");
     $("home").innerHTML = opts; $("away").innerHTML = opts;
-    if (teams[1]) $("away").value = teams[1].code;
+    if (data.teams[1]) $("away").value = data.teams[1].code;
     window._ratings = data;
+  }
+
+  // ----- shareable state: the matchup lives in the URL hash (and is remembered locally) -----
+  function applyState() {
+    const p = new URLSearchParams(location.hash.slice(1));
+    const saved = JSON.parse(localStorage.getItem("matchup") || "{}");
+    const home = p.get("home") || saved.home, away = p.get("away") || saved.away;
+    if (home) $("home").value = home;
+    if (away) $("away").value = away;
+    $("oh").value = p.get("oh") || ""; $("od").value = p.get("od") || ""; $("oa").value = p.get("oa") || "";
+  }
+  function writeState() {
+    const p = new URLSearchParams({ home: $("home").value, away: $("away").value });
+    const [h, d, a] = [$("oh").value, $("od").value, $("oa").value];
+    if (h && d && a) { p.set("oh", h); p.set("od", d); p.set("oa", a); }
+    history.replaceState(null, "", "#" + p.toString());
+    localStorage.setItem("matchup", JSON.stringify({ home: $("home").value, away: $("away").value }));
   }
 
   // ----- matchup prediction -----
@@ -166,7 +195,13 @@
     if (!p) return "";
     return `<tr class="members"><td>${label}</td><td>${pct(p.home_win)}</td><td>${pct(p.draw)}</td><td>${pct(p.away_win)}</td></tr>`;
   }
-  function heatmap(grid, home, away) {
+  function verdict(f) {
+    const e = f.ensemble, gap = Math.abs(e.home_win - e.away_win);
+    if (gap < 0.04) return `⚖️ ${esc(f.home)} and ${esc(f.away)} are evenly matched`;
+    const home = e.home_win > e.away_win;
+    return `⚽ <b>${esc(home ? f.home : f.away)}</b> favoured (${pct(home ? e.home_win : e.away_win)})`;
+  }
+  function heatmap(grid, home, away, ml) {
     let max = 0; grid.grid.forEach(r => r.forEach(p => { if (p > max) max = p; }));
     const N = 8; // show 0..7 goals
     let h = `<table class="grid"><tr><th></th><th colspan="${N}" class="muted">${esc(away)} goals →</th></tr><tr><th class="muted">${esc(home)}↓</th>`;
@@ -177,13 +212,15 @@
       for (let ag = 0; ag < N; ag++) {
         const p = grid.grid[hg][ag];
         const alpha = max > 0 ? (p / max) : 0;
-        h += `<td title="${hg}-${ag}: ${pct(p)}" style="background:rgba(88,166,255,${alpha.toFixed(3)})">${(p * 100).toFixed(0)}</td>`;
+        const cls = (ml && hg === ml.home && ag === ml.away) ? " class=\"ml\"" : "";
+        h += `<td${cls} title="${hg}-${ag}: ${pct(p)}" style="background:rgba(88,166,255,${alpha.toFixed(3)})">${(p * 100).toFixed(0)}</td>`;
       }
       h += "</tr>";
     }
     return h + "</table>";
   }
   async function doPredict() {
+    writeState();
     const out = $("predict-out");
     out.classList.remove("hidden"); out.innerHTML = '<span class="muted">predicting…</span>';
     $("posterior-out").classList.add("hidden");
@@ -194,6 +231,7 @@
       const f = await api(q);
       const e = f.ensemble;
       out.innerHTML = `
+        <div class="verdict">${verdict(f)}</div>
         <div class="bar">
           <span class="h" style="width:${e.home_win * 100}%">${pct(e.home_win)}</span>
           <span class="d" style="width:${e.draw * 100}%">${pct(e.draw)}</span>
@@ -207,12 +245,12 @@
         <div class="note">Expected goals <span class="accent">${f.expected_home.toFixed(2)} – ${f.expected_away.toFixed(2)}</span>
           · most likely <span class="accent">${f.most_likely.home}–${f.most_likely.away}</span> (${pct(f.most_likely.prob)})
           · over 2.5 ${pct(f.over_2_5)} · BTTS ${pct(f.btts)}</div>
-        ${heatmap(f.grid, f.home, f.away)}`;
+        ${heatmap(f.grid, f.home, f.away, f.most_likely)}`;
     } catch (err) { out.innerHTML = `<span class="accent">${esc(err.message)}</span>`; }
   }
   async function doPosterior() {
     const out = $("posterior-out");
-    out.classList.remove("hidden"); out.innerHTML = '<span class="muted">sampling the posterior (HMC)…</span>';
+    out.classList.remove("hidden"); out.innerHTML = '<span class="muted">sampling the posterior (HMC), a few seconds…</span>';
     try {
       const f = await api(`/api/posterior?home=${encodeURIComponent($("home").value)}&away=${encodeURIComponent($("away").value)}&samples=600`);
       const ci = (label, c) => `
@@ -225,13 +263,28 @@
         <div class="note">The model's uncertainty about its own forecast.</div>`;
     } catch (err) { out.innerHTML = `<span class="accent">${esc(err.message)}</span>`; }
   }
+  function swapTeams() {
+    const h = $("home").value; $("home").value = $("away").value; $("away").value = h;
+    const oh = $("oh").value; $("oh").value = $("oa").value; $("oa").value = oh; // home/away odds swap; draw stays
+    doPredict();
+  }
+  function copyLink() {
+    writeState();
+    navigator.clipboard?.writeText(location.href).then(() => {
+      const ok = $("share-ok"); ok.classList.remove("hidden");
+      setTimeout(() => ok.classList.add("hidden"), 1200);
+    });
+  }
 
   // ----- simulation -----
   async function runSim() {
     $("run-sim").disabled = true; $("sim-status").textContent = "simulating…"; $("sim-out").innerHTML = "";
+    localStorage.setItem("sim", JSON.stringify({ iters: $("iters").value, seed: $("seed").value }));
+    const t0 = performance.now();
     try {
       const f = await api(`/api/simulate?iters=${encodeURIComponent($("iters").value)}&seed=${encodeURIComponent($("seed").value)}`);
-      $("sim-status").textContent = `${f.iterations.toLocaleString()} iterations (seed ${f.seed})`;
+      const secs = ((performance.now() - t0) / 1000).toFixed(1);
+      $("sim-status").textContent = `${f.iterations.toLocaleString()} iterations (seed ${f.seed}) · ${secs}s`;
       let h = `<table><tr><th>#</th><th>Team</th><th>Champion</th><th>Final</th><th>Semi</th><th>Quart</th><th>R16</th></tr>`;
       f.teams.slice(0, 24).forEach((t, i) => {
         h += `<tr><td>${i + 1}</td><td>${esc(t.team)}</td>
@@ -246,17 +299,21 @@
   // ----- ratings -----
   let sortKey = "elo", sortDesc = true;
   function renderRatings() {
-    const rows = window._ratings.teams.slice().sort((a, b) => {
-      const x = a[sortKey], y = b[sortKey];
-      const c = typeof x === "string" ? String(x).localeCompare(String(y)) : x - y;
-      return sortDesc ? -c : c;
-    });
+    const q = ($("rfilter").value || "").trim().toLowerCase();
+    const rows = window._ratings.teams
+      .filter(t => !q || t.team.toLowerCase().includes(q) || String(t.confederation).toLowerCase().includes(q) || t.code.toLowerCase().includes(q))
+      .sort((a, b) => {
+        const x = a[sortKey], y = b[sortKey];
+        const c = typeof x === "string" ? String(x).localeCompare(String(y)) : x - y;
+        return sortDesc ? -c : c;
+      });
     const th = (k, label) => `<th data-k="${k}">${label}${sortKey === k ? (sortDesc ? " ▼" : " ▲") : ""}</th>`;
     let h = `<table><tr>${th("team", "Team")}${th("confederation", "Conf")}${th("elo", "Elo")}${th("state_space", "State-space")}${th("strength", "Strength")}</tr>`;
     rows.forEach(t => {
       h += `<tr><td>${esc(t.team)}</td><td class="muted">${esc(t.confederation)}</td>
         <td>${t.elo.toFixed(0)}</td><td>${t.state_space.toFixed(2)}</td><td>${t.strength.toFixed(2)}</td></tr>`;
     });
+    if (!rows.length) h += `<tr><td colspan="5" class="muted">no teams match “${esc(q)}”</td></tr>`;
     $("ratings-out").innerHTML = h + "</table>";
     document.querySelectorAll("#ratings-out th").forEach(el => el.onclick = () => {
       const k = el.dataset.k; if (k === sortKey) sortDesc = !sortDesc; else { sortKey = k; sortDesc = true; }
@@ -274,8 +331,23 @@
   // ----- wire up -----
   $("predict").onclick = doPredict;
   $("posterior").onclick = doPosterior;
+  $("swap").onclick = swapTeams;
+  $("share").onclick = copyLink;
   $("run-sim").onclick = runSim;
-  loadTeams().then(doPredict).catch(e => { $("predict-out").classList.remove("hidden"); $("predict-out").textContent = e.message; });
+  $("rfilter").oninput = renderRatings;
+  document.querySelectorAll(".preset").forEach(b => b.onclick = () => { $("iters").value = b.dataset.iters; runSim(); });
+  // Enter anywhere in the matchup panel triggers a prediction.
+  $("tab-matchup").addEventListener("keydown", e => { if (e.key === "Enter") { e.preventDefault(); doPredict(); } });
+  // Restore the simulation inputs from a previous visit.
+  try {
+    const s = JSON.parse(localStorage.getItem("sim") || "{}");
+    if (s.iters) $("iters").value = s.iters;
+    if (s.seed) $("seed").value = s.seed;
+  } catch (_) {}
+
+  loadTeams()
+    .then(() => { applyState(); return doPredict(); })
+    .catch(e => { $("predict-out").classList.remove("hidden"); $("predict-out").textContent = e.message; });
 </script>
 </body>
 </html>

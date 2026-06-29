@@ -234,9 +234,11 @@ mid-tournament recovers its state instead of starting cold.
 
 `/explore` is an **interactive model explorer** (same dependency-free style) for the on-demand
 capabilities the live dashboard does not cover: predict **any** matchup (with the exact-score-grid
-heatmap, optional bookmaker odds, and the **HMC posterior credible intervals**), run a **custom
-Monte-Carlo** simulation, and browse the team and confederation ratings. It is backed by the
-`/api/*` query endpoints, served by a fit-once `Explorer` kept separate from the live engine.
+heatmap, the most-likely scoreline highlighted, optional bookmaker odds, and the **HMC posterior
+credible intervals**), run a **custom Monte-Carlo** simulation, and browse the team and
+confederation ratings. The current matchup lives in the URL, so any prediction is a **shareable
+link** (a "Copy link" button and a swap-teams toggle make it quick). It is backed by the `/api/*`
+query endpoints, served by a fit-once `Explorer` kept separate from the live engine.
 
 | Method | Path | Description |
 |--------|------|-------------|
