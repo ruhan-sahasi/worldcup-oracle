@@ -1,10 +1,20 @@
-# ---- Build stage ----
-FROM rust:1-bookworm AS builder
+# ---- Dependency planning (cargo-chef) ----
+# cargo-chef caches the (slow) dependency compile in its own layer, so a source-only change
+# recompiles just the workspace crates, not every dependency.
+FROM rust:1-bookworm AS chef
+RUN cargo install cargo-chef --locked
 WORKDIR /app
 
-# Cache dependencies first: copy manifests, then sources.
-COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
-COPY crates ./crates
+FROM chef AS planner
+COPY . .
+RUN cargo chef prepare --recipe-path recipe.json
+
+# ---- Build stage ----
+FROM chef AS builder
+COPY --from=planner /app/recipe.json recipe.json
+# Compile dependencies only (this layer is cached until the dependency set changes).
+RUN cargo chef cook --release --recipe-path recipe.json
+COPY . .
 RUN cargo build --release --bin oracle-server
 
 # ---- Runtime stage ----

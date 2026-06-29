@@ -274,10 +274,11 @@ No key? It runs the deterministic simulation, and every command above works unch
 docker compose up --build         # serves on :8080  (live dashboard + /explore)
 ```
 
-A multi-stage build produces a slim, non-root image with a `/health` healthcheck. The server binds
+A multi-stage build (with **cargo-chef** dependency caching, so a source change recompiles only the
+workspace crates) produces a slim, non-root image with a `/health` healthcheck. The server binds
 and serves the live dashboard immediately; the model explorer fits its baseline in the background
 (its `/api/*` endpoints return 503 for the first few seconds, then go live), so liveness never
-waits on the fit.
+waits on the fit. CI builds the image on every push so the deploy path can't silently break.
 
 ## 🛠️ What this project demonstrates
 
