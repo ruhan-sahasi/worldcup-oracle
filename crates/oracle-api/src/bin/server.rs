@@ -5,6 +5,7 @@
 //! `ORACLE_ADDR` (default `0.0.0.0:8080`).
 
 use std::net::SocketAddr;
+use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 use tracing_subscriber::EnvFilter;
 
@@ -28,6 +29,11 @@ async fn main() -> anyhow::Result<()> {
     )
     .await?;
 
+    // Fit the on-demand explorer once (a few seconds); it backs /explore and the /api/* queries.
+    tracing::info!("fitting the model explorer (baseline)...");
+    let explorer = Arc::new(oracle_engine::Explorer::new());
+    tracing::info!("explorer ready");
+
     let shutdown_cancel = cancel.clone();
     let shutdown = async move {
         let _ = tokio::signal::ctrl_c().await;
@@ -35,7 +41,7 @@ async fn main() -> anyhow::Result<()> {
         shutdown_cancel.cancel();
     };
 
-    oracle_api::serve(engine, addr, shutdown).await?;
+    oracle_api::serve(engine, explorer, addr, shutdown).await?;
 
     cancel.cancel();
     let _ = engine_join.await;

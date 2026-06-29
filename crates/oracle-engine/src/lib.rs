@@ -22,9 +22,11 @@
 
 pub mod event_log;
 pub mod presets;
+pub mod query;
 mod snapshot;
 
 pub use event_log::EventLog;
+pub use query::Explorer;
 pub use snapshot::{MatchPrediction, Metrics, RatingEntry, Snapshot};
 
 use arc_swap::ArcSwap;

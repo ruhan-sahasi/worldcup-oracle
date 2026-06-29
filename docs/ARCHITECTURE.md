@@ -314,6 +314,19 @@ the log is replayed on startup to rebuild state, so a restart mid-tournament rec
 rather than starting cold. The earlier `ScoreSync`/`FullTime` reconciliation makes resume
 self-healing for a live feed that re-emits on restart.
 
+### On-demand explorer (`oracle-engine::query` + `oracle-api` + `static/explore.html`)
+The live `Engine` tracks one running tournament; the `Explorer` is its complement - a fit-once,
+read-only view that answers *ad-hoc* questions (predict any matchup, its HMC posterior credible
+interval, a custom Monte-Carlo run, the ratings). It holds its own baseline (`data::fit_baseline`)
+so exploration never perturbs the live state, and it reuses the model paths the CLI uses
+(`GoalModel::{score_grid, posterior_outcome_samples, confederation_levels}`, `Ensemble::blend`,
+`simulate_with_live`). The transport stays a thin shell: `oracle-api` carries both the `Engine` and
+the `Explorer` in its state (split via `FromRef`), and the new `/api/*` handlers just forward an
+`Explorer` result as JSON - the compute-heavy ones (HMC posterior, simulation) on `spawn_blocking`
+so they never stall the async runtime. `/explore` serves a dependency-free vanilla-JS page (no
+build step) with the same three queries plus an exact-score-grid heatmap and a credible-interval
+view. Request inputs (`iters`, `samples`) are clamped.
+
 ## Quality gates
 - Unit + property-style tests in every crate (probabilities normalize, Elo is
   zero-sum, score grids sum to 1, forecasts nest monotonically).

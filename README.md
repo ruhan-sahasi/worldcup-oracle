@@ -38,8 +38,8 @@ fully offline with **zero keys and zero network**.
   replay of a finished tournament, or the live [football-data.org](https://www.football-data.org) feed.
 - **Lineup aware** -> a confirmed starting XI adjusts a team's effective attack and
   defense, so resting or losing a key player visibly moves that team's odds.
-- **Multiple surfaces** -> a REST API, a WebSocket live stream, a live web dashboard,
-  and a polished CLI/TUI.
+- **Multiple surfaces** -> a REST API, a WebSocket live stream, a live web dashboard, an
+  interactive model explorer, and a polished CLI/TUI.
 
 ## 🧠 The model (in one breath)
 
@@ -216,11 +216,14 @@ optimized rather than guessed.
 cargo run --release -p oracle-cli -- serve         # or: cargo run -p oracle-api --bin oracle-server
 # record every event to a durable log and recover from it on restart:
 cargo run --release -p oracle-cli -- serve --event-log oracle.jsonl
-# open the live dashboard:
+# open the live dashboard, or the interactive model explorer:
 open http://localhost:8080/
+open http://localhost:8080/explore
 # or hit the API directly:
 curl localhost:8080/predict/tournament | jq '.teams[:5]'
-curl localhost:8080/predict/match/1
+curl 'localhost:8080/api/predict?home=Brazil&away=Morocco' | jq '.ensemble'
+curl 'localhost:8080/api/posterior?home=Brazil&away=Morocco' | jq      # HMC credible intervals
+curl 'localhost:8080/api/simulate?iters=20000&seed=42' | jq '.teams[:5]'
 ```
 
 Visiting `/` serves a self-contained dashboard (no build step, no CDN) that subscribes to
@@ -229,15 +232,26 @@ probability-over-time chart, and a feed-health indicator, all updating in real t
 `--event-log`, every event is appended as JSON and replayed on the next start, so a restart
 mid-tournament recovers its state instead of starting cold.
 
+`/explore` is an **interactive model explorer** (same dependency-free style) for the on-demand
+capabilities the live dashboard does not cover: predict **any** matchup (with the exact-score-grid
+heatmap, optional bookmaker odds, and the **HMC posterior credible intervals**), run a **custom
+Monte-Carlo** simulation, and browse the team and confederation ratings. It is backed by the
+`/api/*` query endpoints, served by a fit-once `Explorer` kept separate from the live engine.
+
 | Method | Path | Description |
 |--------|------|-------------|
 | `GET` | `/` | **live web dashboard** |
+| `GET` | `/explore` | **interactive model explorer** |
 | `GET` | `/api` | service info + endpoint list (JSON) |
 | `GET` | `/health` | liveness probe |
 | `GET` | `/teams` | current Elo ratings |
 | `GET` | `/matches` | all match predictions (compact) |
-| `GET` | `/predict/match/{id}` | one match: live odds + exact-score grid |
-| `GET` | `/predict/tournament` | champion-odds table |
+| `GET` | `/predict/match/{id}` | one tournament fixture: live odds + exact-score grid |
+| `GET` | `/predict/tournament` | live champion-odds table |
+| `GET` | `/api/predict?home=&away=` | on-demand forecast for **any** matchup (+ optional odds) |
+| `GET` | `/api/posterior?home=&away=` | HMC posterior **credible intervals** for a matchup |
+| `GET` | `/api/simulate?iters=&seed=` | custom Monte-Carlo champion-odds run |
+| `GET` | `/api/ratings` | team ratings + confederation strength levels |
 | `GET` | `/metrics` | Prometheus metrics |
 | `GET` | `/live` | **WebSocket**: pushes a compact live view on every update |
 
@@ -281,7 +295,9 @@ docker compose up --build         # serves on :8080
   metrics, `#![forbid(unsafe_code)]`, unit + property + integration tests, Criterion
   benchmarks, CI, and Docker.
 - **Full-stack delivery** -> a dependency-free live web dashboard (vanilla JS + canvas)
-  served by the API and driven entirely off the `/live` WebSocket.
+  served by the API off the `/live` WebSocket, plus an interactive **model explorer** at
+  `/explore` (any-matchup prediction with an exact-score heatmap, HMC credible intervals, custom
+  simulation, ratings browser) over on-demand `/api/*` endpoints.
 
 ## 🧪 Tests & benchmarks
 

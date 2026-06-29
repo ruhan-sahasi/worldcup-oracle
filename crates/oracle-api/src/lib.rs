@@ -1,18 +1,25 @@
 //! # oracle-api
 //!
-//! The transport layer: an [`axum`] application exposing the engine over HTTP and
-//! WebSocket. It is a thin shell - every handler just reads an immutable
-//! [`Snapshot`](oracle_engine::Snapshot) from the engine (lock-free) or relays the
-//! broadcast stream. No prediction logic lives here.
+//! The transport layer: an [`axum`] application exposing the engine and the on-demand model over
+//! HTTP and WebSocket. It is a thin shell - the live handlers read an immutable
+//! [`Snapshot`](oracle_engine::Snapshot) from the engine (lock-free) or relay the broadcast
+//! stream; the `/api/*` query handlers just forward an [`Explorer`](oracle_engine::Explorer)
+//! result as JSON. No prediction logic lives here.
 //!
 //! ## Endpoints
 //! | Method | Path | Purpose |
 //! |--------|------|---------|
+//! | GET | `/` | live tournament dashboard |
+//! | GET | `/explore` | interactive model explorer |
 //! | GET | `/health` | liveness probe |
 //! | GET | `/teams` | current Elo ratings |
 //! | GET | `/matches` | all match predictions (compact) |
-//! | GET | `/predict/match/{id}` | one match, full exact-score grid |
-//! | GET | `/predict/tournament` | champion-odds table |
+//! | GET | `/predict/match/{id}` | one tournament fixture, full exact-score grid |
+//! | GET | `/predict/tournament` | live champion-odds table |
+//! | GET | `/api/predict?home=&away=` | on-demand matchup forecast (any two teams) |
+//! | GET | `/api/posterior?home=&away=` | HMC posterior credible intervals for a matchup |
+//! | GET | `/api/simulate?iters=&seed=` | custom Monte-Carlo champion-odds run |
+//! | GET | `/api/ratings` | team ratings + confederation strength levels |
 //! | GET | `/metrics` | Prometheus metrics |
 //! | GET | `/live` | WebSocket: pushes a compact live view on every update |
 #![forbid(unsafe_code)]
@@ -20,7 +27,7 @@
 use axum::{
     extract::{
         ws::{Message, WebSocket, WebSocketUpgrade},
-        Path, State,
+        FromRef, Path, Query, State,
     },
     http::StatusCode,
     response::{Html, IntoResponse, Json},
@@ -29,8 +36,9 @@ use axum::{
 };
 use futures_util::{SinkExt, StreamExt};
 use oracle_domain::{MatchId, MatchStatus, Probabilities, Scoreline, Stage, TeamId};
-use oracle_engine::{Engine, Snapshot};
-use serde::Serialize;
+use oracle_engine::query::{MatchupForecast, PosteriorForecast, RatingsView, SimForecast};
+use oracle_engine::{Engine, Explorer, Snapshot};
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::future::Future;
 use std::net::SocketAddr;
@@ -38,31 +46,63 @@ use std::sync::Arc;
 use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
 
-/// Build the application router with the engine as shared state.
-pub fn router(engine: Arc<Engine>) -> Router {
+/// Shared application state: the live [`Engine`] and the fit-once [`Explorer`] for on-demand
+/// queries. Handlers extract whichever they need via [`FromRef`].
+#[derive(Clone)]
+struct AppState {
+    engine: Arc<Engine>,
+    explorer: Arc<Explorer>,
+}
+
+impl FromRef<AppState> for Arc<Engine> {
+    fn from_ref(state: &AppState) -> Self {
+        state.engine.clone()
+    }
+}
+
+impl FromRef<AppState> for Arc<Explorer> {
+    fn from_ref(state: &AppState) -> Self {
+        state.explorer.clone()
+    }
+}
+
+/// Build the application router. The live tournament is served from the `Engine`; the on-demand
+/// `/explore` page and `/api/*` query endpoints from the `Explorer`.
+pub fn router(engine: Arc<Engine>, explorer: Arc<Explorer>) -> Router {
     Router::new()
         .route("/", get(dashboard))
+        .route("/explore", get(explorer_page))
         .route("/api", get(api_info))
         .route("/health", get(health))
         .route("/teams", get(teams))
         .route("/matches", get(matches))
         .route("/predict/match/:id", get(predict_match))
         .route("/predict/tournament", get(predict_tournament))
+        // On-demand model queries (any matchup, posterior, custom simulation, ratings).
+        .route("/api/predict", get(api_predict))
+        .route("/api/posterior", get(api_posterior))
+        .route("/api/simulate", get(api_simulate))
+        .route("/api/ratings", get(api_ratings))
         .route("/metrics", get(metrics))
         .route("/live", get(live_ws))
         .layer(TraceLayer::new_for_http())
         .layer(CorsLayer::permissive())
-        .with_state(engine)
+        .with_state(AppState { engine, explorer })
 }
 
 /// Serve the API until `shutdown` resolves (graceful shutdown).
-pub async fn serve<F>(engine: Arc<Engine>, addr: SocketAddr, shutdown: F) -> anyhow::Result<()>
+pub async fn serve<F>(
+    engine: Arc<Engine>,
+    explorer: Arc<Explorer>,
+    addr: SocketAddr,
+    shutdown: F,
+) -> anyhow::Result<()>
 where
     F: Future<Output = ()> + Send + 'static,
 {
     let listener = tokio::net::TcpListener::bind(addr).await?;
     tracing::info!(%addr, "oracle-api listening");
-    axum::serve(listener, router(engine))
+    axum::serve(listener, router(engine, explorer))
         .with_graceful_shutdown(shutdown)
         .await?;
     Ok(())
@@ -88,11 +128,95 @@ async fn api_info(State(engine): State<Arc<Engine>>) -> Json<serde_json::Value> 
         "source_healthy": snap.source_healthy,
         "last_update": snap.last_update.to_rfc3339(),
         "endpoints": [
-            "/ (dashboard)", "/health", "/teams", "/matches",
+            "/ (live dashboard)", "/explore (model explorer)", "/health", "/teams", "/matches",
             "/predict/match/{id}", "/predict/tournament",
+            "/api/predict?home=&away=", "/api/posterior?home=&away=",
+            "/api/simulate?iters=&seed=", "/api/ratings",
             "/metrics", "/live (websocket)"
         ],
     }))
+}
+
+/// The interactive model explorer, a self-contained page that calls the `/api/*` endpoints.
+async fn explorer_page() -> Html<&'static str> {
+    Html(include_str!("../static/explore.html"))
+}
+
+/// Query for an on-demand matchup prediction. `neutral` defaults to true (the World Cup default);
+/// supply all three odds to add the market member and anchor the ensemble to it.
+#[derive(Deserialize)]
+struct MatchupParams {
+    home: String,
+    away: String,
+    neutral: Option<bool>,
+    home_odds: Option<f64>,
+    draw_odds: Option<f64>,
+    away_odds: Option<f64>,
+}
+
+async fn api_predict(
+    State(explorer): State<Arc<Explorer>>,
+    Query(p): Query<MatchupParams>,
+) -> Result<Json<MatchupForecast>, StatusCode> {
+    let (Some(home), Some(away)) = (explorer.resolve(&p.home), explorer.resolve(&p.away)) else {
+        return Err(StatusCode::NOT_FOUND);
+    };
+    let odds = match (p.home_odds, p.draw_odds, p.away_odds) {
+        (Some(h), Some(d), Some(a)) => Some((h, d, a)),
+        _ => None,
+    };
+    Ok(Json(explorer.predict(
+        home,
+        away,
+        p.neutral.unwrap_or(true),
+        odds,
+    )))
+}
+
+#[derive(Deserialize)]
+struct PosteriorParams {
+    home: String,
+    away: String,
+    neutral: Option<bool>,
+    samples: Option<usize>,
+}
+
+async fn api_posterior(
+    State(explorer): State<Arc<Explorer>>,
+    Query(p): Query<PosteriorParams>,
+) -> Result<Json<PosteriorForecast>, StatusCode> {
+    let (Some(home), Some(away)) = (explorer.resolve(&p.home), explorer.resolve(&p.away)) else {
+        return Err(StatusCode::NOT_FOUND);
+    };
+    let neutral = p.neutral.unwrap_or(true);
+    let samples = p.samples.unwrap_or(500);
+    // HMC is the slow path; run it off the async runtime so it never stalls other requests.
+    tokio::task::spawn_blocking(move || explorer.posterior(home, away, neutral, samples))
+        .await
+        .map(Json)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+}
+
+#[derive(Deserialize)]
+struct SimParams {
+    iters: Option<u64>,
+    seed: Option<u64>,
+}
+
+async fn api_simulate(
+    State(explorer): State<Arc<Explorer>>,
+    Query(p): Query<SimParams>,
+) -> Result<Json<SimForecast>, StatusCode> {
+    let iters = p.iters.unwrap_or(20_000);
+    let seed = p.seed.unwrap_or(42);
+    tokio::task::spawn_blocking(move || explorer.simulate(iters, seed))
+        .await
+        .map(Json)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+}
+
+async fn api_ratings(State(explorer): State<Arc<Explorer>>) -> Json<RatingsView> {
+    Json(explorer.ratings())
 }
 
 async fn teams(State(engine): State<Arc<Engine>>) -> Json<Vec<oracle_engine::RatingEntry>> {
@@ -305,17 +429,23 @@ impl LiveView {
 
 #[cfg(test)]
 mod tests {
-    use super::router;
+    use super::{router, AppState};
     use axum::body::{to_bytes, Body};
     use axum::http::{Request, StatusCode};
-    use oracle_engine::{presets, spawn, Engine, EngineConfig};
-    use std::sync::Arc;
+    use oracle_engine::{presets, spawn, EngineConfig, Explorer};
+    use std::sync::{Arc, OnceLock};
     use tokio_util::sync::CancellationToken;
     use tower::ServiceExt; // for `oneshot`
 
-    /// Spawn an engine over the deterministic simulation feed (no network), with a populated
-    /// initial snapshot, plus a cancel token to wind it down.
-    async fn test_engine() -> (Arc<Engine>, CancellationToken) {
+    /// One shared `Explorer` for the whole test module (fitting the baseline takes a few seconds).
+    fn shared_explorer() -> Arc<Explorer> {
+        static EX: OnceLock<Arc<Explorer>> = OnceLock::new();
+        EX.get_or_init(|| Arc::new(Explorer::new())).clone()
+    }
+
+    /// Spawn an engine over the deterministic simulation feed (no network), pair it with the
+    /// shared explorer, and return the app state plus a cancel token to wind the engine down.
+    async fn test_state() -> (AppState, CancellationToken) {
         let cancel = CancellationToken::new();
         let (engine, _join) = spawn(
             presets::simulated(),
@@ -324,13 +454,22 @@ mod tests {
         )
         .await
         .expect("engine spawns");
-        (engine, cancel)
+        (
+            AppState {
+                engine,
+                explorer: shared_explorer(),
+            },
+            cancel,
+        )
     }
 
     /// Fire one GET request at a fresh router and return `(status, body bytes)`.
-    async fn get(engine: &Arc<Engine>, uri: &str) -> (StatusCode, Vec<u8>) {
+    async fn get(state: &AppState, uri: &str) -> (StatusCode, Vec<u8>) {
         let req = Request::builder().uri(uri).body(Body::empty()).unwrap();
-        let res = router(engine.clone()).oneshot(req).await.unwrap();
+        let res = router(state.engine.clone(), state.explorer.clone())
+            .oneshot(req)
+            .await
+            .unwrap();
         let status = res.status();
         let bytes = to_bytes(res.into_body(), usize::MAX).await.unwrap();
         (status, bytes.to_vec())
@@ -342,25 +481,25 @@ mod tests {
 
     #[tokio::test]
     async fn rest_routes_return_expected_shapes() {
-        let (engine, cancel) = test_engine().await;
+        let (state, cancel) = test_state().await;
 
-        let (status, body) = get(&engine, "/health").await;
+        let (status, body) = get(&state, "/health").await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body, b"ok");
 
-        let (status, body) = get(&engine, "/api").await;
+        let (status, body) = get(&state, "/api").await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(json(&body)["service"], "worldcup-oracle");
 
-        let (status, body) = get(&engine, "/teams").await;
+        let (status, body) = get(&state, "/teams").await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(json(&body).as_array().unwrap().len(), 48);
 
-        let (status, body) = get(&engine, "/matches").await;
+        let (status, body) = get(&state, "/matches").await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(json(&body).as_array().unwrap().len(), 72);
 
-        let (status, body) = get(&engine, "/predict/tournament").await;
+        let (status, body) = get(&state, "/predict/tournament").await;
         assert_eq!(status, StatusCode::OK);
         let champ_mass: f64 = json(&body)["teams"]
             .as_array()
@@ -373,7 +512,7 @@ mod tests {
             "champion mass ~1: {champ_mass}"
         );
 
-        let (status, body) = get(&engine, "/predict/match/1").await;
+        let (status, body) = get(&state, "/predict/match/1").await;
         assert_eq!(status, StatusCode::OK);
         let m = json(&body);
         assert!(m["home_name"].is_string() && m["away_name"].is_string());
@@ -383,7 +522,7 @@ mod tests {
             + p["away_win"].as_f64().unwrap();
         assert!((sum - 1.0).abs() < 1e-6, "match probs sum to 1");
 
-        let (status, body) = get(&engine, "/metrics").await;
+        let (status, body) = get(&state, "/metrics").await;
         assert_eq!(status, StatusCode::OK);
         assert!(String::from_utf8_lossy(&body).contains("oracle_events_processed_total"));
 
@@ -392,12 +531,63 @@ mod tests {
 
     #[tokio::test]
     async fn unknown_match_is_404_and_dashboard_is_served() {
-        let (engine, cancel) = test_engine().await;
+        let (state, cancel) = test_state().await;
 
-        let (status, _) = get(&engine, "/predict/match/999999").await;
+        let (status, _) = get(&state, "/predict/match/999999").await;
         assert_eq!(status, StatusCode::NOT_FOUND);
 
-        let (status, body) = get(&engine, "/").await;
+        let (status, body) = get(&state, "/").await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(String::from_utf8_lossy(&body).contains("<title>"));
+
+        cancel.cancel();
+    }
+
+    #[tokio::test]
+    async fn on_demand_query_endpoints_work() {
+        let (state, cancel) = test_state().await;
+
+        // Predict any matchup: ensemble probabilities normalize, the full grid is present.
+        let (status, body) = get(&state, "/api/predict?home=Brazil&away=Japan").await;
+        assert_eq!(status, StatusCode::OK);
+        let v = json(&body);
+        let e = &v["ensemble"];
+        let sum = e["home_win"].as_f64().unwrap()
+            + e["draw"].as_f64().unwrap()
+            + e["away_win"].as_f64().unwrap();
+        assert!((sum - 1.0).abs() < 1e-6, "ensemble probs sum to 1");
+        assert_eq!(v["grid"]["grid"].as_array().unwrap().len(), 11);
+
+        // Unknown team -> 404.
+        let (status, _) = get(&state, "/api/predict?home=Brazil&away=Atlantis").await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+
+        // Custom simulation: champion mass ~1.
+        let (status, body) = get(&state, "/api/simulate?iters=2000&seed=1").await;
+        assert_eq!(status, StatusCode::OK);
+        let mass: f64 = json(&body)["teams"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["p_champion"].as_f64().unwrap())
+            .sum();
+        assert!((mass - 1.0).abs() < 0.05, "champion mass ~1: {mass}");
+
+        // Ratings: all teams + six confederations.
+        let (status, body) = get(&state, "/api/ratings").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json(&body)["teams"].as_array().unwrap().len(), 48);
+        assert_eq!(json(&body)["confederations"].as_array().unwrap().len(), 6);
+
+        // Posterior: a 90% credible interval that brackets its own mean.
+        let (status, body) = get(&state, "/api/posterior?home=Brazil&away=Japan&samples=200").await;
+        assert_eq!(status, StatusCode::OK);
+        let hw = &json(&body)["home_win"];
+        assert!(hw["lo"].as_f64().unwrap() <= hw["mean"].as_f64().unwrap());
+        assert!(hw["mean"].as_f64().unwrap() <= hw["hi"].as_f64().unwrap());
+
+        // The explorer page is served.
+        let (status, body) = get(&state, "/explore").await;
         assert_eq!(status, StatusCode::OK);
         assert!(String::from_utf8_lossy(&body).contains("<title>"));
 

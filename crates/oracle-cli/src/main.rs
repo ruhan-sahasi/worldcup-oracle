@@ -927,13 +927,17 @@ async fn cmd_serve(addr: SocketAddr, event_log: Option<std::path::PathBuf>) -> a
     )
     .await?;
 
-    println!("worldcup-oracle serving on http://{addr}  (Ctrl-C to stop)");
+    // The on-demand explorer (backs /explore and the /api/* query endpoints); fit once.
+    println!("fitting the model explorer...");
+    let explorer = std::sync::Arc::new(oracle_engine::Explorer::new());
+
+    println!("worldcup-oracle serving on http://{addr}  (/ live · /explore interactive · Ctrl-C to stop)");
     let shutdown_cancel = cancel.clone();
     let shutdown = async move {
         let _ = tokio::signal::ctrl_c().await;
         shutdown_cancel.cancel();
     };
-    oracle_api::serve(engine, addr, shutdown).await?;
+    oracle_api::serve(engine, explorer, addr, shutdown).await?;
     cancel.cancel();
     let _ = join.await;
     Ok(())
