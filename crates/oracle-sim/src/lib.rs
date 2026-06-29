@@ -23,7 +23,10 @@
 //! score/minute/red-cards (see [`simulate_with_live`] / [`InProgress`]) so the tournament
 //! forecast tracks live results. A level knockout tie goes to 30' of extra time at a reduced rate
 //! and then a near-50/50 penalty shootout (see [`SimConfig::extra_time_fraction`] /
-//! [`SimConfig::shootout_skill`]). When the tournament already contains knockout fixtures (the
+//! [`SimConfig::shootout_skill`]). Knockout ties also carry two per-team factors that open-play
+//! strength cannot represent (they act only in the knockout stage): a **shootout skill** that
+//! tilts the shootout, and a **knockout pedigree** that tilts the scoring rates (see
+//! [`LiveInputs::shootout_rating`] / [`LiveInputs::knockout_pedigree`]). When the tournament already contains knockout fixtures (the
 //! group stage is complete), the simulator plays that **real bracket** - finished ties stay
 //! fixed, in-progress ties are conditioned, scheduled ties are sampled - instead of re-deriving a
 //! bracket from a fresh group simulation. Until then, when the tournament has the real 2026 shape
@@ -79,6 +82,14 @@ pub struct LiveInputs {
     /// The engine fills this from the dynamic state-space rating; empty falls back to the
     /// sampler's own (static, fit-based) uncertainty.
     pub rating_sigma: HashMap<TeamId, f64>,
+    /// Per-team **penalty-shootout skill** (positive = better). Tilts a level knockout tie's
+    /// shootout away from the coin flip, on top of the small expected-goal edge. Applies only in
+    /// the knockout stage; absent = neutral.
+    pub shootout_rating: HashMap<TeamId, f64>,
+    /// Per-team **knockout pedigree** (positive = handles single-elimination pressure better).
+    /// A log-rate tilt applied only to knockout ties - an effect open-play strength, which acts
+    /// everywhere, cannot represent. Absent = neutral.
+    pub knockout_pedigree: HashMap<TeamId, f64>,
 }
 
 /// Supplies expected goals for a (neutral-venue) matchup. Implemented for the
@@ -222,6 +233,10 @@ struct Prepared {
     dispersion: f64,
     /// Per-team log-space strength SD (indexed by team-index), resampled each iteration.
     team_sigma: Vec<f64>,
+    /// Per-team penalty-shootout skill (indexed by team-index); tilts the shootout coin flip.
+    shootout_rating: Vec<f64>,
+    /// Per-team knockout pedigree (indexed by team-index); a knockout-only log-rate tilt.
+    ko_pedigree: Vec<f64>,
     /// Whether any team has non-zero strength uncertainty (skip the draw entirely if not).
     has_uncertainty: bool,
     /// Whether the tournament has the 2026 shape (12 full groups, top-2 + 8 thirds), so the
@@ -478,6 +493,16 @@ impl Prepared {
             .collect();
         let has_uncertainty = team_sigma.iter().any(|&s| s > 0.0);
 
+        // Per-team knockout factors (neutral 0 when absent): shootout skill and pedigree.
+        let shootout_rating: Vec<f64> = teams
+            .iter()
+            .map(|&t| inputs.shootout_rating.get(&t).copied().unwrap_or(0.0))
+            .collect();
+        let ko_pedigree: Vec<f64> = teams
+            .iter()
+            .map(|&t| inputs.knockout_pedigree.get(&t).copied().unwrap_or(0.0))
+            .collect();
+
         // The fixed 2026 bracket applies only to the real shape: 12 groups that each can
         // produce a third-placed team, top two plus the eight best thirds advancing.
         let fixed_bracket = groups.len() == 12
@@ -497,6 +522,8 @@ impl Prepared {
             shootout_skill: config.shootout_skill,
             dispersion: sampler.dispersion().max(0.0),
             team_sigma,
+            shootout_rating,
+            ko_pedigree,
             has_uncertainty,
             fixed_bracket,
             ko_r32,
@@ -544,10 +571,11 @@ impl Prepared {
         if b == BYE {
             return a;
         }
-        // Apply this iteration's resampled team strengths to the base expected goals.
+        // Apply this iteration's resampled team strengths to the base expected goals, plus the
+        // knockout-pedigree tilt (this is a knockout tie, where temperament/experience tells).
         let (eg_a, eg_b) = self.eg[a * self.n + b];
-        let la = eg_a * (att[a] - def[b]).exp();
-        let ma = eg_b * (att[b] - def[a]).exp();
+        let la = eg_a * (att[a] - def[b] + KO_PEDIGREE_SCALE * self.ko_pedigree[a]).exp();
+        let ma = eg_b * (att[b] - def[a] + KO_PEDIGREE_SCALE * self.ko_pedigree[b]).exp();
         let mut gh = self.sample_goals(rng, la);
         let mut ga = self.sample_goals(rng, ma);
         if gh == ga {
@@ -559,8 +587,11 @@ impl Prepared {
             std::cmp::Ordering::Greater => a,
             std::cmp::Ordering::Less => b,
             std::cmp::Ordering::Equal => {
-                // Shootout: near 50/50, only slightly tilted by the expected-goal edge.
-                let p = (0.5 + self.shootout_skill * (la - ma)).clamp(0.35, 0.65);
+                // Shootout: near 50/50, tilted by the expected-goal edge and shootout skill.
+                let p = (0.5
+                    + self.shootout_skill * (la - ma)
+                    + SHOOTOUT_RATING_SCALE * (self.shootout_rating[a] - self.shootout_rating[b]))
+                    .clamp(0.35, 0.65);
                 if rng.gen::<f64>() < p {
                     a
                 } else {
@@ -604,15 +635,18 @@ impl Prepared {
         current: Scoreline,
         (att, def): (&[f64], &[f64]),
     ) -> usize {
-        let rate_h = rem_rates.0 * (att[home_ix] - def[away_ix]).exp();
-        let rate_a = rem_rates.1 * (att[away_ix] - def[home_ix]).exp();
+        // Knockout-pedigree tilt applies here too (this is a knockout tie).
+        let ped_h = KO_PEDIGREE_SCALE * self.ko_pedigree[home_ix];
+        let ped_a = KO_PEDIGREE_SCALE * self.ko_pedigree[away_ix];
+        let rate_h = rem_rates.0 * (att[home_ix] - def[away_ix] + ped_h).exp();
+        let rate_a = rem_rates.1 * (att[away_ix] - def[home_ix] + ped_a).exp();
         let mut gh = i32::from(current.home) + self.sample_goals(rng, rate_h);
         let mut ga = i32::from(current.away) + self.sample_goals(rng, rate_a);
         // Extra time and the shootout use full-match strengths (the remaining-rate conditioning
         // only governs the rest of regulation).
         let (eg_h, eg_a) = self.eg[home_ix * self.n + away_ix];
-        let la = eg_h * (att[home_ix] - def[away_ix]).exp();
-        let ma = eg_a * (att[away_ix] - def[home_ix]).exp();
+        let la = eg_h * (att[home_ix] - def[away_ix] + ped_h).exp();
+        let ma = eg_a * (att[away_ix] - def[home_ix] + ped_a).exp();
         if gh == ga {
             gh += self.sample_goals(rng, la * self.extra_time_fraction);
             ga += self.sample_goals(rng, ma * self.extra_time_fraction);
@@ -621,7 +655,11 @@ impl Prepared {
             std::cmp::Ordering::Greater => home_ix,
             std::cmp::Ordering::Less => away_ix,
             std::cmp::Ordering::Equal => {
-                let p = (0.5 + self.shootout_skill * (la - ma)).clamp(0.35, 0.65);
+                let p = (0.5
+                    + self.shootout_skill * (la - ma)
+                    + SHOOTOUT_RATING_SCALE
+                        * (self.shootout_rating[home_ix] - self.shootout_rating[away_ix]))
+                    .clamp(0.35, 0.65);
                 if rng.gen::<f64>() < p {
                     home_ix
                 } else {
@@ -800,6 +838,13 @@ impl Prepared {
 /// Sentinel team-index representing a bracket bye.
 const BYE: usize = usize::MAX;
 
+/// Log-rate tilt per unit of knockout pedigree, applied only to knockout ties (a side that
+/// handles single-elimination pressure better scores a touch more / concedes a touch less).
+const KO_PEDIGREE_SCALE: f64 = 0.10;
+/// Shootout win-probability tilt per unit of shootout-skill difference, on top of the
+/// expected-goal edge. Kept modest so a shootout stays mostly a coin flip.
+const SHOOTOUT_RATING_SCALE: f64 = 0.06;
+
 /// A materialized knockout fixture's bearing on the simulation, keyed by its (sorted) team-index
 /// pair. A `Finished` tie is settled; a `Live` tie supplies the live-conditioned remaining rates
 /// and the score already on the board so the simulator samples only the rest.
@@ -942,6 +987,100 @@ mod tests {
     impl MatchSampler for EvenSampler {
         fn xg(&self, _home: TeamId, _away: TeamId) -> (f64, f64) {
             (1.3, 1.3)
+        }
+    }
+
+    /// Even, very low-scoring teams, so most knockout ties reach a penalty shootout (lets the
+    /// shootout-skill effect be isolated).
+    struct GoallessSampler;
+    impl MatchSampler for GoallessSampler {
+        fn xg(&self, _home: TeamId, _away: TeamId) -> (f64, f64) {
+            (0.35, 0.35)
+        }
+    }
+
+    #[test]
+    fn shootout_skill_tilts_a_level_tie() {
+        // Even, low-scoring teams reach shootouts often; team 0 is far better at them.
+        let t = tiny_tournament();
+        let inputs = LiveInputs {
+            shootout_rating: [(TeamId(0), 4.0)].into_iter().collect(),
+            ..Default::default()
+        };
+        let prep = Prepared::build(
+            &t,
+            &GoallessSampler,
+            SimConfig::default(),
+            &inputs,
+            LiveConfig::default(),
+        );
+        let mut rng = StdRng::seed_from_u64(11);
+        let z = vec![0.0; prep.n];
+        let trials = 30_000;
+        let wins = (0..trials)
+            .filter(|_| prep.sample_knockout(&mut rng, 0, 1, &z, &z) == 0)
+            .count();
+        let rate = wins as f64 / trials as f64;
+        assert!(
+            rate > 0.54,
+            "shootout skill should give a real edge when ties reach shootouts: {rate:.3}"
+        );
+    }
+
+    #[test]
+    fn knockout_pedigree_favours_the_clutch_side() {
+        let t = tiny_tournament();
+        let inputs = LiveInputs {
+            knockout_pedigree: [(TeamId(0), 2.0)].into_iter().collect(),
+            ..Default::default()
+        };
+        let prep = Prepared::build(
+            &t,
+            &EvenSampler,
+            SimConfig::default(),
+            &inputs,
+            LiveConfig::default(),
+        );
+        let mut rng = StdRng::seed_from_u64(5);
+        let z = vec![0.0; prep.n];
+        let trials = 30_000;
+        let wins = (0..trials)
+            .filter(|_| prep.sample_knockout(&mut rng, 0, 1, &z, &z) == 0)
+            .count();
+        let rate = wins as f64 / trials as f64;
+        assert!(
+            rate > 0.53,
+            "knockout pedigree should favour team 0: {rate:.3}"
+        );
+    }
+
+    #[test]
+    fn knockout_factors_leave_the_group_stage_untouched() {
+        // The factors only enter knockout sampling, so per-team group-qualification probabilities
+        // must be bit-identical with and without them (each iteration is independently seeded).
+        let t = full_tournament();
+        let cfg = SimConfig {
+            iterations: 2000,
+            ..Default::default()
+        };
+        let base = simulate(&t, &RankSampler, cfg);
+        let inputs = LiveInputs {
+            knockout_pedigree: (0..48u32)
+                .map(|i| (TeamId(i), (i % 5) as f64 - 2.0))
+                .collect(),
+            shootout_rating: (0..48u32)
+                .map(|i| (TeamId(i), (i % 3) as f64 - 1.0))
+                .collect(),
+            ..Default::default()
+        };
+        let with_ko = simulate_with_live(&t, &RankSampler, cfg, &inputs, LiveConfig::default());
+        for (b, w) in base.teams.iter().zip(&with_ko.teams) {
+            assert_eq!(b.team, w.team);
+            assert!(
+                (b.p_advance_group - w.p_advance_group).abs() < 1e-12,
+                "group qualification changed for {:?}",
+                b.team
+            );
         }
     }
 

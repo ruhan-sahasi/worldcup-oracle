@@ -180,9 +180,11 @@ fn cmd_simulate(iters: u64, seed: u64, top: usize) -> anyhow::Result<()> {
         tournament.name, iters, seed
     );
     // Apply the full match context (host, crowd, altitude, rest, travel, heat) plus the style
-    // matchup to every fixture.
+    // matchup to every fixture, and the per-team knockout factors (shootout skill, pedigree).
     let inputs = LiveInputs {
         venue: data::matchup_adjustments(&tournament),
+        shootout_rating: data::shootout_ratings(),
+        knockout_pedigree: data::knockout_pedigree(),
         ..Default::default()
     };
     let start = Instant::now();

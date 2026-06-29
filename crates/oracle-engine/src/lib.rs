@@ -396,6 +396,9 @@ struct EngineState {
     /// Per-match adjustments precomputed once: venue/crowd/travel/heat context plus the style
     /// matchup (`data::matchup_adjustments`).
     venue_adj: HashMap<MatchId, VenueAdj>,
+    /// Per-team knockout factors precomputed once: penalty-shootout skill and knockout pedigree.
+    shootout_rating: HashMap<TeamId, f64>,
+    knockout_pedigree: HashMap<TeamId, f64>,
     /// Whether the data feed is currently healthy (updated by `SourceStatus` events).
     source_healthy: bool,
     /// Wall-clock time the last event was processed - surfaces feed staleness.
@@ -422,6 +425,8 @@ impl EngineState {
         // Match context (venue/crowd/travel/heat) plus the style matchup is static for the
         // tournament, so precompute it once.
         let venue_adj = oracle_ingest::data::matchup_adjustments(&tournament);
+        let shootout_rating = oracle_ingest::data::shootout_ratings();
+        let knockout_pedigree = oracle_ingest::data::knockout_pedigree();
         Self {
             tournament,
             names,
@@ -442,6 +447,8 @@ impl EngineState {
                 teams: Vec::new(),
             },
             venue_adj,
+            shootout_rating,
+            knockout_pedigree,
             source_healthy: true,
             last_update: chrono::Utc::now(),
         }
@@ -713,6 +720,8 @@ impl EngineState {
             live,
             venue,
             rating_sigma,
+            shootout_rating: self.shootout_rating.clone(),
+            knockout_pedigree: self.knockout_pedigree.clone(),
         };
         self.last_forecast = simulate_with_live(
             &self.tournament,

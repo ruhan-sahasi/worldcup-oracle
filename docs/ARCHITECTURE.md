@@ -239,10 +239,14 @@ Plays the remaining group fixtures and the 32-team knockout out tens of thousand
 times - sampling each scoreline from the goal model - to estimate every team's
 probability of advancing, reaching each round, and winning the cup. A level knockout tie
 goes to **30 minutes of extra time** at a reduced rate and, if still level, a **penalty
-shootout** that is close to a coin flip (only slightly tilted by the expected-goal edge,
-clamped to [0.35, 0.65]), instead of being decided by relative strength. Iterations are
-independent, so it fans out over `rayon`; per-iteration RNG seeds make a given
-`(seed, iterations)` perfectly reproducible. Each probability carries a Monte-Carlo
+shootout** that is close to a coin flip (tilted by the expected-goal edge and per-team
+**shootout skill**, clamped to [0.35, 0.65]), instead of being decided by relative strength.
+The knockout rounds also carry a per-team **knockout pedigree** - a log-rate tilt applied only to
+knockout ties (single-elimination temperament/experience), an effect open-play strength, which
+acts in every match, structurally cannot represent. Both knockout factors are reasoned-synthetic
+offline (real: historical shootout conversion and knockout history) and feed in via
+`LiveInputs`. Iterations are independent, so it fans out over `rayon`; per-iteration RNG seeds make
+a given `(seed, iterations)` perfectly reproducible. Each probability carries a Monte-Carlo
 standard error `sqrt(p(1-p)/N)`, surfaced by `simulate`.
 
 The knockout uses the **fixed 2026 bracket** (`oracle_domain::bracket::FIXED_R32`, shared with

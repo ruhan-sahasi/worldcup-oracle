@@ -954,6 +954,41 @@ pub fn style_adjustments(tournament: &Tournament) -> HashMap<MatchId, VenueAdj> 
         .collect()
 }
 
+/// Synthetic per-team **penalty-shootout skill** (roughly a z-score, mean ~0; positive = better).
+/// Shootout outcomes carry a persistent component - kicking technique, the goalkeeper, composure -
+/// that open-play strength does not capture, so most models' 50/50 shootout leaves signal on the
+/// table. Reasoned-synthetic (on real data: historical shootout conversion and save rate).
+pub fn shootout_ratings() -> HashMap<TeamId, f64> {
+    (0..TEAMS.len() as u32)
+        .map(|i| {
+            let mut rng = StdRng::seed_from_u64(0x5400_7E07 ^ u64::from(i));
+            (TeamId(i), rng.gen_range(-1.0..1.0))
+        })
+        .collect()
+}
+
+/// Synthetic per-team **knockout pedigree**: how well a side handles single-elimination pressure.
+/// It tracks strength only mildly (success breeds experience) but carries substantial independent
+/// variation, since temperament is not open-play quality - and 2026's 48-team field brings more
+/// debutants than ever. Reasoned-synthetic (on real data: tournament knockout history / debutant
+/// status). Applied only to knockout ties, an effect additive strength (which acts everywhere)
+/// cannot represent.
+pub fn knockout_pedigree() -> HashMap<TeamId, f64> {
+    TEAMS
+        .iter()
+        .enumerate()
+        .map(|(i, &(_, _, _, rating))| {
+            let strength_part = ((rating - 1800.0) / 350.0).clamp(-1.0, 1.0);
+            let mut rng = StdRng::seed_from_u64(0x9ED1_6EE5 ^ i as u64);
+            let independent = rng.gen_range(-0.8..0.8);
+            (
+                TeamId(i as u32),
+                (0.4 * strength_part + independent).clamp(-1.2, 1.2),
+            )
+        })
+        .collect()
+}
+
 /// Every per-match log-space adjustment that applies to a fixture: venue/crowd/travel context
 /// plus the style matchup, summed componentwise. This is what the engine and CLI feed to the
 /// Monte-Carlo (and the engine's single-match prediction), so all context reaches the forecast.
@@ -1401,6 +1436,19 @@ mod tests {
         let adj =
             oracle_model::style_adjustment(&style_profile(id("ARG")), &style_profile(id("JPN")));
         assert!((adj.0 .0 + adj.1 .0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn knockout_factors_cover_every_team_in_range_and_are_deterministic() {
+        let so = shootout_ratings();
+        let ped = knockout_pedigree();
+        assert_eq!(so.len(), 48);
+        assert_eq!(ped.len(), 48);
+        assert!(so.values().all(|v| v.abs() <= 1.0 + 1e-9));
+        assert!(ped.values().all(|v| v.abs() <= 1.2 + 1e-9));
+        // Deterministic (reproducible across calls).
+        assert_eq!(so, shootout_ratings());
+        assert_eq!(ped, knockout_pedigree());
     }
 
     #[test]

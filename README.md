@@ -54,6 +54,7 @@ fully offline with **zero keys and zero network**.
 | **Suspension tracking** | yellow-card accumulation drops a suspended starter from the next match before its lineup is known |
 | **Venue, crowd, travel & heat context** | host advantage, altitude, rest-day differential, a continuous **crowd-partisanship** signal (diaspora / traveling fans, not just literal hosts), **continental travel + time-zone load** (eastward trips bite harder), and **match-time heat** (afternoon kickoffs in Dallas/Monterrey/Miami suppress tempo, which also flattens the favourite's edge) adjust each match |
 | **Style matchup** (a low-rank style embedding per team, scored by a **bilinear** `sₕᵀ M sₐ` form) | a **non-transitive** rock-paper-scissors edge that additive ratings cannot represent (style A troubles style B) |
+| **Knockout factors** (per-team **penalty-shootout skill** + **knockout pedigree**) | knockout-only signals open-play strength can't capture: who wins shootouts, and who handles single-elimination pressure (debutant-heavy in a 48-team field) |
 | **Monte-Carlo** (rayon-parallel, **conditions in-progress matches** on their live score; the **fixed 2026 knockout bracket**; knockouts go to **extra time + a near-50/50 shootout**; **resamples team strength each iteration**) | tournament-level champion odds that move with live results and carry parameter uncertainty |
 
 Calibration is measured with proper scoring rules (Brier, log-loss), benchmarked against
@@ -309,7 +310,9 @@ cargo bench -p oracle-sim       # Monte-Carlo throughput
   reasoned-synthetic models (crowd: host on home soil, Mexico's reach across US venues,
   confederation-level diaspora pull; style: regional style clusters with per-team jitter), not
   measured attendance or fitted style embeddings - on real data the style vectors would be fit
-  from match residuals.
+  from match residuals. The **knockout factors** (per-team penalty-shootout skill and knockout
+  pedigree) are likewise reasoned-synthetic; on real data they would come from historical shootout
+  conversion and tournament knockout history.
 - Knockout ties go to extra time and a near-50/50 shootout, and the simulator plays the **fixed
   2026 knockout bracket** (group winners/runners-up/best thirds placed in their real R32 slots)
   when the tournament has the real shape. Once the group stage finishes, the engine **materializes
