@@ -42,16 +42,20 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::future::Future;
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
 
-/// Shared application state: the live [`Engine`] and the fit-once [`Explorer`] for on-demand
+/// A lazily-fit explorer: empty until the background fit completes (the `/api/*` endpoints return
+/// 503 until then), so the server starts serving the live dashboard and engine endpoints at once.
+type ExplorerSlot = Arc<OnceLock<Explorer>>;
+
+/// Shared application state: the live [`Engine`] and the (lazily-fit) [`Explorer`] for on-demand
 /// queries. Handlers extract whichever they need via [`FromRef`].
 #[derive(Clone)]
 struct AppState {
     engine: Arc<Engine>,
-    explorer: Arc<Explorer>,
+    explorer: ExplorerSlot,
 }
 
 impl FromRef<AppState> for Arc<Engine> {
@@ -60,15 +64,28 @@ impl FromRef<AppState> for Arc<Engine> {
     }
 }
 
-impl FromRef<AppState> for Arc<Explorer> {
+impl FromRef<AppState> for ExplorerSlot {
     fn from_ref(state: &AppState) -> Self {
         state.explorer.clone()
     }
 }
 
+/// Create an explorer handle and fit its baseline in a background blocking task, so the server can
+/// start serving immediately. The `/api/*` query endpoints return 503 until the fit (a few
+/// seconds) completes; the live dashboard and engine endpoints are available at once.
+pub fn spawn_explorer() -> ExplorerSlot {
+    let slot: ExplorerSlot = Arc::new(OnceLock::new());
+    let fill = slot.clone();
+    tokio::task::spawn_blocking(move || {
+        let _ = fill.set(Explorer::new());
+        tracing::info!("model explorer ready");
+    });
+    slot
+}
+
 /// Build the application router. The live tournament is served from the `Engine`; the on-demand
 /// `/explore` page and `/api/*` query endpoints from the `Explorer`.
-pub fn router(engine: Arc<Engine>, explorer: Arc<Explorer>) -> Router {
+pub fn router(engine: Arc<Engine>, explorer: ExplorerSlot) -> Router {
     Router::new()
         .route("/", get(dashboard))
         .route("/explore", get(explorer_page))
@@ -93,7 +110,7 @@ pub fn router(engine: Arc<Engine>, explorer: Arc<Explorer>) -> Router {
 /// Serve the API until `shutdown` resolves (graceful shutdown).
 pub async fn serve<F>(
     engine: Arc<Engine>,
-    explorer: Arc<Explorer>,
+    explorer: ExplorerSlot,
     addr: SocketAddr,
     shutdown: F,
 ) -> anyhow::Result<()>
@@ -119,7 +136,10 @@ async fn dashboard() -> Html<&'static str> {
     Html(include_str!("../static/index.html"))
 }
 
-async fn api_info(State(engine): State<Arc<Engine>>) -> Json<serde_json::Value> {
+async fn api_info(
+    State(engine): State<Arc<Engine>>,
+    State(explorer): State<ExplorerSlot>,
+) -> Json<serde_json::Value> {
     let snap = engine.snapshot();
     Json(serde_json::json!({
         "service": "worldcup-oracle",
@@ -127,6 +147,8 @@ async fn api_info(State(engine): State<Arc<Engine>>) -> Json<serde_json::Value> 
         "provider": engine.provider_name(),
         "source_healthy": snap.source_healthy,
         "last_update": snap.last_update.to_rfc3339(),
+        // The explorer fits in the background; the /api/* query endpoints 503 until it is ready.
+        "explorer_ready": explorer.get().is_some(),
         "endpoints": [
             "/ (live dashboard)", "/explore (model explorer)", "/health", "/teams", "/matches",
             "/predict/match/{id}", "/predict/tournament",
@@ -154,18 +176,24 @@ struct MatchupParams {
     away_odds: Option<f64>,
 }
 
+/// The fit explorer, or 503 while it is still warming up.
+fn ready(explorer: &OnceLock<Explorer>) -> Result<&Explorer, StatusCode> {
+    explorer.get().ok_or(StatusCode::SERVICE_UNAVAILABLE)
+}
+
 async fn api_predict(
-    State(explorer): State<Arc<Explorer>>,
+    State(explorer): State<ExplorerSlot>,
     Query(p): Query<MatchupParams>,
 ) -> Result<Json<MatchupForecast>, StatusCode> {
-    let (Some(home), Some(away)) = (explorer.resolve(&p.home), explorer.resolve(&p.away)) else {
+    let ex = ready(&explorer)?;
+    let (Some(home), Some(away)) = (ex.resolve(&p.home), ex.resolve(&p.away)) else {
         return Err(StatusCode::NOT_FOUND);
     };
     let odds = match (p.home_odds, p.draw_odds, p.away_odds) {
         (Some(h), Some(d), Some(a)) => Some((h, d, a)),
         _ => None,
     };
-    Ok(Json(explorer.predict(
+    Ok(Json(ex.predict(
         home,
         away,
         p.neutral.unwrap_or(true),
@@ -182,19 +210,25 @@ struct PosteriorParams {
 }
 
 async fn api_posterior(
-    State(explorer): State<Arc<Explorer>>,
+    State(explorer): State<ExplorerSlot>,
     Query(p): Query<PosteriorParams>,
 ) -> Result<Json<PosteriorForecast>, StatusCode> {
-    let (Some(home), Some(away)) = (explorer.resolve(&p.home), explorer.resolve(&p.away)) else {
+    let ex = ready(&explorer)?;
+    let (Some(home), Some(away)) = (ex.resolve(&p.home), ex.resolve(&p.away)) else {
         return Err(StatusCode::NOT_FOUND);
     };
     let neutral = p.neutral.unwrap_or(true);
     let samples = p.samples.unwrap_or(500);
     // HMC is the slow path; run it off the async runtime so it never stalls other requests.
-    tokio::task::spawn_blocking(move || explorer.posterior(home, away, neutral, samples))
-        .await
-        .map(Json)
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+    tokio::task::spawn_blocking(move || {
+        explorer
+            .get()
+            .unwrap()
+            .posterior(home, away, neutral, samples)
+    })
+    .await
+    .map(Json)
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
 }
 
 #[derive(Deserialize)]
@@ -204,19 +238,24 @@ struct SimParams {
 }
 
 async fn api_simulate(
-    State(explorer): State<Arc<Explorer>>,
+    State(explorer): State<ExplorerSlot>,
     Query(p): Query<SimParams>,
 ) -> Result<Json<SimForecast>, StatusCode> {
+    if explorer.get().is_none() {
+        return Err(StatusCode::SERVICE_UNAVAILABLE);
+    }
     let iters = p.iters.unwrap_or(20_000);
     let seed = p.seed.unwrap_or(42);
-    tokio::task::spawn_blocking(move || explorer.simulate(iters, seed))
+    tokio::task::spawn_blocking(move || explorer.get().unwrap().simulate(iters, seed))
         .await
         .map(Json)
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
 }
 
-async fn api_ratings(State(explorer): State<Arc<Explorer>>) -> Json<RatingsView> {
-    Json(explorer.ratings())
+async fn api_ratings(
+    State(explorer): State<ExplorerSlot>,
+) -> Result<Json<RatingsView>, StatusCode> {
+    Ok(Json(ready(&explorer)?.ratings()))
 }
 
 async fn teams(State(engine): State<Arc<Engine>>) -> Json<Vec<oracle_engine::RatingEntry>> {
@@ -437,10 +476,16 @@ mod tests {
     use tokio_util::sync::CancellationToken;
     use tower::ServiceExt; // for `oneshot`
 
-    /// One shared `Explorer` for the whole test module (fitting the baseline takes a few seconds).
-    fn shared_explorer() -> Arc<Explorer> {
-        static EX: OnceLock<Arc<Explorer>> = OnceLock::new();
-        EX.get_or_init(|| Arc::new(Explorer::new())).clone()
+    /// One shared, already-fit explorer slot for the whole test module (fitting the baseline takes
+    /// a few seconds). Tests that want the warming-up state use an empty `OnceLock` instead.
+    fn shared_explorer() -> Arc<OnceLock<Explorer>> {
+        static EX: OnceLock<Arc<OnceLock<Explorer>>> = OnceLock::new();
+        EX.get_or_init(|| {
+            let slot = Arc::new(OnceLock::new());
+            let _ = slot.set(Explorer::new());
+            slot
+        })
+        .clone()
     }
 
     /// Spawn an engine over the deterministic simulation feed (no network), pair it with the
@@ -540,6 +585,43 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         assert!(String::from_utf8_lossy(&body).contains("<title>"));
 
+        cancel.cancel();
+    }
+
+    #[tokio::test]
+    async fn api_is_503_while_warming_but_live_endpoints_stay_up() {
+        // An empty explorer slot models the warmup window (before the background fit completes).
+        let cancel = CancellationToken::new();
+        let (engine, _join) = spawn(
+            presets::simulated(),
+            EngineConfig::default(),
+            cancel.clone(),
+        )
+        .await
+        .expect("engine spawns");
+        let state = AppState {
+            engine,
+            explorer: Arc::new(OnceLock::new()),
+        };
+
+        // The on-demand query endpoints report "warming up".
+        for uri in [
+            "/api/ratings",
+            "/api/predict?home=Brazil&away=Japan",
+            "/api/simulate?iters=2000",
+        ] {
+            let (status, _) = get(&state, uri).await;
+            assert_eq!(
+                status,
+                StatusCode::SERVICE_UNAVAILABLE,
+                "{uri} should 503 while warming"
+            );
+        }
+        // The live dashboard, health, and engine endpoints are unaffected by explorer readiness.
+        for uri in ["/health", "/", "/predict/tournament"] {
+            let (status, _) = get(&state, uri).await;
+            assert_eq!(status, StatusCode::OK, "{uri} should be up during warmup");
+        }
         cancel.cancel();
     }
 

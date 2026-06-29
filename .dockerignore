@@ -1,0 +1,9 @@
+# Keep the build context small: never ship the build cache, VCS, or docs to the daemon.
+target
+.git
+.github
+docs
+*.md
+.dockerignore
+Dockerfile
+docker-compose.yml

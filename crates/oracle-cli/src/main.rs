@@ -927,9 +927,9 @@ async fn cmd_serve(addr: SocketAddr, event_log: Option<std::path::PathBuf>) -> a
     )
     .await?;
 
-    // The on-demand explorer (backs /explore and the /api/* query endpoints); fit once.
-    println!("fitting the model explorer...");
-    let explorer = std::sync::Arc::new(oracle_engine::Explorer::new());
+    // The on-demand explorer (backs /explore and the /api/* query endpoints); fit in the
+    // background so the live dashboard and engine endpoints respond immediately.
+    let explorer = oracle_api::spawn_explorer();
 
     println!("worldcup-oracle serving on http://{addr}  (/ live · /explore interactive · Ctrl-C to stop)");
     let shutdown_cancel = cancel.clone();
