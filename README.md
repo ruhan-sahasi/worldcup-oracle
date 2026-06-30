@@ -93,7 +93,8 @@ flowchart LR
 | `oracle-api` | axum REST + WebSocket server (`oracle-server`) |
 | `oracle-cli` | `wc-oracle`: CLI commands + live TUI |
 
-See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for diagrams and the model maths.
+See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for diagrams and the model maths, and
+[`docs/METHODOLOGY.md`](docs/METHODOLOGY.md) for the *why* behind each modelling choice.
 
 ## 🚀 Quickstart
 
