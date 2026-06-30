@@ -9,13 +9,14 @@
 //! wc-oracle tune       # search goal-model hyperparameters by held-out log-loss
 //! wc-oracle serve      # run the REST + WebSocket server
 //! wc-oracle watch      # live terminal dashboard (TUI)
+//! wc-oracle sensitivity # ablation: how much each unconventional signal moves the title odds
 //! ```
 #![forbid(unsafe_code)]
 
 mod watch;
 
 use clap::{Parser, Subcommand};
-use oracle_domain::{Outcome, Probabilities, ScoreGrid, Team, TeamId};
+use oracle_domain::{MatchId, Outcome, Probabilities, ScoreGrid, Team, TeamId};
 use oracle_ingest::data;
 use oracle_model::{Ensemble, GoalModel, LiveConfig};
 use oracle_ratings::RatingStore;
@@ -113,6 +114,18 @@ enum Command {
         #[arg(long, default_value_t = 40)]
         speed: u64,
     },
+    /// Signal sensitivity: how much each unconventional signal moves the championship odds.
+    Sensitivity {
+        /// Monte-Carlo iterations per signal variant (nine variants plus a baseline are run).
+        #[arg(long, default_value_t = 40_000)]
+        iters: u64,
+        /// RNG seed, shared across variants so the deltas isolate each signal from MC noise.
+        #[arg(long, default_value_t = 42)]
+        seed: u64,
+        /// How many top movers to list per signal.
+        #[arg(long, default_value_t = 3)]
+        top: usize,
+    },
 }
 
 #[tokio::main]
@@ -144,6 +157,7 @@ async fn main() -> anyhow::Result<()> {
         } => cmd_tune(matches, seed, data),
         Command::Serve { addr, event_log } => cmd_serve(addr, event_log).await,
         Command::Watch { speed } => watch::run(speed).await,
+        Command::Sensitivity { iters, seed, top } => cmd_sensitivity(iters, seed, top),
     }
 }
 
@@ -230,6 +244,215 @@ fn cmd_simulate(iters: u64, seed: u64, top: usize) -> anyhow::Result<()> {
         iters,
         elapsed.as_secs_f64(),
         iters as f64 / elapsed.as_secs_f64().max(1e-9),
+    );
+    Ok(())
+}
+
+/// Ablation study: re-run the tournament with each unconventional signal disabled in turn and
+/// report how far it moves the championship distribution. A signal that barely shifts the title
+/// picture is honest to surface; one that moves it a lot earns its place. All variants share the
+/// RNG seed, so each delta reflects the signal rather than Monte-Carlo noise.
+fn cmd_sensitivity(iters: u64, seed: u64, top: usize) -> anyhow::Result<()> {
+    use std::collections::HashMap;
+
+    let tournament = data::world_cup_2026();
+    let names: HashMap<TeamId, String> = tournament
+        .teams
+        .iter()
+        .map(|t| (t.id, t.name.clone()))
+        .collect();
+
+    eprintln!("Fitting the baseline and nine signal variants (this runs several simulations)...");
+    let model = data::fit_baseline_model(seed);
+    let model_unpooled = data::fit_model_unpooled(seed);
+    let mut model_no_dispersion = model.clone();
+    model_no_dispersion.set_dispersion(0.0);
+
+    let full_venue = data::matchup_adjustments(&tournament);
+    let full_shootout = data::shootout_ratings();
+    let full_pedigree = data::knockout_pedigree();
+    let no_teams: HashMap<TeamId, f64> = HashMap::new();
+    let fat_on = SimConfig::default().ko_fatigue_penalty;
+
+    // Run one variant and return its per-team champion probabilities.
+    let champ = |venue: &HashMap<MatchId, data::VenueAdj>,
+                 shootout: &HashMap<TeamId, f64>,
+                 pedigree: &HashMap<TeamId, f64>,
+                 sampler: &GoalModel,
+                 fatigue: f64|
+     -> HashMap<TeamId, f64> {
+        let inputs = LiveInputs {
+            venue: venue.clone(),
+            shootout_rating: shootout.clone(),
+            knockout_pedigree: pedigree.clone(),
+            ..Default::default()
+        };
+        let config = SimConfig {
+            iterations: iters,
+            seed,
+            ko_fatigue_penalty: fatigue,
+            ..SimConfig::default()
+        };
+        simulate_with_live(&tournament, sampler, config, &inputs, LiveConfig::default())
+            .ranked()
+            .into_iter()
+            .map(|t| (t.team, t.p_champion))
+            .collect()
+    };
+    let masked = |m: data::SignalMask| data::matchup_adjustments_masked(&tournament, m);
+
+    let base = champ(&full_venue, &full_shootout, &full_pedigree, &model, fat_on);
+
+    // Each entry disables exactly one signal; everything else is the full model.
+    let variants: Vec<(&str, HashMap<TeamId, f64>)> = vec![
+        (
+            "Crowd composition",
+            champ(
+                &masked(data::SignalMask {
+                    crowd: false,
+                    ..Default::default()
+                }),
+                &full_shootout,
+                &full_pedigree,
+                &model,
+                fat_on,
+            ),
+        ),
+        (
+            "Travel & circadian load",
+            champ(
+                &masked(data::SignalMask {
+                    travel: false,
+                    ..Default::default()
+                }),
+                &full_shootout,
+                &full_pedigree,
+                &model,
+                fat_on,
+            ),
+        ),
+        (
+            "Heat suppression",
+            champ(
+                &masked(data::SignalMask {
+                    heat: false,
+                    ..Default::default()
+                }),
+                &full_shootout,
+                &full_pedigree,
+                &model,
+                fat_on,
+            ),
+        ),
+        (
+            "Style matchup",
+            champ(
+                &masked(data::SignalMask {
+                    style: false,
+                    ..Default::default()
+                }),
+                &full_shootout,
+                &full_pedigree,
+                &model,
+                fat_on,
+            ),
+        ),
+        (
+            "Shootout skill",
+            champ(&full_venue, &no_teams, &full_pedigree, &model, fat_on),
+        ),
+        (
+            "Knockout pedigree",
+            champ(&full_venue, &full_shootout, &no_teams, &model, fat_on),
+        ),
+        (
+            "Overdispersion (NB margins)",
+            champ(
+                &full_venue,
+                &full_shootout,
+                &full_pedigree,
+                &model_no_dispersion,
+                fat_on,
+            ),
+        ),
+        (
+            "Extra-time fatigue",
+            champ(&full_venue, &full_shootout, &full_pedigree, &model, 0.0),
+        ),
+        (
+            "Confederation pooling",
+            champ(
+                &full_venue,
+                &full_shootout,
+                &full_pedigree,
+                &model_unpooled,
+                fat_on,
+            ),
+        ),
+    ];
+
+    // For each variant, total-variation distance from the baseline champion distribution, plus
+    // the teams whose title odds move most.
+    struct SignalRow<'a> {
+        label: &'a str,
+        tvd: f64,
+        movers: Vec<(String, f64)>,
+    }
+    let mut rows: Vec<SignalRow> = Vec::new();
+    for (label, ablated) in &variants {
+        let mut tvd = 0.0;
+        let mut deltas: Vec<(TeamId, f64)> = Vec::with_capacity(base.len());
+        for (&team, &pb) in &base {
+            let pa = ablated.get(&team).copied().unwrap_or(0.0);
+            tvd += (pa - pb).abs();
+            deltas.push((team, pa - pb));
+        }
+        tvd *= 0.5;
+        deltas.sort_by(|a, b| {
+            b.1.abs()
+                .partial_cmp(&a.1.abs())
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        let movers: Vec<(String, f64)> = deltas
+            .into_iter()
+            .take(top)
+            .map(|(t, d)| (names.get(&t).cloned().unwrap_or_default(), d))
+            .collect();
+        rows.push(SignalRow { label, tvd, movers });
+    }
+    rows.sort_by(|a, b| {
+        b.tvd
+            .partial_cmp(&a.tvd)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+
+    println!(
+        "Signal sensitivity - how much each unconventional signal moves the title picture\n\
+         ({iters} iterations per variant, seed {seed}; one signal disabled per row)\n"
+    );
+    println!(
+        "{:<30}{:>12}   Biggest movers",
+        "Signal (disabled)", "Title shift"
+    );
+    println!("{}", "-".repeat(80));
+    for row in &rows {
+        let movers_str = row
+            .movers
+            .iter()
+            .map(|(n, d)| format!("{} {:+.1}pp", n, d * 100.0))
+            .collect::<Vec<_>>()
+            .join(", ");
+        println!(
+            "{:<30}{:>11.2}%   {}",
+            row.label,
+            row.tvd * 100.0,
+            movers_str
+        );
+    }
+    println!(
+        "\nTitle shift = total variation distance between the full-model and ablated champion\n\
+         distributions (0 = identical). Each row turns off exactly one signal and re-simulates;\n\
+         the shared seed couples the runs so the delta reflects the signal, not Monte-Carlo noise."
     );
     Ok(())
 }

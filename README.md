@@ -206,6 +206,33 @@ validation split and reporting the winner's honest test-set loss. It reaches a b
 fewer fits than a grid, over continuous values a grid could never land on, so the constants are
 optimized rather than guessed.
 
+```bash
+# 7. Ablate each unconventional signal to see how much it actually moves the title picture:
+cargo run --release -p oracle-cli -- sensitivity
+```
+
+```text
+  Signal (disabled)              Title shift   Biggest movers
+  --------------------------------------------------------------------------------
+  Knockout pedigree                    6.33%   Argentina -1.8pp, Brazil -1.3pp
+  Travel & circadian load              3.68%   Argentina -0.8pp, Germany +0.7pp
+  Overdispersion (NB margins)          3.63%   France +0.8pp, Argentina +0.5pp
+  Crowd composition                    3.50%   Argentina -1.0pp, Italy +0.6pp
+  Style matchup                        2.86%   Argentina +0.5pp, England -0.4pp
+  Heat suppression                     2.71%   Germany +0.5pp, Brazil -0.4pp
+  Shootout skill                       1.53%   France -0.6pp, Spain +0.2pp
+  Extra-time fatigue                   1.32%   France +0.3pp, Senegal -0.2pp
+  Confederation pooling                0.50%   Argentina -0.1pp, France +0.1pp
+```
+
+The skeptic's fair question about nine unconventional signals is whether they *matter*.
+`sensitivity` answers it: it disables each one in turn and re-simulates the whole tournament on a
+**shared RNG seed** (so the delta reflects the signal, not Monte-Carlo noise), reporting how far it
+moves the championship distribution (**total variation distance**) and which teams move most. The
+honest read above (illustrative; numbers shift with `--iters`/`--seed`) is that knockout pedigree
+reshapes the title race the most while confederation pooling barely touches it. A signal that moves
+little is reported as such rather than asserted to matter.
+
 > **Validated on real data.** On 1,520 real Premier League matches with real Bet365 closing
 > odds, the stacked ensemble (Brier **0.5416**) matches the bookmaker's closing line (0.5421)
 > out-of-sample and stays well-calibrated (ECE 0.018). Numbers and a one-command reproducer

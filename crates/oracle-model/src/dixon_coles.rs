@@ -211,6 +211,13 @@ impl GoalModel {
         Self::fit_with_confederations(observations, config, &HashMap::new())
     }
 
+    /// Override the negative-binomial dispersion (the NB size `r`; 0 = Poisson, no overdispersion).
+    /// Lets a fitted model be re-run with overdispersion disabled, which the signal sensitivity
+    /// analysis uses to isolate the effect of the fat-tailed (negative-binomial) margins.
+    pub fn set_dispersion(&mut self, dispersion: f64) {
+        self.dispersion = dispersion.max(0.0);
+    }
+
     /// Like [`fit`](Self::fit), but **confederation-aware**. Two additions, both targeting the
     /// World Cup's core blind spot (confederations rarely play each other, so cross-confederation
     /// strength is poorly pinned down):

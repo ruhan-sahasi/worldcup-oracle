@@ -151,6 +151,9 @@ pub struct SimConfig {
     /// resampling team strength per iteration. 1.0 uses the fitted uncertainty; 0 disables
     /// parameter uncertainty (a purely deterministic-strength forecast).
     pub rating_uncertainty: f64,
+    /// Log-attack penalty carried into a survivor's next knockout tie when its previous tie went
+    /// to extra time (a within-tournament fatigue state). 0 disables the carry-over.
+    pub ko_fatigue_penalty: f64,
 }
 
 impl Default for SimConfig {
@@ -163,6 +166,7 @@ impl Default for SimConfig {
             extra_time_fraction: 0.30,
             shootout_skill: 0.10,
             rating_uncertainty: 1.0,
+            ko_fatigue_penalty: KO_FATIGUE_PENALTY,
         }
     }
 }
@@ -239,6 +243,8 @@ struct Prepared {
     shootout_rating: Vec<f64>,
     /// Per-team knockout pedigree (indexed by team-index); a knockout-only log-rate tilt.
     ko_pedigree: Vec<f64>,
+    /// Extra-time fatigue penalty carried to a survivor's next tie (from [`SimConfig`]; 0 = off).
+    ko_fatigue_penalty: f64,
     /// Whether any team has non-zero strength uncertainty (skip the draw entirely if not).
     has_uncertainty: bool,
     /// Whether the tournament has the 2026 shape (12 full groups, top-2 + 8 thirds), so the
@@ -526,6 +532,7 @@ impl Prepared {
             team_sigma,
             shootout_rating,
             ko_pedigree,
+            ko_fatigue_penalty: config.ko_fatigue_penalty,
             has_uncertainty,
             fixed_bracket,
             ko_r32,
@@ -752,7 +759,7 @@ impl Prepared {
                     wins[b] = 0;
                     let (w, et) = self.play_ko_tie(rng, a, b, &att, &def, (0.0, 0.0));
                     wins[w] += 1;
-                    fatigue[w] = if et { KO_FATIGUE_PENALTY } else { 0.0 };
+                    fatigue[w] = if et { self.ko_fatigue_penalty } else { 0.0 };
                     w
                 })
                 .collect()
@@ -819,7 +826,7 @@ impl Prepared {
                         wins[b] = 0;
                         let (w, et) = self.sample_knockout(rng, a, b, &att, &def, (0.0, 0.0));
                         wins[w] += 1;
-                        fatigue[w] = if et { KO_FATIGUE_PENALTY } else { 0.0 };
+                        fatigue[w] = if et { self.ko_fatigue_penalty } else { 0.0 };
                         w
                     })
                     .collect()
@@ -847,7 +854,7 @@ impl Prepared {
                         );
                         if w != BYE {
                             wins[w] += 1;
-                            fatigue[w] = if et { KO_FATIGUE_PENALTY } else { 0.0 };
+                            fatigue[w] = if et { self.ko_fatigue_penalty } else { 0.0 };
                         }
                         w
                     })
@@ -869,7 +876,7 @@ impl Prepared {
                 let (w, et) = self.play_ko_tie(rng, a, b, &att, &def, fat);
                 if w != BYE {
                     wins[w] += 1;
-                    fatigue[w] = if et { KO_FATIGUE_PENALTY } else { 0.0 };
+                    fatigue[w] = if et { self.ko_fatigue_penalty } else { 0.0 };
                 }
                 next.push(w);
                 k += 2;

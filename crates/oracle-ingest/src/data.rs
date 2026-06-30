@@ -989,19 +989,72 @@ pub fn knockout_pedigree() -> HashMap<TeamId, f64> {
         .collect()
 }
 
+/// Which of the toggleable per-match context/style signals to include when building matchup
+/// adjustments. All-true (the [`Default`]) reproduces the full model; flipping one off drops that
+/// signal, which is how the `sensitivity` analysis isolates each one's effect. The structural
+/// terms (host advantage, altitude, rest) are always applied and are not part of the mask.
+#[derive(Clone, Copy, Debug)]
+pub struct SignalMask {
+    pub crowd: bool,
+    pub travel: bool,
+    pub heat: bool,
+    pub style: bool,
+}
+
+impl Default for SignalMask {
+    fn default() -> Self {
+        Self {
+            crowd: true,
+            travel: true,
+            heat: true,
+            style: true,
+        }
+    }
+}
+
+/// Every per-match log-space adjustment that applies to a fixture, with a chosen subset of the
+/// toggleable signals enabled. A disabled context signal is zeroed at its [`MatchContext`] source
+/// (so the rest of the context still composes correctly); style is simply not added. An all-true
+/// mask is identical to [`matchup_adjustments`].
+pub fn matchup_adjustments_masked(
+    tournament: &Tournament,
+    mask: SignalMask,
+) -> HashMap<MatchId, VenueAdj> {
+    let mut adj: HashMap<MatchId, VenueAdj> = match_contexts(tournament)
+        .into_iter()
+        .map(|(id, mut ctx)| {
+            if !mask.crowd {
+                ctx.crowd_support = 0.0;
+            }
+            if !mask.travel {
+                ctx.home_travel_km = 0.0;
+                ctx.away_travel_km = 0.0;
+                ctx.home_tz_shift = 0.0;
+                ctx.away_tz_shift = 0.0;
+            }
+            if !mask.heat {
+                ctx.temperature_c = 0.0;
+            }
+            (id, context_adjustment(&ctx))
+        })
+        .collect();
+    if mask.style {
+        for (id, ((sha, shd), (saa, sad))) in style_adjustments(tournament) {
+            let e = adj.entry(id).or_default();
+            e.0 .0 += sha;
+            e.0 .1 += shd;
+            e.1 .0 += saa;
+            e.1 .1 += sad;
+        }
+    }
+    adj
+}
+
 /// Every per-match log-space adjustment that applies to a fixture: venue/crowd/travel context
 /// plus the style matchup, summed componentwise. This is what the engine and CLI feed to the
 /// Monte-Carlo (and the engine's single-match prediction), so all context reaches the forecast.
 pub fn matchup_adjustments(tournament: &Tournament) -> HashMap<MatchId, VenueAdj> {
-    let mut adj = venue_adjustments(tournament);
-    for (id, ((sha, shd), (saa, sad))) in style_adjustments(tournament) {
-        let e = adj.entry(id).or_default();
-        e.0 .0 += sha;
-        e.0 .1 += shd;
-        e.1 .0 += saa;
-        e.1 .1 += sad;
-    }
-    adj
+    matchup_adjustments_masked(tournament, SignalMask::default())
 }
 
 /// A per-team venue/travel adjustment: `((home_attack, home_defense), (away_attack,
@@ -1212,6 +1265,18 @@ pub fn fit_baseline_model(seed: u64) -> GoalModel {
     fit_baseline(seed).model
 }
 
+/// A goal model fit on the same synthetic history but **without confederation pooling**: plain
+/// global ridge shrinkage toward the overall mean and no cross-confederation offset (an empty
+/// confederations map reduces exactly to [`GoalModel::fit`]). Used by the `sensitivity` analysis
+/// to isolate how much hierarchical pooling reshapes the title picture.
+pub fn fit_model_unpooled(seed: u64) -> GoalModel {
+    let obs: Vec<Observation> = synthetic_history_with_market(4000, seed)
+        .into_iter()
+        .map(|r| r.obs)
+        .collect();
+    GoalModel::fit(&obs, DixonColesConfig::default())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1246,6 +1311,40 @@ mod tests {
         // Argentina (id 0, strongest) vs New Zealand (id 47, weakest).
         let p = model.outcome_probabilities(TeamId(0), TeamId(47), true);
         assert!(p.home_win > 0.6, "fit should rate Argentina well above NZ");
+    }
+
+    #[test]
+    fn full_signal_mask_matches_unmasked_and_disabling_changes_adjustments() {
+        let t = world_cup_2026();
+        let full = matchup_adjustments(&t);
+        let masked_full = matchup_adjustments_masked(&t, SignalMask::default());
+        assert_eq!(full.len(), masked_full.len());
+        for (id, v) in &full {
+            let m = masked_full.get(id).expect("same fixtures");
+            assert!((v.0 .0 - m.0 .0).abs() < 1e-12 && (v.1 .1 - m.1 .1).abs() < 1e-12);
+        }
+        // Turning off the style matchup must change at least one fixture's adjustment.
+        let no_style = matchup_adjustments_masked(
+            &t,
+            SignalMask {
+                style: false,
+                ..Default::default()
+            },
+        );
+        let changed = full
+            .iter()
+            .any(|(id, v)| (v.0 .0 - no_style.get(id).unwrap().0 .0).abs() > 1e-9);
+        assert!(changed, "disabling style should move some adjustment");
+    }
+
+    #[test]
+    fn unpooled_fit_still_ranks_argentina_over_new_zealand() {
+        let model = fit_model_unpooled(1);
+        let p = model.outcome_probabilities(TeamId(0), TeamId(47), true);
+        assert!(
+            p.home_win > 0.6,
+            "even unpooled, the fit should rate Argentina well above NZ"
+        );
     }
 
     #[test]

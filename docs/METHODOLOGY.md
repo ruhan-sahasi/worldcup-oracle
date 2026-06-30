@@ -108,6 +108,12 @@ Skill is the point, so it is measured carefully:
 - The honest finding: on held-out data the ensemble's interval **overlaps the bookmaker's** - it
   matches the market within noise rather than beating it. That is a strong, truthful result, and the
   CV harness is what lets it be stated with confidence.
+- **Signal ablation** (`wc-oracle sensitivity`): the natural skeptic's question about nine
+  unconventional signals is "do they actually matter?". The analysis disables each signal in turn
+  and re-simulates the whole tournament on a shared RNG seed (so the delta reflects the signal, not
+  Monte-Carlo noise), reporting how far each one moves the championship distribution (total
+  variation distance) and which teams move most. A signal that barely shifts the title picture is
+  reported honestly as such; the point is to *measure* each contribution rather than assert it.
 
 ## Honest limitations
 
