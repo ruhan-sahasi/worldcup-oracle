@@ -9,10 +9,12 @@
 //! Everything is fit once in [`Explorer::new`] and then queried; the type is cheap to share
 //! (`Arc<Explorer>`) across request handlers.
 
-use oracle_domain::{Confederation, Probabilities, ScoreGrid, TeamId, Tournament};
-use oracle_ingest::data;
+use oracle_domain::{Confederation, MatchId, Probabilities, ScoreGrid, TeamId, Tournament};
+use oracle_ingest::data::{self, SignalMask, VenueAdj};
 use oracle_model::hmc::HmcConfig;
-use oracle_model::{implied_probabilities, Ensemble, GoalModel, LiveConfig, Observation};
+use oracle_model::{
+    implied_probabilities, DixonColesConfig, Ensemble, GoalModel, LiveConfig, Observation,
+};
 use oracle_ratings::{RatingStore, StateSpaceRatings};
 use oracle_sim::{simulate_with_live, LiveInputs, SimConfig};
 use serde::Serialize;
@@ -21,6 +23,8 @@ use std::collections::HashMap;
 /// Hard ceilings so a single request cannot tie the server up indefinitely.
 const SIM_MAX_ITERS: u64 = 100_000;
 const POSTERIOR_MAX_SAMPLES: usize = 1500;
+/// The sensitivity analysis runs ten simulations, so cap its per-variant iterations lower.
+const SENSITIVITY_MAX_ITERS: u64 = 50_000;
 
 /// A fitted-once view of the model for interactive, on-demand queries.
 pub struct Explorer {
@@ -279,6 +283,220 @@ impl Explorer {
             confederations,
         }
     }
+
+    /// Signal sensitivity: disable each unconventional signal in turn, re-simulate the whole
+    /// tournament on a shared seed, and report how far each one moves the championship distribution
+    /// (and which teams move most). The same analysis the `wc-oracle sensitivity` command prints,
+    /// served for the explorer.
+    pub fn sensitivity(&self, iters: u64, seed: u64) -> SensitivityForecast {
+        let iters = iters.clamp(2000, SENSITIVITY_MAX_ITERS);
+        // The "no confederation pooling" variant: refit globally on the same history (an empty
+        // confederations map reduces to the plain fit).
+        let unpooled = GoalModel::fit(&self.observations, DixonColesConfig::default());
+        let signals = signal_sensitivity(
+            &self.tournament,
+            &self.model,
+            &unpooled,
+            &self.shootout_rating,
+            &self.knockout_pedigree,
+            iters,
+            seed,
+            3,
+        )
+        .into_iter()
+        .map(|c| SignalRow {
+            signal: c.signal.to_string(),
+            title_shift: c.title_shift,
+            movers: c
+                .movers
+                .into_iter()
+                .map(|(team, delta)| MoverRow {
+                    team: self.name(team),
+                    delta,
+                })
+                .collect(),
+        })
+        .collect();
+        SensitivityForecast {
+            iterations: iters,
+            seed,
+            signals,
+        }
+    }
+}
+
+/// One signal's measured contribution to the championship distribution.
+pub struct SignalContribution {
+    pub signal: &'static str,
+    /// Total variation distance between the full-model and ablated champion distributions.
+    pub title_shift: f64,
+    /// Teams with the largest signed change in champion probability (most affected first).
+    pub movers: Vec<(TeamId, f64)>,
+}
+
+/// Ablate each unconventional signal in turn and measure how far disabling it moves the
+/// championship distribution. Shared by the `wc-oracle sensitivity` command and the web explorer.
+/// All variants share `seed` (common random numbers), so each delta reflects the signal rather
+/// than Monte-Carlo noise. `unpooled` is a model refit without confederation pooling; `iters` is
+/// used as-is (callers clamp).
+#[allow(clippy::too_many_arguments)]
+pub fn signal_sensitivity(
+    tournament: &Tournament,
+    model: &GoalModel,
+    unpooled: &GoalModel,
+    shootout: &HashMap<TeamId, f64>,
+    pedigree: &HashMap<TeamId, f64>,
+    iters: u64,
+    seed: u64,
+    top: usize,
+) -> Vec<SignalContribution> {
+    let full_venue = data::matchup_adjustments(tournament);
+    let no_teams: HashMap<TeamId, f64> = HashMap::new();
+    let fat_on = SimConfig::default().ko_fatigue_penalty;
+    let mut model_no_dispersion = model.clone();
+    model_no_dispersion.set_dispersion(0.0);
+
+    // Run one variant and return its per-team champion probabilities.
+    let champ = |venue: &HashMap<MatchId, VenueAdj>,
+                 shoot: &HashMap<TeamId, f64>,
+                 ped: &HashMap<TeamId, f64>,
+                 sampler: &GoalModel,
+                 fatigue: f64|
+     -> HashMap<TeamId, f64> {
+        let inputs = LiveInputs {
+            venue: venue.clone(),
+            shootout_rating: shoot.clone(),
+            knockout_pedigree: ped.clone(),
+            ..Default::default()
+        };
+        let config = SimConfig {
+            iterations: iters,
+            seed,
+            ko_fatigue_penalty: fatigue,
+            ..SimConfig::default()
+        };
+        simulate_with_live(tournament, sampler, config, &inputs, LiveConfig::default())
+            .ranked()
+            .into_iter()
+            .map(|t| (t.team, t.p_champion))
+            .collect()
+    };
+    let masked = |m: SignalMask| data::matchup_adjustments_masked(tournament, m);
+
+    let base = champ(&full_venue, shootout, pedigree, model, fat_on);
+
+    // Each entry disables exactly one signal; everything else is the full model.
+    let variants: Vec<(&'static str, HashMap<TeamId, f64>)> = vec![
+        (
+            "Crowd composition",
+            champ(
+                &masked(SignalMask {
+                    crowd: false,
+                    ..Default::default()
+                }),
+                shootout,
+                pedigree,
+                model,
+                fat_on,
+            ),
+        ),
+        (
+            "Travel & circadian load",
+            champ(
+                &masked(SignalMask {
+                    travel: false,
+                    ..Default::default()
+                }),
+                shootout,
+                pedigree,
+                model,
+                fat_on,
+            ),
+        ),
+        (
+            "Heat suppression",
+            champ(
+                &masked(SignalMask {
+                    heat: false,
+                    ..Default::default()
+                }),
+                shootout,
+                pedigree,
+                model,
+                fat_on,
+            ),
+        ),
+        (
+            "Style matchup",
+            champ(
+                &masked(SignalMask {
+                    style: false,
+                    ..Default::default()
+                }),
+                shootout,
+                pedigree,
+                model,
+                fat_on,
+            ),
+        ),
+        (
+            "Shootout skill",
+            champ(&full_venue, &no_teams, pedigree, model, fat_on),
+        ),
+        (
+            "Knockout pedigree",
+            champ(&full_venue, shootout, &no_teams, model, fat_on),
+        ),
+        (
+            "Overdispersion (NB margins)",
+            champ(
+                &full_venue,
+                shootout,
+                pedigree,
+                &model_no_dispersion,
+                fat_on,
+            ),
+        ),
+        (
+            "Extra-time fatigue",
+            champ(&full_venue, shootout, pedigree, model, 0.0),
+        ),
+        (
+            "Confederation pooling",
+            champ(&full_venue, shootout, pedigree, unpooled, fat_on),
+        ),
+    ];
+
+    let mut out: Vec<SignalContribution> = variants
+        .into_iter()
+        .map(|(signal, ablated)| {
+            let mut tvd = 0.0;
+            let mut deltas: Vec<(TeamId, f64)> = Vec::with_capacity(base.len());
+            for (&team, &pb) in &base {
+                let pa = ablated.get(&team).copied().unwrap_or(0.0);
+                tvd += (pa - pb).abs();
+                deltas.push((team, pa - pb));
+            }
+            tvd *= 0.5;
+            deltas.sort_by(|a, b| {
+                b.1.abs()
+                    .partial_cmp(&a.1.abs())
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+            deltas.truncate(top);
+            SignalContribution {
+                signal,
+                title_shift: tvd,
+                movers: deltas,
+            }
+        })
+        .collect();
+    out.sort_by(|a, b| {
+        b.title_shift
+            .partial_cmp(&a.title_shift)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    out
 }
 
 fn top_scorelines(grid: &ScoreGrid, n: usize) -> Vec<ScoreLine> {
@@ -388,6 +606,29 @@ pub struct RatingsView {
     pub confederations: Vec<ConfRow>,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct MoverRow {
+    pub team: String,
+    /// Signed change in championship probability when the signal is disabled.
+    pub delta: f64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SignalRow {
+    pub signal: String,
+    /// Total variation distance between the full-model and ablated champion distributions.
+    pub title_shift: f64,
+    pub movers: Vec<MoverRow>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SensitivityForecast {
+    pub iterations: u64,
+    pub seed: u64,
+    /// Signals ranked by how far disabling each one moves the title picture.
+    pub signals: Vec<SignalRow>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -439,5 +680,20 @@ mod tests {
         assert!(post.home_win.lo <= point.dixon_coles.home_win + 0.05);
         assert!(post.home_win.hi >= point.dixon_coles.home_win - 0.05);
         assert!(post.home_win.hi > post.home_win.lo);
+    }
+
+    #[test]
+    fn sensitivity_reports_nine_ranked_signals() {
+        let ex = Explorer::new();
+        let s = ex.sensitivity(2000, 42);
+        assert_eq!(s.signals.len(), 9);
+        // Ranked by title shift descending, each a valid total-variation distance in [0, 1].
+        for w in s.signals.windows(2) {
+            assert!(w[0].title_shift >= w[1].title_shift);
+        }
+        for sig in &s.signals {
+            assert!((0.0..=1.0).contains(&sig.title_shift));
+            assert!(sig.movers.len() <= 3);
+        }
     }
 }

@@ -84,6 +84,7 @@
     <div class="tabs">
       <div class="tab active" data-tab="matchup">Matchup</div>
       <div class="tab" data-tab="simulate">Simulate</div>
+      <div class="tab" data-tab="sensitivity">Sensitivity</div>
       <div class="tab" data-tab="ratings">Ratings</div>
     </div>
 
@@ -125,6 +126,23 @@
           <span id="sim-status" class="muted"></span>
         </div>
         <div id="sim-out"></div>
+      </div>
+    </section>
+
+    <!-- ===== Sensitivity ===== -->
+    <section id="tab-sensitivity" class="hidden">
+      <div class="panel">
+        <h2>Signal sensitivity</h2>
+        <div class="row">
+          <label>iterations</label><input class="num" id="sens-iters" value="20000" />
+          <label>seed</label><input class="num" id="sens-seed" value="42" />
+          <button id="run-sens">Run ablation</button>
+          <span id="sens-status" class="muted"></span>
+        </div>
+        <div class="note">Disables each unconventional signal in turn and re-simulates on a shared
+          seed, so each bar is that signal's own effect on the title race (total variation distance
+          from the full model), not Monte-Carlo noise. Runs several simulations, so give it a moment.</div>
+        <div id="sens-out"></div>
       </div>
     </section>
 
@@ -308,6 +326,30 @@
     finally { $("run-sim").disabled = false; }
   }
 
+  // ----- sensitivity -----
+  async function runSensitivity() {
+    $("run-sens").disabled = true; $("sens-status").textContent = "ablating (runs several simulations)…"; $("sens-out").innerHTML = "";
+    localStorage.setItem("sens", JSON.stringify({ iters: $("sens-iters").value, seed: $("sens-seed").value }));
+    const t0 = performance.now();
+    try {
+      const f = await api(`/api/sensitivity?iters=${encodeURIComponent($("sens-iters").value)}&seed=${encodeURIComponent($("sens-seed").value)}`);
+      const secs = ((performance.now() - t0) / 1000).toFixed(1);
+      $("sens-status").textContent = `${f.iterations.toLocaleString()} iterations/variant (seed ${f.seed}) · ${secs}s`;
+      const max = Math.max(...f.signals.map(s => s.title_shift), 1e-9);
+      let h = `<table><tr><th>Signal (disabled)</th><th>Title shift</th><th>Biggest movers</th></tr>`;
+      f.signals.forEach(s => {
+        const w = (s.title_shift / max * 100).toFixed(0);
+        const bar = `<span style="display:inline-block;width:110px;height:8px;background:var(--line);border-radius:3px;vertical-align:middle"><span style="display:block;height:8px;width:${w}%;background:var(--away);border-radius:3px"></span></span>`;
+        const movers = s.movers.map(m => `${esc(m.team)} <span style="color:${m.delta >= 0 ? '#3fb950' : '#f85149'}">${(m.delta >= 0 ? '+' : '') + (m.delta * 100).toFixed(1)}pp</span>`).join(", ");
+        h += `<tr><td>${esc(s.signal)}</td>
+          <td>${bar} <span class="accent" style="margin-left:8px">${pct(s.title_shift)}</span></td>
+          <td class="muted">${movers || "-"}</td></tr>`;
+      });
+      $("sens-out").innerHTML = h + "</table>";
+    } catch (err) { $("sens-status").textContent = err.message; }
+    finally { $("run-sens").disabled = false; }
+  }
+
   // ----- ratings -----
   let sortKey = "elo", sortDesc = true;
   function renderRatings() {
@@ -346,6 +388,7 @@
   $("swap").onclick = swapTeams;
   $("share").onclick = copyLink;
   $("run-sim").onclick = runSim;
+  $("run-sens").onclick = runSensitivity;
   $("rfilter").oninput = renderRatings;
   document.querySelectorAll(".preset").forEach(b => b.onclick = () => { $("iters").value = b.dataset.iters; runSim(); });
   // Enter anywhere in the matchup panel triggers a prediction.
@@ -355,6 +398,9 @@
     const s = JSON.parse(localStorage.getItem("sim") || "{}");
     if (s.iters) $("iters").value = s.iters;
     if (s.seed) $("seed").value = s.seed;
+    const sn = JSON.parse(localStorage.getItem("sens") || "{}");
+    if (sn.iters) $("sens-iters").value = sn.iters;
+    if (sn.seed) $("sens-seed").value = sn.seed;
   } catch (_) {}
 
   loadTeams()

@@ -320,15 +320,18 @@ self-healing for a live feed that re-emits on restart.
 ### On-demand explorer (`oracle-engine::query` + `oracle-api` + `static/explore.html`)
 The live `Engine` tracks one running tournament; the `Explorer` is its complement - a fit-once,
 read-only view that answers *ad-hoc* questions (predict any matchup, its HMC posterior credible
-interval, a custom Monte-Carlo run, the ratings). It holds its own baseline (`data::fit_baseline`)
+interval, a custom Monte-Carlo run, the signal-sensitivity ablation, the ratings). It holds its own
+baseline (`data::fit_baseline`)
 so exploration never perturbs the live state, and it reuses the model paths the CLI uses
 (`GoalModel::{score_grid, posterior_outcome_samples, confederation_levels}`, `Ensemble::blend`,
 `simulate_with_live`). The transport stays a thin shell: `oracle-api` carries both the `Engine` and
 the `Explorer` in its state (split via `FromRef`), and the new `/api/*` handlers just forward an
-`Explorer` result as JSON - the compute-heavy ones (HMC posterior, simulation) on `spawn_blocking`
-so they never stall the async runtime. `/explore` serves a dependency-free vanilla-JS page (no
-build step) with the same three queries plus an exact-score-grid heatmap and a credible-interval
-view. Request inputs (`iters`, `samples`) are clamped.
+`Explorer` result as JSON - the compute-heavy ones (HMC posterior, simulation, the ten-run
+sensitivity ablation) on `spawn_blocking` so they never stall the async runtime. The ablation logic
+itself lives once in `oracle_engine::signal_sensitivity`, shared by the CLI `sensitivity` command
+and the explorer. `/explore` serves a dependency-free vanilla-JS page (no build step) with those
+queries plus an exact-score-grid heatmap, a credible-interval view, and a sensitivity bar chart.
+Request inputs (`iters`, `samples`) are clamped.
 
 ## Quality gates
 - Unit + property-style tests in every crate (probabilities normalize, Elo is

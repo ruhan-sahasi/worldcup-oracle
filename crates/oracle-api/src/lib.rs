@@ -19,6 +19,7 @@
 //! | GET | `/api/predict?home=&away=` | on-demand matchup forecast (any two teams) |
 //! | GET | `/api/posterior?home=&away=` | HMC posterior credible intervals for a matchup |
 //! | GET | `/api/simulate?iters=&seed=` | custom Monte-Carlo champion-odds run |
+//! | GET | `/api/sensitivity?iters=&seed=` | per-signal ablation: how much each signal moves the title |
 //! | GET | `/api/ratings` | team ratings + confederation strength levels |
 //! | GET | `/metrics` | Prometheus metrics |
 //! | GET | `/live` | WebSocket: pushes a compact live view on every update |
@@ -36,7 +37,9 @@ use axum::{
 };
 use futures_util::{SinkExt, StreamExt};
 use oracle_domain::{MatchId, MatchStatus, Probabilities, Scoreline, Stage, TeamId};
-use oracle_engine::query::{MatchupForecast, PosteriorForecast, RatingsView, SimForecast};
+use oracle_engine::query::{
+    MatchupForecast, PosteriorForecast, RatingsView, SensitivityForecast, SimForecast,
+};
 use oracle_engine::{Engine, Explorer, Snapshot};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -99,6 +102,7 @@ pub fn router(engine: Arc<Engine>, explorer: ExplorerSlot) -> Router {
         .route("/api/predict", get(api_predict))
         .route("/api/posterior", get(api_posterior))
         .route("/api/simulate", get(api_simulate))
+        .route("/api/sensitivity", get(api_sensitivity))
         .route("/api/ratings", get(api_ratings))
         .route("/metrics", get(metrics))
         .route("/live", get(live_ws))
@@ -153,7 +157,7 @@ async fn api_info(
             "/ (live dashboard)", "/explore (model explorer)", "/health", "/teams", "/matches",
             "/predict/match/{id}", "/predict/tournament",
             "/api/predict?home=&away=", "/api/posterior?home=&away=",
-            "/api/simulate?iters=&seed=", "/api/ratings",
+            "/api/simulate?iters=&seed=", "/api/sensitivity?iters=&seed=", "/api/ratings",
             "/metrics", "/live (websocket)"
         ],
     }))
@@ -256,6 +260,28 @@ async fn api_ratings(
     State(explorer): State<ExplorerSlot>,
 ) -> Result<Json<RatingsView>, StatusCode> {
     Ok(Json(ready(&explorer)?.ratings()))
+}
+
+#[derive(Deserialize)]
+struct SensitivityParams {
+    iters: Option<u64>,
+    seed: Option<u64>,
+}
+
+async fn api_sensitivity(
+    State(explorer): State<ExplorerSlot>,
+    Query(p): Query<SensitivityParams>,
+) -> Result<Json<SensitivityForecast>, StatusCode> {
+    if explorer.get().is_none() {
+        return Err(StatusCode::SERVICE_UNAVAILABLE);
+    }
+    let iters = p.iters.unwrap_or(20_000);
+    let seed = p.seed.unwrap_or(42);
+    // The ablation runs ten simulations; keep it off the async runtime.
+    tokio::task::spawn_blocking(move || explorer.get().unwrap().sensitivity(iters, seed))
+        .await
+        .map(Json)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
 }
 
 async fn teams(State(engine): State<Arc<Engine>>) -> Json<Vec<oracle_engine::RatingEntry>> {
@@ -609,6 +635,7 @@ mod tests {
             "/api/ratings",
             "/api/predict?home=Brazil&away=Japan",
             "/api/simulate?iters=2000",
+            "/api/sensitivity?iters=2000",
         ] {
             let (status, _) = get(&state, uri).await;
             assert_eq!(
@@ -660,6 +687,18 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         assert_eq!(json(&body)["teams"].as_array().unwrap().len(), 48);
         assert_eq!(json(&body)["confederations"].as_array().unwrap().len(), 6);
+
+        // Sensitivity: nine signals, each a valid total-variation distance, ranked descending.
+        let (status, body) = get(&state, "/api/sensitivity?iters=2000&seed=1").await;
+        assert_eq!(status, StatusCode::OK);
+        let signals = json(&body)["signals"].as_array().unwrap().clone();
+        assert_eq!(signals.len(), 9);
+        let shifts: Vec<f64> = signals
+            .iter()
+            .map(|s| s["title_shift"].as_f64().unwrap())
+            .collect();
+        assert!(shifts.iter().all(|&s| (0.0..=1.0).contains(&s)));
+        assert!(shifts.windows(2).all(|w| w[0] >= w[1]), "ranked descending");
 
         // Posterior: a 90% credible interval that brackets its own mean.
         let (status, body) = get(&state, "/api/posterior?home=Brazil&away=Japan&samples=200").await;

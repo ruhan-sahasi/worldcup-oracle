@@ -16,7 +16,7 @@
 mod watch;
 
 use clap::{Parser, Subcommand};
-use oracle_domain::{MatchId, Outcome, Probabilities, ScoreGrid, Team, TeamId};
+use oracle_domain::{Outcome, Probabilities, ScoreGrid, Team, TeamId};
 use oracle_ingest::data;
 use oracle_model::{Ensemble, GoalModel, LiveConfig};
 use oracle_ratings::RatingStore;
@@ -264,167 +264,38 @@ fn cmd_sensitivity(iters: u64, seed: u64, top: usize) -> anyhow::Result<()> {
 
     eprintln!("Fitting the baseline and nine signal variants (this runs several simulations)...");
     let model = data::fit_baseline_model(seed);
-    let model_unpooled = data::fit_model_unpooled(seed);
-    let mut model_no_dispersion = model.clone();
-    model_no_dispersion.set_dispersion(0.0);
+    let unpooled = data::fit_model_unpooled(seed);
 
-    let full_venue = data::matchup_adjustments(&tournament);
-    let full_shootout = data::shootout_ratings();
-    let full_pedigree = data::knockout_pedigree();
-    let no_teams: HashMap<TeamId, f64> = HashMap::new();
-    let fat_on = SimConfig::default().ko_fatigue_penalty;
+    // The ablation itself lives in oracle-engine, shared with the web explorer.
+    let contributions = oracle_engine::signal_sensitivity(
+        &tournament,
+        &model,
+        &unpooled,
+        &data::shootout_ratings(),
+        &data::knockout_pedigree(),
+        iters,
+        seed,
+        top,
+    );
 
-    // Run one variant and return its per-team champion probabilities.
-    let champ = |venue: &HashMap<MatchId, data::VenueAdj>,
-                 shootout: &HashMap<TeamId, f64>,
-                 pedigree: &HashMap<TeamId, f64>,
-                 sampler: &GoalModel,
-                 fatigue: f64|
-     -> HashMap<TeamId, f64> {
-        let inputs = LiveInputs {
-            venue: venue.clone(),
-            shootout_rating: shootout.clone(),
-            knockout_pedigree: pedigree.clone(),
-            ..Default::default()
-        };
-        let config = SimConfig {
-            iterations: iters,
-            seed,
-            ko_fatigue_penalty: fatigue,
-            ..SimConfig::default()
-        };
-        simulate_with_live(&tournament, sampler, config, &inputs, LiveConfig::default())
-            .ranked()
-            .into_iter()
-            .map(|t| (t.team, t.p_champion))
-            .collect()
-    };
-    let masked = |m: data::SignalMask| data::matchup_adjustments_masked(&tournament, m);
-
-    let base = champ(&full_venue, &full_shootout, &full_pedigree, &model, fat_on);
-
-    // Each entry disables exactly one signal; everything else is the full model.
-    let variants: Vec<(&str, HashMap<TeamId, f64>)> = vec![
-        (
-            "Crowd composition",
-            champ(
-                &masked(data::SignalMask {
-                    crowd: false,
-                    ..Default::default()
-                }),
-                &full_shootout,
-                &full_pedigree,
-                &model,
-                fat_on,
-            ),
-        ),
-        (
-            "Travel & circadian load",
-            champ(
-                &masked(data::SignalMask {
-                    travel: false,
-                    ..Default::default()
-                }),
-                &full_shootout,
-                &full_pedigree,
-                &model,
-                fat_on,
-            ),
-        ),
-        (
-            "Heat suppression",
-            champ(
-                &masked(data::SignalMask {
-                    heat: false,
-                    ..Default::default()
-                }),
-                &full_shootout,
-                &full_pedigree,
-                &model,
-                fat_on,
-            ),
-        ),
-        (
-            "Style matchup",
-            champ(
-                &masked(data::SignalMask {
-                    style: false,
-                    ..Default::default()
-                }),
-                &full_shootout,
-                &full_pedigree,
-                &model,
-                fat_on,
-            ),
-        ),
-        (
-            "Shootout skill",
-            champ(&full_venue, &no_teams, &full_pedigree, &model, fat_on),
-        ),
-        (
-            "Knockout pedigree",
-            champ(&full_venue, &full_shootout, &no_teams, &model, fat_on),
-        ),
-        (
-            "Overdispersion (NB margins)",
-            champ(
-                &full_venue,
-                &full_shootout,
-                &full_pedigree,
-                &model_no_dispersion,
-                fat_on,
-            ),
-        ),
-        (
-            "Extra-time fatigue",
-            champ(&full_venue, &full_shootout, &full_pedigree, &model, 0.0),
-        ),
-        (
-            "Confederation pooling",
-            champ(
-                &full_venue,
-                &full_shootout,
-                &full_pedigree,
-                &model_unpooled,
-                fat_on,
-            ),
-        ),
-    ];
-
-    // For each variant, total-variation distance from the baseline champion distribution, plus
-    // the teams whose title odds move most.
-    struct SignalRow<'a> {
-        label: &'a str,
+    // Already ranked by title shift; join in team names for display.
+    struct SignalRow {
+        label: &'static str,
         tvd: f64,
         movers: Vec<(String, f64)>,
     }
-    let mut rows: Vec<SignalRow> = Vec::new();
-    for (label, ablated) in &variants {
-        let mut tvd = 0.0;
-        let mut deltas: Vec<(TeamId, f64)> = Vec::with_capacity(base.len());
-        for (&team, &pb) in &base {
-            let pa = ablated.get(&team).copied().unwrap_or(0.0);
-            tvd += (pa - pb).abs();
-            deltas.push((team, pa - pb));
-        }
-        tvd *= 0.5;
-        deltas.sort_by(|a, b| {
-            b.1.abs()
-                .partial_cmp(&a.1.abs())
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
-        let movers: Vec<(String, f64)> = deltas
-            .into_iter()
-            .take(top)
-            .map(|(t, d)| (names.get(&t).cloned().unwrap_or_default(), d))
-            .collect();
-        rows.push(SignalRow { label, tvd, movers });
-    }
-    rows.sort_by(|a, b| {
-        b.tvd
-            .partial_cmp(&a.tvd)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
+    let rows: Vec<SignalRow> = contributions
+        .into_iter()
+        .map(|c| SignalRow {
+            label: c.signal,
+            tvd: c.title_shift,
+            movers: c
+                .movers
+                .into_iter()
+                .map(|(t, d)| (names.get(&t).cloned().unwrap_or_default(), d))
+                .collect(),
+        })
+        .collect();
 
     println!(
         "Signal sensitivity - how much each unconventional signal moves the title picture\n\

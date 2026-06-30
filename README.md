@@ -263,10 +263,11 @@ mid-tournament recovers its state instead of starting cold.
 `/explore` is an **interactive model explorer** (same dependency-free style) for the on-demand
 capabilities the live dashboard does not cover: predict **any** matchup (with the exact-score-grid
 heatmap, the most-likely scoreline highlighted, optional bookmaker odds, and the **HMC posterior
-credible intervals**), run a **custom Monte-Carlo** simulation, and browse the team and
-confederation ratings. The current matchup lives in the URL, so any prediction is a **shareable
-link** (a "Copy link" button and a swap-teams toggle make it quick). It is backed by the `/api/*`
-query endpoints, served by a fit-once `Explorer` kept separate from the live engine.
+credible intervals**), run a **custom Monte-Carlo** simulation, run the **signal-sensitivity
+ablation** (a bar chart of how much each unconventional signal moves the title race), and browse the
+team and confederation ratings. The current matchup lives in the URL, so any prediction is a
+**shareable link** (a "Copy link" button and a swap-teams toggle make it quick). It is backed by the
+`/api/*` query endpoints, served by a fit-once `Explorer` kept separate from the live engine.
 
 | Method | Path | Description |
 |--------|------|-------------|
@@ -281,6 +282,7 @@ query endpoints, served by a fit-once `Explorer` kept separate from the live eng
 | `GET` | `/api/predict?home=&away=` | on-demand forecast for **any** matchup (+ optional odds) |
 | `GET` | `/api/posterior?home=&away=` | HMC posterior **credible intervals** for a matchup |
 | `GET` | `/api/simulate?iters=&seed=` | custom Monte-Carlo champion-odds run |
+| `GET` | `/api/sensitivity?iters=&seed=` | per-signal ablation: how much each signal moves the title |
 | `GET` | `/api/ratings` | team ratings + confederation strength levels |
 | `GET` | `/metrics` | Prometheus metrics |
 | `GET` | `/live` | **WebSocket**: pushes a compact live view on every update |

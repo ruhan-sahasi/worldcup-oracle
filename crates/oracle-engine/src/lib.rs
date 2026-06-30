@@ -26,7 +26,7 @@ pub mod query;
 mod snapshot;
 
 pub use event_log::EventLog;
-pub use query::Explorer;
+pub use query::{signal_sensitivity, Explorer, SignalContribution};
 pub use snapshot::{MatchPrediction, Metrics, RatingEntry, Snapshot};
 
 use arc_swap::ArcSwap;
