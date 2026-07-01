@@ -85,7 +85,9 @@ impl EngineDeps {
                 iterations: 20_000,
                 ..SimConfig::default()
             },
-            tournament_lr: 0.03,
+            // In-tournament results are the most relevant data the model sees, so the online
+            // goal-model update leans in a bit harder than a routine friendly would.
+            tournament_lr: 0.05,
             suspension_threshold: 2,
             state_space: StateSpaceRatings::with_defaults(),
         }
@@ -586,9 +588,11 @@ impl EngineState {
             self.ratings.record(home, away, score, true);
             self.model
                 .update_with_result(home, away, score, true, self.tournament_lr);
-            // The state-space rating learns too (age 0 = just now), updating both its mean
-            // and its per-team variance, which feeds the forecast's parameter uncertainty.
-            self.state_space.observe(home, away, score, 0.0, true);
+            // The state-space rating learns too, updating both its mean and its per-team variance
+            // (which feeds the forecast's parameter uncertainty). Using the tournament-specific
+            // observe injects a per-match process-noise bump so the filter keeps tracking form
+            // fast instead of growing overconfident across the competition.
+            self.state_space.observe_tournament(home, away, score, true);
             self.tournament.matches[pos].status = MatchStatus::Finished;
             self.tournament.matches[pos].score = score;
             // If that was the last group result, the knockout participants are now known:

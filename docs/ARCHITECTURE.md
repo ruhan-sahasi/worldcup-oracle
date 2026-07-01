@@ -165,8 +165,16 @@ belief about its latent strength, `N(mean, var)`, in goal-difference units. Betw
 strength performs a **random walk** (variance grows with elapsed days, so a thinly-observed team
 is correctly less certain); at a match the goal margin is a noisy linear measurement of the
 strength gap and a two-state **Kalman update** moves both means toward the surprise and shrinks
-their variances. Trained offline over the full match history and then updated live from each
-`FullTime`, it produces two things a point-estimate rating cannot: a win/draw/win prediction that
+their variances. It is trained offline over the full match history and then updated live from each
+`FullTime`.
+
+Live, results arrive through `observe_tournament` rather than the day-based `observe`: tournament
+matches are only days apart, so the elapsed-time walk barely moves the filter and it would grow
+overconfident and sluggish across the competition. Instead a fixed **per-match process-noise bump**
+(`tournament_process_var`) is injected before each Kalman update, keeping the gain up so recent
+results move the estimate faster and the per-team uncertainty does not collapse mid-tournament.
+
+It produces two things a point-estimate rating cannot: a win/draw/win prediction that
 becomes the ensemble's fourth member, and a per-team *uncertainty* (`stddev`) that the engine maps
 to log-rate units and feeds the Monte-Carlo as a dynamic `rating_sigma` (below), replacing the
 static fit-based uncertainty. A single latent strength is modelled, not separate attack/defense

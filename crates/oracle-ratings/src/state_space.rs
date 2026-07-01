@@ -26,6 +26,14 @@ pub struct StateSpaceConfig {
     pub initial_var: f64,
     /// Random-walk variance added per day since a team last played.
     pub process_var_per_day: f64,
+    /// Random-walk variance injected per *in-tournament* match (see [`observe_tournament`]).
+    /// Tournament matches are only days apart, so the day-based walk barely moves the filter and
+    /// lets it grow overconfident and sluggish; a fixed per-match bump keeps it reactive to
+    /// tournament form (a team's true level shifts with form, injuries, and momentum in a
+    /// tournament, faster than the calendar gap alone implies).
+    ///
+    /// [`observe_tournament`]: StateSpaceRatings::observe_tournament
+    pub tournament_process_var: f64,
     /// Measurement noise on a single match's goal margin.
     pub obs_var: f64,
     /// Maps a one-unit strength gap to expected goal-margin (here strength *is* in margin
@@ -43,6 +51,7 @@ impl Default for StateSpaceConfig {
             initial_mean: 0.0,
             initial_var: 1.0,
             process_var_per_day: 0.0015,
+            tournament_process_var: 0.03,
             obs_var: 1.8,
             scale: 1.0,
             home_advantage: 0.0,
@@ -111,7 +120,8 @@ impl StateSpaceRatings {
     }
 
     /// Observe a finished match (`age_days` = how long ago; smaller is more recent): predict
-    /// both teams forward, then a two-state Kalman update from the goal margin.
+    /// both teams forward by the elapsed-time random walk, then a two-state Kalman update from
+    /// the goal margin.
     pub fn observe(
         &mut self,
         home: TeamId,
@@ -122,6 +132,43 @@ impl StateSpaceRatings {
     ) {
         self.predict_to(home, age_days);
         self.predict_to(away, age_days);
+        self.kalman_update(home, away, score, neutral);
+    }
+
+    /// Observe an **in-tournament** result. Rather than the day-based random walk (tournament
+    /// matches are only days apart, so it would barely move the filter and let it grow
+    /// overconfident and sluggish over the competition), inject a fixed process-noise bump per
+    /// match before the Kalman update. That keeps the Kalman gain up, so recent tournament results
+    /// move the estimate faster and the per-team uncertainty the Monte-Carlo consumes does not
+    /// collapse as the tournament wears on.
+    pub fn observe_tournament(
+        &mut self,
+        home: TeamId,
+        away: TeamId,
+        score: Scoreline,
+        neutral: bool,
+    ) {
+        self.bump_variance(home);
+        self.bump_variance(away);
+        self.kalman_update(home, away, score, neutral);
+    }
+
+    /// Inject the per-match tournament process noise and mark the team as just-played (age 0).
+    fn bump_variance(&mut self, team: TeamId) {
+        let (mean, var) = self.get(team);
+        self.state.insert(
+            team,
+            (mean, var + self.config.tournament_process_var.max(0.0)),
+        );
+        self.last_age.insert(team, 0.0);
+    }
+
+    /// The two-state Kalman measurement update from a match's goal margin, shared by [`observe`]
+    /// and [`observe_tournament`] (which differ only in the predict step that precedes it).
+    ///
+    /// [`observe`]: Self::observe
+    /// [`observe_tournament`]: Self::observe_tournament
+    fn kalman_update(&mut self, home: TeamId, away: TeamId, score: Scoreline, neutral: bool) {
         let (mh, ph) = self.get(home);
         let (ma, pa) = self.get(away);
         let adv = if neutral {
@@ -222,6 +269,32 @@ mod tests {
             "a long gap should leave more residual variance"
         );
         let _ = after_first;
+    }
+
+    #[test]
+    fn tournament_observations_stay_reactive_where_a_zero_gap_goes_stale() {
+        // The same six results fed two ways: as in-tournament matches (fixed process-noise bump)
+        // vs as back-to-back matches at age 0 (no random walk, the old engine behaviour). The
+        // tournament filter keeps more variance (stays reactive) and tracks the winning team
+        // higher and faster.
+        let mut tourney = StateSpaceRatings::with_defaults();
+        let mut zero_gap = StateSpaceRatings::with_defaults();
+        for _ in 0..6 {
+            tourney.observe_tournament(t(1), t(2), Scoreline::new(2, 0), true);
+            zero_gap.observe(t(1), t(2), Scoreline::new(2, 0), 0.0, true);
+        }
+        assert!(
+            tourney.stddev(t(1)) > zero_gap.stddev(t(1)),
+            "tournament process noise should keep the filter reactive ({} vs {})",
+            tourney.stddev(t(1)),
+            zero_gap.stddev(t(1))
+        );
+        assert!(
+            tourney.mean(t(1)) > zero_gap.mean(t(1)),
+            "a higher Kalman gain should track the rising team faster ({} vs {})",
+            tourney.mean(t(1)),
+            zero_gap.mean(t(1))
+        );
     }
 
     #[test]

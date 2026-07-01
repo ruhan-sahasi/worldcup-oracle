@@ -114,8 +114,9 @@ Skill is the point, so it is measured carefully:
   **temperature** is refit by minimizing log-loss and applied to the remaining forecasts. This is
   post-hoc temperature scaling, correcting any systematic over/under-confidence the offline fit
   could not anticipate. It rides on top of the model's other in-tournament learning (online
-  goal-model updates and the state-space rating), which move the point estimates; recalibration
-  fixes the *sharpness*.
+  goal-model updates and the state-space rating, which injects a per-match process-noise bump for
+  tournament games so it keeps tracking form fast instead of growing overconfident) - those move
+  the point estimates; recalibration fixes the *sharpness*.
 - **Signal ablation** (`wc-oracle sensitivity`): the natural skeptic's question about nine
   unconventional signals is "do they actually matter?". The analysis disables each signal in turn
   and re-simulates the whole tournament on a shared RNG seed (so the delta reflects the signal, not
