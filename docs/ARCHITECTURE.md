@@ -201,6 +201,12 @@ members are then refit on all the data for deployment. When a match has bookmake
 as the fourth member and the ensemble anchors to them; with no odds it degrades cleanly to the
 three model members (`blend` renormalizes the weights).
 
+For **knockout ties** the engine calls `blend_with_market_boost`, scaling the market member's
+weight by `KNOCKOUT_MARKET_BOOST`: a single-elimination match draws a sharp, heavily-traded
+closing line, and the stacked weights (learned mostly on group/league play) under-weight it, so the
+knockout forecast leans harder on the market. Applied only when odds are present for a
+knockout-stage fixture; a boost of 1.0 is exactly `blend`.
+
 ### Lineup, suspension & venue adjustments (`oracle-ingest::data` + `oracle-model`)
 Three context signals produce log-space per-team `(attack, defense)` deltas that sum and
 feed `GoalModel::expected_goals_adjusted`. **Lineups**: a confirmed XI compared to the

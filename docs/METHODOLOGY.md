@@ -35,7 +35,9 @@ bookmaker odds ─▶ market member ─────────────┘  
 The **Dixon-Coles bivariate-Poisson** goal model is the core: it turns team histories into a full
 exact-score distribution. **Elo** and a **state-space (Kalman)** rating are complementary strength
 signals; the **market** (vig-free bookmaker odds) is the fourth member. A **log-opinion-pool
-ensemble** blends them with weights learned by out-of-fold stacking. For tournament odds, a parallel
+ensemble** blends them with weights learned by out-of-fold stacking, and leans harder on the market
+for **knockout ties**, where the heavily-traded single-match closing line is the sharpest signal
+and the stacked weights (learned mostly on group/league play) under-weight it. For tournament odds, a parallel
 **Monte-Carlo** plays the rest of the competition tens of thousands of times.
 
 ## The unconventional signals

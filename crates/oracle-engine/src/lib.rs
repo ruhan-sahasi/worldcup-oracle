@@ -438,6 +438,11 @@ const CONTEXT_CALIB_MIN: usize = 20;
 /// a tournament is a small, noisy sample, so the gain should barely move without clear evidence.
 const CONTEXT_PRIOR_PRECISION: f64 = 8.0;
 
+/// Extra weight on the bookmaker market for **knockout** ties, where the single-match closing line
+/// is an especially sharp signal (the ensemble weights are learned mostly on group/league play, so
+/// they under-weight it). Applied only when odds are present for a knockout-stage match.
+const KNOCKOUT_MARKET_BOOST: f64 = 1.75;
+
 impl EngineState {
     fn new(tournament: Tournament, deps: EngineDeps) -> Self {
         let names = tournament
@@ -847,10 +852,20 @@ impl EngineState {
         let elo = self.ratings.win_probabilities(m.home, m.away, NEUTRAL);
         let kalman = self.state_space.win_probabilities(m.home, m.away, NEUTRAL);
         let mut members = vec![dc, elo, kalman];
-        if let Some(market) = self.live.get(&m.id).and_then(|l| l.market) {
+        let market_present = if let Some(market) = self.live.get(&m.id).and_then(|l| l.market) {
             members.push(market);
-        }
-        self.ensemble.blend(&members)
+            true
+        } else {
+            false
+        };
+        // Knockout ties lean harder on the market: the single-match closing line is the sharpest
+        // signal there, so boost its weight when odds are present for a knockout-stage fixture.
+        let boost = if market_present && m.stage.is_knockout() {
+            KNOCKOUT_MARKET_BOOST
+        } else {
+            1.0
+        };
+        self.ensemble.blend_with_market_boost(&members, boost)
     }
 
     /// The full raw pre-match forecast for a matchup (its own grid, then [`blend_pre_match`]).
@@ -1582,5 +1597,71 @@ mod tests {
         let adj = state.match_adjustments(sched.id);
         assert!((adj.0 .0 - (g * ctx.0 .0 + sty.0 .0)).abs() < 1e-9);
         assert!((adj.1 .0 - (g * ctx.1 .0 + sty.1 .0)).abs() < 1e-9);
+    }
+
+    #[test]
+    fn knockout_ties_lean_harder_on_the_market() {
+        // Finish the group stage so the real knockout bracket is materialized.
+        let mut state = state_with_lr(0.0);
+        let metrics = Metrics::default();
+        let groups: Vec<(MatchId, TeamId, TeamId)> = state
+            .tournament
+            .matches
+            .iter()
+            .map(|m| (m.id, m.home, m.away))
+            .collect();
+        for (id, home, away) in groups {
+            let score = if home.0 < away.0 {
+                Scoreline::new(2, 0)
+            } else {
+                Scoreline::new(0, 2)
+            };
+            state.apply_event(
+                &MatchEvent::new(id, 90, EventKind::FullTime { score }),
+                &metrics,
+            );
+        }
+        let ko = state
+            .tournament
+            .matches
+            .iter()
+            .find(|m| m.stage.is_knockout())
+            .unwrap()
+            .clone();
+        // Strongly away-favouring bookmaker odds on the tie.
+        state.apply_event(
+            &MatchEvent::new(
+                ko.id,
+                0,
+                EventKind::Odds {
+                    home: 8.0,
+                    draw: 5.0,
+                    away: 1.3,
+                },
+            ),
+            &metrics,
+        );
+
+        let shown = state.predict_match(&ko).probabilities;
+
+        // Reference: the same members and temperature, but WITHOUT the knockout market boost.
+        let (home_adj, away_adj) = state.match_adjustments(ko.id);
+        let grid = state
+            .model
+            .score_grid_adjusted(ko.home, ko.away, true, home_adj, away_adj);
+        let members = [
+            grid.outcome_probabilities(),
+            state.ratings.win_probabilities(ko.home, ko.away, true),
+            state.state_space.win_probabilities(ko.home, ko.away, true),
+            implied_probabilities(8.0, 5.0, 1.3),
+        ];
+        let plain = apply_temperature(state.ensemble.blend(&members), state.calib_temperature);
+
+        assert!(
+            shown.away_win > plain.away_win + 1e-6,
+            "the knockout market boost should pull toward the away-favouring line ({} vs {})",
+            shown.away_win,
+            plain.away_win
+        );
     }
 }

@@ -73,13 +73,31 @@ impl Ensemble {
     /// Blend member forecasts via the temperature-scaled log-opinion pool. An empty
     /// input returns a uniform distribution; missing weights default to 1.0.
     pub fn blend(&self, members: &[Probabilities]) -> Probabilities {
+        self.blend_with_market_boost(members, 1.0)
+    }
+
+    /// Blend as [`blend`](Self::blend), but scale the weight of the **final** member by
+    /// `market_boost` before pooling. By the engine's member convention the bookmaker market is
+    /// the last member when present, so a boost `> 1` leans harder on the closing line. This is
+    /// used for knockout ties, where the single-match market is an especially sharp signal and the
+    /// ensemble weights (learned mostly on group/league play) under-weight it. `1.0` is identical
+    /// to [`blend`](Self::blend).
+    pub fn blend_with_market_boost(
+        &self,
+        members: &[Probabilities],
+        market_boost: f64,
+    ) -> Probabilities {
         if members.is_empty() {
             return Probabilities::uniform();
         }
+        let last = members.len() - 1;
         let mut acc = [0.0f64; 3];
         let mut total_w = 0.0;
         for (idx, m) in members.iter().enumerate() {
-            let w = self.weights.get(idx).copied().unwrap_or(1.0);
+            let mut w = self.weights.get(idx).copied().unwrap_or(1.0);
+            if idx == last {
+                w *= market_boost.max(0.0);
+            }
             total_w += w;
             for (slot, outcome) in OUTCOMES.into_iter().enumerate() {
                 // ln of each member's probability, floored to avoid -inf on p = 0.
@@ -229,6 +247,24 @@ mod tests {
         let b = Probabilities::new(0.2, 0.1, 0.7);
         let blended = Ensemble::new(vec![1.0, 1.0]).blend(&[a, b]);
         assert!(blended.home_win < 0.8 && blended.home_win > 0.2);
+    }
+
+    #[test]
+    fn market_boost_pulls_toward_the_market_member() {
+        let dc = Probabilities::new(0.5, 0.3, 0.2);
+        let elo = Probabilities::new(0.45, 0.3, 0.25);
+        let market = Probabilities::new(0.15, 0.25, 0.6); // strongly away
+        let e = Ensemble::new(vec![1.0, 1.0, 1.0]);
+        let base = e.blend(&[dc, elo, market]);
+        let boosted = e.blend_with_market_boost(&[dc, elo, market], 3.0);
+        assert!(
+            boosted.away_win > base.away_win && boosted.home_win < base.home_win,
+            "boosting the market should pull the blend toward its away lean"
+        );
+        assert!((boosted.sum() - 1.0).abs() < 1e-9);
+        // A boost of 1.0 is exactly the plain blend.
+        let same = e.blend_with_market_boost(&[dc, elo, market], 1.0);
+        assert!((same.away_win - base.away_win).abs() < 1e-12);
     }
 
     #[test]
