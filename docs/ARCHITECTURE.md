@@ -150,6 +150,15 @@ teams' coefficients) on each finished match. The engine calls it from the `FullT
 alongside the Elo update, so as the group stage unfolds the forecast tracks tournament form
 instead of staying frozen at the offline fit.
 
+The engine also **recalibrates in-tournament**. Where the online update moves the point
+estimates, a **temperature-scaling** layer fixes their sharpness: from the `FullTime` arm it
+records the match's pre-match forecast (`pre_match_probs`, captured *before* the result updates
+the model, so the pair is leak-free) against the realized outcome, and once `MIN_CALIB_SAMPLES`
+matches have finished it refits the single temperature that minimizes log-loss over those pairs
+(`oracle_model::fit_temperature`) and applies it (`apply_temperature`) to every remaining
+scheduled-match forecast. It is the identity until enough results accumulate, so early forecasts
+are untouched.
+
 ### State-space (Kalman) rating (`oracle-ratings::state_space`)
 The deeper version of in-tournament learning *and* uncertainty. Each team carries a Gaussian
 belief about its latent strength, `N(mean, var)`, in goal-difference units. Between matches the

@@ -49,6 +49,7 @@ fully offline with **zero keys and zero network**.
 | **Elo** with home edge + margin-of-victory scaling | a complementary strength signal |
 | **State-space (Kalman) rating** - each team a Gaussian `N(mean, var)`, random-walk between matches + Kalman update from each result | principled in-tournament learning *and* a per-team uncertainty that the Monte-Carlo consumes |
 | **Log-opinion-pool ensemble** (`[Dixon-Coles, Elo, State-space, Market]` weights + temperature **learned by out-of-fold stacking**) | a single sharper forecast, anchored to the bookmaker when odds are present; weights trained on leakage-free predictions over the whole dataset |
+| **Live recalibration** - as matches finish, their leak-free pre-match forecasts are scored against the results and a **temperature-scaling** correction is refit and applied to the remaining forecasts | the model recalibrates itself against the tournament as it plays, correcting any over/under-confidence the offline fit could not anticipate |
 | **Bayesian live updater** with **score effects** | conditions on score, minute, and red cards; a trailing team chases and a leading team defends |
 | **Lineup adjustment** | a confirmed XI shifts each team's attack and defense |
 | **Suspension tracking** | yellow-card accumulation drops a suspended starter from the next match before its lineup is known |

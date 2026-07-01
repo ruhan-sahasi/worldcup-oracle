@@ -36,7 +36,8 @@ use oracle_domain::{
 };
 use oracle_ingest::DataProvider;
 use oracle_model::{
-    implied_probabilities, live_score_grid, Ensemble, GoalModel, LiveConfig, LiveState,
+    apply_temperature, fit_temperature, implied_probabilities, live_score_grid, Ensemble,
+    GoalModel, LiveConfig, LiveState,
 };
 use oracle_ratings::{EloConfig, RatingStore, StateSpaceRatings};
 use oracle_sim::{simulate_with_live, InProgress, LiveInputs, SimConfig, VenueAdj};
@@ -405,7 +406,18 @@ struct EngineState {
     source_healthy: bool,
     /// Wall-clock time the last event was processed - surfaces feed staleness.
     last_update: chrono::DateTime<chrono::Utc>,
+    /// Live calibration: each finished match's pre-match forecast paired with its realized
+    /// outcome (leak-free - the forecast is recorded before the result updates the model).
+    calib_pairs: Vec<(Probabilities, Outcome)>,
+    /// The temperature fitted on `calib_pairs` and applied to remaining pre-match forecasts:
+    /// post-hoc **temperature scaling**, recalibrating the model against the tournament as it
+    /// plays. `1.0` (the identity) until enough matches have finished.
+    calib_temperature: f64,
 }
+
+/// Finished matches needed before the live temperature recalibration kicks in (below this it stays
+/// at the identity, since a handful of results cannot pin down a calibration correction).
+const MIN_CALIB_SAMPLES: usize = 12;
 
 impl EngineState {
     fn new(tournament: Tournament, deps: EngineDeps) -> Self {
@@ -453,6 +465,8 @@ impl EngineState {
             knockout_pedigree,
             source_healthy: true,
             last_update: chrono::Utc::now(),
+            calib_pairs: Vec::new(),
+            calib_temperature: 1.0,
         }
     }
 
@@ -559,6 +573,13 @@ impl EngineState {
         }
 
         if let Some(score) = final_score {
+            // Live calibration: pair this match's *pre-match* forecast with its realized outcome
+            // before the model learns from it (so the pair is leak-free), then refit the
+            // temperature applied to the remaining forecasts.
+            let m = self.tournament.matches[pos].clone();
+            let pred = self.pre_match_probs(&m);
+            self.calib_pairs.push((pred, score.outcome()));
+            self.refit_calibration();
             // World Cup matches are at neutral venues. Both ratings learn from the result:
             // Elo, and the Dixon-Coles goal model (online, so the forecast tracks tournament
             // form instead of staying frozen at the offline fit).
@@ -741,6 +762,53 @@ impl EngineState {
             .unwrap_or_else(|| id.to_string())
     }
 
+    /// The raw (pre-calibration) pre-match ensemble blend for a matchup, given its score grid:
+    /// [Dixon-Coles, Elo, state-space, (market)] through the learned ensemble. Shared by the
+    /// scheduled-match prediction and the live-calibration capture so they stay identical.
+    fn blend_pre_match(
+        &self,
+        m: &oracle_domain::Match,
+        grid: &oracle_domain::ScoreGrid,
+    ) -> Probabilities {
+        const NEUTRAL: bool = true;
+        let dc = grid.outcome_probabilities();
+        let elo = self.ratings.win_probabilities(m.home, m.away, NEUTRAL);
+        let kalman = self.state_space.win_probabilities(m.home, m.away, NEUTRAL);
+        let mut members = vec![dc, elo, kalman];
+        if let Some(market) = self.live.get(&m.id).and_then(|l| l.market) {
+            members.push(market);
+        }
+        self.ensemble.blend(&members)
+    }
+
+    /// The full raw pre-match forecast for a matchup (its own grid, then [`blend_pre_match`]).
+    /// Used to record a leak-free `(prediction, outcome)` pair for live calibration.
+    fn pre_match_probs(&self, m: &oracle_domain::Match) -> Probabilities {
+        let (home_adj, away_adj) = self.match_adjustments(m.id);
+        let grid = self
+            .model
+            .score_grid_adjusted(m.home, m.away, true, home_adj, away_adj);
+        self.blend_pre_match(m, &grid)
+    }
+
+    /// Refit the calibration temperature once enough matches have finished. Post-hoc temperature
+    /// scaling: the single temperature that minimizes log-loss over the accumulated pre-match
+    /// forecasts and their realized outcomes, then applied to the remaining forecasts.
+    fn refit_calibration(&mut self) {
+        if self.calib_pairs.len() < MIN_CALIB_SAMPLES {
+            return;
+        }
+        let t = fit_temperature(&self.calib_pairs);
+        if (t - self.calib_temperature).abs() > 1e-6 {
+            self.calib_temperature = t;
+            tracing::info!(
+                temperature = t,
+                samples = self.calib_pairs.len(),
+                "recalibrated remaining forecasts against tournament results"
+            );
+        }
+    }
+
     fn predict_match(&self, m: &oracle_domain::Match) -> MatchPrediction {
         let lm = self.live.get(&m.id).copied();
         let (status, score, minute, home_reds, away_reds) = match lm {
@@ -777,14 +845,10 @@ impl EngineState {
                 let grid = self
                     .model
                     .score_grid_adjusted(m.home, m.away, NEUTRAL, home_adj, away_adj);
-                let dc = grid.outcome_probabilities();
-                let elo = self.ratings.win_probabilities(m.home, m.away, NEUTRAL);
-                let kalman = self.state_space.win_probabilities(m.home, m.away, NEUTRAL);
-                let mut members = vec![dc, elo, kalman];
-                if let Some(market) = lm.and_then(|l| l.market) {
-                    members.push(market);
-                }
-                let blended = self.ensemble.blend(&members);
+                // Raw ensemble blend, then the live calibration correction (identity until enough
+                // tournament results have accumulated to fit a temperature).
+                let blended =
+                    apply_temperature(self.blend_pre_match(m, &grid), self.calib_temperature);
                 let mls = grid.most_likely_score();
                 (blended, Some(grid), Some(mls))
             }
@@ -1317,5 +1381,65 @@ mod tests {
             state.state_space.stddev(team) < sd_before,
             "observing matches should reduce the Kalman uncertainty"
         );
+    }
+
+    #[test]
+    fn live_recalibration_fits_and_applies_a_temperature() {
+        // Online learning off (to isolate calibration). Finish enough matches so each one's
+        // favoured outcome always wins: the pre-match forecasts are then systematically
+        // under-confident, so the fitted temperature sharpens them (> 1).
+        let mut state = state_with_lr(0.0);
+        let metrics = Metrics::default();
+        assert!(
+            (state.calib_temperature - 1.0).abs() < 1e-9,
+            "starts at the identity"
+        );
+
+        let ids: Vec<MatchId> = state
+            .tournament
+            .matches
+            .iter()
+            .take(30)
+            .map(|m| m.id)
+            .collect();
+        for id in ids {
+            let m = state
+                .tournament
+                .matches
+                .iter()
+                .find(|x| x.id == id)
+                .unwrap()
+                .clone();
+            let score = match state.pre_match_probs(&m).most_likely() {
+                Outcome::HomeWin => Scoreline::new(2, 0),
+                Outcome::Draw => Scoreline::new(1, 1),
+                Outcome::AwayWin => Scoreline::new(0, 2),
+            };
+            state.apply_event(
+                &MatchEvent::new(id, 90, EventKind::FullTime { score }),
+                &metrics,
+            );
+        }
+
+        assert_eq!(state.calib_pairs.len(), 30);
+        assert!(
+            state.calib_temperature > 1.0,
+            "an under-confident model should be sharpened, got {}",
+            state.calib_temperature
+        );
+
+        // A scheduled match's shown forecast is exactly the raw blend after the fitted temperature.
+        let sched = state
+            .tournament
+            .matches
+            .iter()
+            .find(|m| !m.is_finished())
+            .unwrap()
+            .clone();
+        let expected = apply_temperature(state.pre_match_probs(&sched), state.calib_temperature);
+        let shown = state.predict_match(&sched).probabilities;
+        assert!((shown.home_win - expected.home_win).abs() < 1e-9);
+        assert!((shown.draw - expected.draw).abs() < 1e-9);
+        assert!((shown.away_win - expected.away_win).abs() < 1e-9);
     }
 }

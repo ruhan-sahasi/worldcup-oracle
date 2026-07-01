@@ -108,6 +108,14 @@ Skill is the point, so it is measured carefully:
 - The honest finding: on held-out data the ensemble's interval **overlaps the bookmaker's** - it
   matches the market within noise rather than beating it. That is a strong, truthful result, and the
   CV harness is what lets it be stated with confidence.
+- **Live recalibration** (in the engine, once a tournament is under way): the finished matches are
+  a calibration set. Each match's leak-free pre-match forecast (recorded before its result updates
+  the model) is paired with the realized outcome, and once enough have accumulated a single
+  **temperature** is refit by minimizing log-loss and applied to the remaining forecasts. This is
+  post-hoc temperature scaling, correcting any systematic over/under-confidence the offline fit
+  could not anticipate. It rides on top of the model's other in-tournament learning (online
+  goal-model updates and the state-space rating), which move the point estimates; recalibration
+  fixes the *sharpness*.
 - **Signal ablation** (`wc-oracle sensitivity`): the natural skeptic's question about nine
   unconventional signals is "do they actually matter?". The analysis disables each signal in turn
   and re-simulates the whole tournament on a shared RNG seed (so the delta reflects the signal, not

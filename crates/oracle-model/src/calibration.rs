@@ -87,6 +87,62 @@ pub fn score(predictions: &[(Probabilities, Outcome)]) -> CalibrationReport {
     }
 }
 
+/// Rescale a probability triple by a temperature: multiply the log-probabilities by `temperature`
+/// and renormalize (a softmax over `temperature * ln p`). This matches [`Ensemble`](crate::Ensemble)'s
+/// convention: `temperature > 1` sharpens the distribution (more confident), `< 1` flattens it
+/// (less confident), and `1` is the identity. Used to apply a fitted calibration correction.
+pub fn apply_temperature(p: Probabilities, temperature: f64) -> Probabilities {
+    let l = [
+        p.home_win.max(1e-12).ln() * temperature,
+        p.draw.max(1e-12).ln() * temperature,
+        p.away_win.max(1e-12).ln() * temperature,
+    ];
+    let max = l[0].max(l[1]).max(l[2]);
+    Probabilities::new((l[0] - max).exp(), (l[1] - max).exp(), (l[2] - max).exp())
+}
+
+/// Fit the single temperature that minimizes log-loss over `(prediction, outcome)` pairs, the
+/// standard **temperature-scaling** post-hoc calibration. `> 1` means the raw predictions were
+/// under-confident (sharpen them), `< 1` over-confident (soften them). Returns `1.0` (the identity)
+/// for fewer than two samples. Found by golden-section search over `[0.1, 5.0]`, since the log-loss
+/// is unimodal in the temperature.
+pub fn fit_temperature(predictions: &[(Probabilities, Outcome)]) -> f64 {
+    if predictions.len() < 2 {
+        return 1.0;
+    }
+    let loss = |t: f64| -> f64 {
+        predictions
+            .iter()
+            .map(|(p, o)| -apply_temperature(*p, t).of(*o).max(1e-12).ln())
+            .sum::<f64>()
+    };
+    // Golden-section search: shrink [a, b] keeping the golden-ratio interior points.
+    let phi = (5.0_f64.sqrt() - 1.0) / 2.0; // ~0.618
+    let (mut a, mut b) = (0.1_f64, 5.0_f64);
+    let mut c = b - phi * (b - a);
+    let mut d = a + phi * (b - a);
+    let (mut fc, mut fd) = (loss(c), loss(d));
+    for _ in 0..80 {
+        if fc < fd {
+            b = d;
+            d = c;
+            fd = fc;
+            c = b - phi * (b - a);
+            fc = loss(c);
+        } else {
+            a = c;
+            c = d;
+            fc = fd;
+            d = a + phi * (b - a);
+            fd = loss(d);
+        }
+        if (b - a).abs() < 1e-4 {
+            break;
+        }
+    }
+    (a + b) / 2.0
+}
+
 /// A skill metric with a bootstrap confidence interval: the point estimate on the full sample
 /// plus the 2.5th and 97.5th percentiles over the resamples.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
@@ -248,6 +304,48 @@ mod tests {
         assert!(r.brier < 1e-9);
         assert!(r.log_loss < 1e-6);
         assert!((r.accuracy - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn temperature_one_is_the_identity() {
+        let p = Probabilities::new(0.6, 0.25, 0.15);
+        let q = apply_temperature(p, 1.0);
+        assert!((p.home_win - q.home_win).abs() < 1e-9);
+        assert!((p.draw - q.draw).abs() < 1e-9);
+        assert!((p.away_win - q.away_win).abs() < 1e-9);
+    }
+
+    #[test]
+    fn temperature_above_one_sharpens_below_one_flattens() {
+        let p = Probabilities::new(0.6, 0.25, 0.15);
+        let sharp = apply_temperature(p, 2.0);
+        let flat = apply_temperature(p, 0.5);
+        assert!(sharp.home_win > p.home_win, "sharpen raises the peak");
+        assert!(flat.home_win < p.home_win, "flatten lowers the peak");
+        assert!((sharp.sum() - 1.0).abs() < 1e-9 && (flat.sum() - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn fit_temperature_sharpens_an_under_confident_model() {
+        // A model that only ever says 0.5 for the favourite, but the favourite always wins, is
+        // under-confident: the best temperature sharpens it (> 1) and cuts the log-loss.
+        let preds: Vec<(Probabilities, Outcome)> = (0..60)
+            .map(|_| (Probabilities::new(0.5, 0.3, 0.2), Outcome::HomeWin))
+            .collect();
+        let t = fit_temperature(&preds);
+        assert!(
+            t > 1.0,
+            "under-confident model should be sharpened, got {t}"
+        );
+        let before = score(&preds).log_loss;
+        let after = score(
+            &preds
+                .iter()
+                .map(|(p, o)| (apply_temperature(*p, t), *o))
+                .collect::<Vec<_>>(),
+        )
+        .log_loss;
+        assert!(after < before, "temperature scaling should reduce log-loss");
     }
 
     #[test]
