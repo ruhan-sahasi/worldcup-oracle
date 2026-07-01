@@ -143,6 +143,29 @@ pub fn fit_temperature(predictions: &[(Probabilities, Outcome)]) -> f64 {
     (a + b) / 2.0
 }
 
+/// Fit a multiplicative **gain** on a predictor, shrunk toward 1: a one-dimensional Bayesian
+/// ridge. Given `(x, y)` pairs it returns the `g` minimizing
+/// `Σ (yᵢ - g·xᵢ)² + prior_precision·(g - 1)²`, in closed form
+/// `(Σ xᵢyᵢ + prior_precision) / (Σ xᵢ² + prior_precision)`. With no data (or a huge prior) it
+/// returns `1.0`, the prior. Used to recalibrate a reasoned-synthetic effect's *strength* against
+/// observed results without overreacting to a small sample: `x` is the effect's predicted
+/// contribution, `y` the residual it is meant to explain, so `g > 1` means the effect is playing
+/// out stronger than the prior and `g < 1` weaker.
+pub fn fit_gain_toward_one(pairs: &[(f64, f64)], prior_precision: f64) -> f64 {
+    let lambda = prior_precision.max(0.0);
+    // Prior N(1, 1/lambda) contributes `lambda` to the denominator and `lambda * 1` to the numerator.
+    let mut sxx = lambda;
+    let mut sxy = lambda;
+    for &(x, y) in pairs {
+        sxx += x * x;
+        sxy += x * y;
+    }
+    if sxx <= 0.0 {
+        return 1.0;
+    }
+    sxy / sxx
+}
+
 /// A skill metric with a bootstrap confidence interval: the point estimate on the full sample
 /// plus the 2.5th and 97.5th percentiles over the resamples.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
@@ -346,6 +369,25 @@ mod tests {
         )
         .log_loss;
         assert!(after < before, "temperature scaling should reduce log-loss");
+    }
+
+    #[test]
+    fn gain_shrinks_toward_one_and_recovers_the_slope() {
+        // y = 1.5 x exactly. With no prior, recover the slope; with a strong prior, pulled toward 1.
+        let pairs: Vec<(f64, f64)> = (1..=20)
+            .map(|i| {
+                let x = i as f64 * 0.1;
+                (x, 1.5 * x)
+            })
+            .collect();
+        assert!((fit_gain_toward_one(&pairs, 0.0) - 1.5).abs() < 1e-9);
+        let shrunk = fit_gain_toward_one(&pairs, 100.0);
+        assert!(
+            shrunk > 1.0 && shrunk < 1.5,
+            "strong prior pulls toward 1: {shrunk}"
+        );
+        // No data collapses to the prior mean of 1.
+        assert!((fit_gain_toward_one(&[], 5.0) - 1.0).abs() < 1e-12);
     }
 
     #[test]

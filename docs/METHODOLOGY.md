@@ -117,6 +117,14 @@ Skill is the point, so it is measured carefully:
   goal-model updates and the state-space rating, which injects a per-match process-noise bump for
   tournament games so it keeps tracking form fast instead of growing overconfident) - those move
   the point estimates; recalibration fixes the *sharpness*.
+- **Context recalibration** (in the engine): the reasoned-synthetic context effects (host, crowd,
+  travel, heat) carry an *aggregate* strength gain, refit in-tournament against the results. Each
+  finished match contributes the context's predicted margin contribution and the residual it should
+  explain; a strongly-shrunk 1-D ridge (prior mean 1) nudges the gain toward what the tournament
+  actually shows, so if context is playing out stronger or weaker than the priors the remaining
+  forecasts follow. Deliberately *one* gain, not per-signal: a single tournament cannot reliably
+  separate the correlated host/crowd/heat/travel effects, so the honest statistic is their combined
+  strength, shrunk hard toward the prior until real evidence accumulates.
 - **Signal ablation** (`wc-oracle sensitivity`): the natural skeptic's question about nine
   unconventional signals is "do they actually matter?". The analysis disables each signal in turn
   and re-simulates the whole tournament on a shared RNG seed (so the delta reflects the signal, not

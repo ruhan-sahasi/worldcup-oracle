@@ -36,8 +36,8 @@ use oracle_domain::{
 };
 use oracle_ingest::DataProvider;
 use oracle_model::{
-    apply_temperature, fit_temperature, implied_probabilities, live_score_grid, Ensemble,
-    GoalModel, LiveConfig, LiveState,
+    apply_temperature, fit_gain_toward_one, fit_temperature, implied_probabilities,
+    live_score_grid, Ensemble, GoalModel, LiveConfig, LiveState,
 };
 use oracle_ratings::{EloConfig, RatingStore, StateSpaceRatings};
 use oracle_sim::{simulate_with_live, InProgress, LiveInputs, SimConfig, VenueAdj};
@@ -398,9 +398,20 @@ struct EngineState {
     suspended: HashMap<MatchId, Vec<(TeamId, String)>>,
     live: HashMap<MatchId, LiveMatch>,
     last_forecast: oracle_domain::TournamentForecast,
-    /// Per-match adjustments precomputed once: venue/crowd/travel/heat context plus the style
-    /// matchup (`data::matchup_adjustments`).
-    venue_adj: HashMap<MatchId, VenueAdj>,
+    /// Per-match **context** adjustments (host/crowd/travel/heat/altitude/rest), precomputed once
+    /// (`data::venue_adjustments`). Kept separate from style so the live context gain scales only
+    /// this part.
+    context_adj: HashMap<MatchId, VenueAdj>,
+    /// Per-match **style matchup** adjustments, precomputed once (`data::style_adjustments`).
+    style_adj: HashMap<MatchId, VenueAdj>,
+    /// Aggregate multiplier on the context adjustment, recalibrated in-tournament: the reasoned
+    /// priors (host/crowd/travel/heat) are scaled toward what the tournament actually shows. `1.0`
+    /// (the prior) until enough results accumulate. One gain rather than per-signal, since a
+    /// tournament's matches cannot reliably separate the correlated context effects.
+    context_gain: f64,
+    /// `(context contribution to predicted margin, residual vs observed margin)` per finished
+    /// match, the regression that fits `context_gain`.
+    context_calib: Vec<(f64, f64)>,
     /// Per-team knockout factors precomputed once: penalty-shootout skill and knockout pedigree.
     shootout_rating: HashMap<TeamId, f64>,
     knockout_pedigree: HashMap<TeamId, f64>,
@@ -421,6 +432,12 @@ struct EngineState {
 /// at the identity, since a handful of results cannot pin down a calibration correction).
 const MIN_CALIB_SAMPLES: usize = 12;
 
+/// Finished matches needed before the context gain moves off 1.0.
+const CONTEXT_CALIB_MIN: usize = 20;
+/// Prior precision (shrinkage toward gain 1) for the context recalibration. Deliberately strong:
+/// a tournament is a small, noisy sample, so the gain should barely move without clear evidence.
+const CONTEXT_PRIOR_PRECISION: f64 = 8.0;
+
 impl EngineState {
     fn new(tournament: Tournament, deps: EngineDeps) -> Self {
         let names = tournament
@@ -438,9 +455,11 @@ impl EngineState {
         for (team, rating) in deps.elo_seeds {
             ratings.seed(team, rating);
         }
-        // Match context (venue/crowd/travel/heat) plus the style matchup is static for the
-        // tournament, so precompute it once.
-        let venue_adj = oracle_ingest::data::matchup_adjustments(&tournament);
+        // Match context (venue/crowd/travel/heat) and the style matchup are static for the
+        // tournament, so precompute each once. They are kept separate so the live context gain
+        // can scale the context part without touching style.
+        let context_adj = oracle_ingest::data::venue_adjustments(&tournament);
+        let style_adj = oracle_ingest::data::style_adjustments(&tournament);
         let shootout_rating = oracle_ingest::data::shootout_ratings();
         let knockout_pedigree = oracle_ingest::data::knockout_pedigree();
         Self {
@@ -462,7 +481,10 @@ impl EngineState {
                 iterations: 0,
                 teams: Vec::new(),
             },
-            venue_adj,
+            context_adj,
+            style_adj,
+            context_gain: 1.0,
+            context_calib: Vec::new(),
             shootout_rating,
             knockout_pedigree,
             source_healthy: true,
@@ -472,13 +494,40 @@ impl EngineState {
         }
     }
 
-    /// Combined venue + lineup `(home_adj, away_adj)` deltas for a match (summed in log
-    /// space), feeding the adjusted goal model and the Monte-Carlo.
+    /// Combined `(home_adj, away_adj)` deltas for a match (summed in log space): the
+    /// context (scaled by the live-recalibrated `context_gain`), the style matchup, and player
+    /// availability. Feeds the adjusted goal model and the Monte-Carlo.
     fn match_adjustments(&self, id: MatchId) -> VenueAdj {
-        let ((vh_a, vh_d), (va_a, va_d)) = self.venue_adj.get(&id).copied().unwrap_or_default();
+        let g = self.context_gain;
+        let ((ch_a, ch_d), (ca_a, ca_d)) = self.context_adj.get(&id).copied().unwrap_or_default();
+        let ((sh_a, sh_d), (sa_a, sa_d)) = self.style_adj.get(&id).copied().unwrap_or_default();
         // Player availability: announced lineup if known, else a suspension-derived estimate.
         let ((lh_a, lh_d), (la_a, la_d)) = self.availability_adj(id);
-        ((vh_a + lh_a, vh_d + lh_d), (va_a + la_a, va_d + la_d))
+        (
+            (g * ch_a + sh_a + lh_a, g * ch_d + sh_d + lh_d),
+            (g * ca_a + sa_a + la_a, g * ca_d + sa_d + la_d),
+        )
+    }
+
+    /// The static per-match adjustment (no availability): the context scaled by `context_gain`
+    /// plus the style matchup. This is the base the Monte-Carlo's `venue` map is built from.
+    fn scaled_context_plus_style(&self) -> HashMap<MatchId, VenueAdj> {
+        let g = self.context_gain;
+        let mut out: HashMap<MatchId, VenueAdj> = HashMap::new();
+        for (&id, adj) in &self.context_adj {
+            out.insert(
+                id,
+                ((g * adj.0 .0, g * adj.0 .1), (g * adj.1 .0, g * adj.1 .1)),
+            );
+        }
+        for (&id, adj) in &self.style_adj {
+            let e = out.entry(id).or_default();
+            e.0 .0 += adj.0 .0;
+            e.0 .1 += adj.0 .1;
+            e.1 .0 += adj.1 .0;
+            e.1 .1 += adj.1 .1;
+        }
+        out
     }
 
     /// Apply an event to mutable state. Returns `true` when a result landed (the
@@ -582,6 +631,23 @@ impl EngineState {
             let pred = self.pre_match_probs(&m);
             self.calib_pairs.push((pred, score.outcome()));
             self.refit_calibration();
+            // Context recalibration: how much of this match's margin the context signals explain
+            // (residual vs observed), to shrink the aggregate context gain toward what the
+            // tournament shows. Uses the pre-result model, so it is leak-free.
+            let z = f64::from(score.home) - f64::from(score.away);
+            let (lb, mb) = self.model.expected_goals(home, away, true);
+            let base_margin = lb - mb;
+            let ((ch_a, ch_d), (ca_a, ca_d)) = self
+                .context_adj
+                .get(&event.match_id)
+                .copied()
+                .unwrap_or_default();
+            let (lc, mc) =
+                self.model
+                    .expected_goals_adjusted(home, away, true, (ch_a, ch_d), (ca_a, ca_d));
+            self.context_calib
+                .push(((lc - mc) - base_margin, z - base_margin));
+            self.refit_context_gain();
             // World Cup matches are at neutral venues. Both ratings learn from the result:
             // Elo, and the Dixon-Coles goal model (online, so the forecast tracks tournament
             // form instead of staying frozen at the offline fit).
@@ -643,7 +709,8 @@ impl EngineState {
             self.match_index.insert(self.tournament.matches[i].id, i);
         }
         // Match context + style matchup now cover the knockout fixtures too.
-        self.venue_adj = oracle_ingest::data::matchup_adjustments(&self.tournament);
+        self.context_adj = oracle_ingest::data::venue_adjustments(&self.tournament);
+        self.style_adj = oracle_ingest::data::style_adjustments(&self.tournament);
     }
 
     /// The team's next unplayed match by kickoff (where a suspension would be served).
@@ -718,10 +785,11 @@ impl EngineState {
                 )
             })
             .collect();
-        // Venue context applies to every fixture; suspensions add a player-availability
-        // penalty to scheduled matches that have no announced lineup yet (lineup/live
-        // matches already carry their delta in `live`, so we skip them to avoid double count).
-        let mut venue = self.venue_adj.clone();
+        // Context (scaled by the recalibrated gain) + style apply to every fixture; suspensions
+        // add a player-availability penalty to scheduled matches that have no announced lineup yet
+        // (lineup/live matches already carry their delta in `live`, so we skip them to avoid
+        // double count).
+        let mut venue = self.scaled_context_plus_style();
         for &id in self.suspended.keys() {
             if live.contains_key(&id) {
                 continue;
@@ -809,6 +877,24 @@ impl EngineState {
                 temperature = t,
                 samples = self.calib_pairs.len(),
                 "recalibrated remaining forecasts against tournament results"
+            );
+        }
+    }
+
+    /// Recalibrate the aggregate context gain once enough matches have finished: a strongly shrunk
+    /// 1-D ridge of the observed margin residual on the context's predicted contribution, clamped
+    /// so a noisy tournament cannot swing it wildly.
+    fn refit_context_gain(&mut self) {
+        if self.context_calib.len() < CONTEXT_CALIB_MIN {
+            return;
+        }
+        let g = fit_gain_toward_one(&self.context_calib, CONTEXT_PRIOR_PRECISION).clamp(0.5, 1.5);
+        if (g - self.context_gain).abs() > 1e-6 {
+            self.context_gain = g;
+            tracing::info!(
+                context_gain = g,
+                samples = self.context_calib.len(),
+                "recalibrated context effects against tournament results"
             );
         }
     }
@@ -1445,5 +1531,56 @@ mod tests {
         assert!((shown.home_win - expected.home_win).abs() < 1e-9);
         assert!((shown.draw - expected.draw).abs() < 1e-9);
         assert!((shown.away_win - expected.away_win).abs() < 1e-9);
+    }
+
+    #[test]
+    fn context_recalibration_accumulates_and_scales_only_the_context_part() {
+        // Finish enough matches to move the gain off its prior, then confirm a scheduled match's
+        // adjustment is exactly context * gain + style (no lineup/suspension in play here).
+        let mut state = state_with_lr(0.0);
+        let metrics = Metrics::default();
+        let ids: Vec<MatchId> = state
+            .tournament
+            .matches
+            .iter()
+            .take(25)
+            .map(|m| m.id)
+            .collect();
+        for id in ids {
+            state.apply_event(
+                &MatchEvent::new(
+                    id,
+                    90,
+                    EventKind::FullTime {
+                        score: Scoreline::new(2, 0),
+                    },
+                ),
+                &metrics,
+            );
+        }
+        assert_eq!(state.context_calib.len(), 25);
+        assert!(
+            (0.5..=1.5).contains(&state.context_gain),
+            "gain stays in the clamped range: {}",
+            state.context_gain
+        );
+
+        let sched = state
+            .tournament
+            .matches
+            .iter()
+            .find(|m| !m.is_finished())
+            .unwrap()
+            .clone();
+        let ctx = state
+            .context_adj
+            .get(&sched.id)
+            .copied()
+            .unwrap_or_default();
+        let sty = state.style_adj.get(&sched.id).copied().unwrap_or_default();
+        let g = state.context_gain;
+        let adj = state.match_adjustments(sched.id);
+        assert!((adj.0 .0 - (g * ctx.0 .0 + sty.0 .0)).abs() < 1e-9);
+        assert!((adj.1 .0 - (g * ctx.1 .0 + sty.1 .0)).abs() < 1e-9);
     }
 }

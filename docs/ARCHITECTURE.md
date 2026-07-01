@@ -230,6 +230,16 @@ reach the champion odds. Squads, xG, venue assignments, the crowd-pull model, an
 synthetic offline; rest days, travel, and time-zone shifts come from the real fixture schedule
 and venue coordinates.
 
+Live, the engine carries an **aggregate context gain** (`context_gain`) that scales this whole
+context adjustment, recalibrated in-tournament: at each `FullTime` it records the context's
+contribution to the predicted margin against the residual it should explain, and once
+`CONTEXT_CALIB_MIN` matches have finished it refits the gain with `fit_gain_toward_one` (a 1-D ridge
+shrunk hard toward 1, then clamped). So if the context effects are playing out stronger or weaker
+than the reasoned priors, the remaining forecasts follow. It is deliberately *one* gain, not
+per-signal: a single tournament cannot reliably separate the correlated host/crowd/heat/travel
+effects, so context is stored separately from style (only context is scaled) and the honest
+statistic is their combined strength. The gain stays at 1 until enough results accumulate.
+
 ### Style matchups (`oracle-model::style` + `oracle-ingest::data`)
 Every other strength signal is *additive* (a team's rating minus its opponent's), which cannot
 represent matchups that defy ratings - a low block frustrating a possession side, a high press
