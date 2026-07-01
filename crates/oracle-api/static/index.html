@@ -64,6 +64,7 @@
     <h1><span class="ball">⚽</span>worldcup-oracle</h1>
     <span id="conn" class="pill">connecting…</span>
     <span id="health" class="pill"></span>
+    <span id="calib" class="pill" title="Live self-recalibration: forecast temperature, context-effect gain, and results folded in as the tournament plays"></span>
     <span class="spacer"></span>
     <a href="/explore" class="pill" style="text-decoration:none">⚙ explorer</a>
     <span class="meta" id="updated"></span>
@@ -119,6 +120,10 @@
     if (v.last_update) {
       const t = new Date(v.last_update);
       el("updated").textContent = "updated " + (isNaN(t) ? v.last_update : t.toLocaleTimeString());
+    }
+    const a = v.adaptive;
+    if (a) {
+      el("calib").textContent = `self-cal: τ ${a.calibration_temperature.toFixed(2)} · ctx ${a.context_gain.toFixed(2)} · ${a.results_seen} results`;
     }
   }
 

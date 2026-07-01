@@ -257,7 +257,9 @@ curl 'localhost:8080/api/simulate?iters=20000&seed=42' | jq '.teams[:5]'
 
 Visiting `/` serves a self-contained dashboard (no build step, no CDN) that subscribes to
 the `/live` WebSocket and renders live match win bars, a championship-odds leaderboard, a
-probability-over-time chart, and a feed-health indicator, all updating in real time. With
+probability-over-time chart, a feed-health indicator, and a **self-recalibration** readout (the
+live forecast temperature, context-effect gain, and results folded in, so you can watch the model
+adapt), all updating in real time. With
 `--event-log`, every event is appended as JSON and replayed on the next start, so a restart
 mid-tournament recovers its state instead of starting cold.
 

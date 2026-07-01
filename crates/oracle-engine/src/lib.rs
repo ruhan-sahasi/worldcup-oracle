@@ -27,7 +27,7 @@ mod snapshot;
 
 pub use event_log::EventLog;
 pub use query::{signal_sensitivity, Explorer, SignalContribution};
-pub use snapshot::{MatchPrediction, Metrics, RatingEntry, Snapshot};
+pub use snapshot::{AdaptiveState, MatchPrediction, Metrics, RatingEntry, Snapshot};
 
 use arc_swap::ArcSwap;
 use oracle_domain::{
@@ -1008,6 +1008,11 @@ impl EngineState {
             matches,
             forecast: self.last_forecast.clone(),
             ratings,
+            adaptive: AdaptiveState {
+                results_seen: self.calib_pairs.len(),
+                calibration_temperature: self.calib_temperature,
+                context_gain: self.context_gain,
+            },
         }
     }
 }

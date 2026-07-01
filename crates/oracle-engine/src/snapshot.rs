@@ -43,6 +43,19 @@ pub struct RatingEntry {
     pub rating: f64,
 }
 
+/// The engine's in-tournament self-recalibration state, surfaced for observability. As results
+/// arrive the live features adjust these away from their neutral values, so a viewer can watch the
+/// model recalibrate itself against the tournament.
+#[derive(Debug, Clone, Copy, Serialize)]
+pub struct AdaptiveState {
+    /// Finished matches folded into the live calibration so far.
+    pub results_seen: usize,
+    /// Temperature applied to the remaining pre-match forecasts (1.0 = no correction; >1 sharpens).
+    pub calibration_temperature: f64,
+    /// Aggregate gain on the context effects, recalibrated against results (1.0 = the reasoned prior).
+    pub context_gain: f64,
+}
+
 /// A complete published view of engine state.
 #[derive(Debug, Clone, Serialize)]
 pub struct Snapshot {
@@ -56,6 +69,8 @@ pub struct Snapshot {
     pub matches: Vec<MatchPrediction>,
     pub forecast: TournamentForecast,
     pub ratings: Vec<RatingEntry>,
+    /// The engine's live self-recalibration state (temperature, context gain, results seen).
+    pub adaptive: AdaptiveState,
 }
 
 impl Snapshot {

@@ -40,7 +40,7 @@ use oracle_domain::{MatchId, MatchStatus, Probabilities, Scoreline, Stage, TeamI
 use oracle_engine::query::{
     MatchupForecast, PosteriorForecast, RatingsView, SensitivityForecast, SimForecast,
 };
-use oracle_engine::{Engine, Explorer, Snapshot};
+use oracle_engine::{AdaptiveState, Engine, Explorer, Snapshot};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::future::Future;
@@ -153,6 +153,12 @@ async fn api_info(
         "last_update": snap.last_update.to_rfc3339(),
         // The explorer fits in the background; the /api/* query endpoints 503 until it is ready.
         "explorer_ready": explorer.get().is_some(),
+        // The engine's live self-recalibration state (updates as results arrive).
+        "adaptive": {
+            "results_seen": snap.adaptive.results_seen,
+            "calibration_temperature": snap.adaptive.calibration_temperature,
+            "context_gain": snap.adaptive.context_gain,
+        },
         "endpoints": [
             "/ (live dashboard)", "/explore (model explorer)", "/health", "/teams", "/matches",
             "/predict/match/{id}", "/predict/tournament",
@@ -467,6 +473,8 @@ pub struct LiveView {
     pub last_update: String,
     pub live_matches: Vec<MatchSummary>,
     pub top_contenders: Vec<ForecastRow>,
+    /// The engine's live self-recalibration state (temperature, context gain, results seen).
+    pub adaptive: AdaptiveState,
 }
 
 impl LiveView {
@@ -488,6 +496,7 @@ impl LiveView {
             last_update: snap.last_update.to_rfc3339(),
             live_matches,
             top_contenders,
+            adaptive: snap.adaptive,
         }
     }
 }
@@ -561,6 +570,11 @@ mod tests {
         let (status, body) = get(&state, "/api").await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(json(&body)["service"], "worldcup-oracle");
+        // The live self-recalibration state is surfaced (neutral before any results).
+        let adaptive = &json(&body)["adaptive"];
+        assert!(adaptive["calibration_temperature"].is_number());
+        assert!(adaptive["context_gain"].is_number());
+        assert_eq!(adaptive["results_seen"].as_u64(), Some(0));
 
         let (status, body) = get(&state, "/teams").await;
         assert_eq!(status, StatusCode::OK);
