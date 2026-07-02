@@ -43,7 +43,7 @@ use oracle_domain::{MatchId, MatchStatus, Probabilities, Scoreline, Stage, TeamI
 use oracle_engine::query::{
     MatchupForecast, PosteriorForecast, RatingsView, SensitivityForecast, SimForecast,
 };
-use oracle_engine::{AdaptiveState, Engine, Explorer, Snapshot, Upset};
+use oracle_engine::{AdaptiveState, Engine, Explorer, Snapshot, Upset, WinProbSample};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::future::Future;
@@ -572,6 +572,9 @@ pub struct MatchSummary {
     pub score: Scoreline,
     pub minute: u16,
     pub probabilities: Probabilities,
+    /// Win-probability timeline for a live match (the drama graph); empty for others.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub history: Vec<WinProbSample>,
 }
 
 impl MatchSummary {
@@ -587,6 +590,7 @@ impl MatchSummary {
             score: p.score,
             minute: p.minute,
             probabilities: p.probabilities,
+            history: p.history.clone(),
         }
     }
 }

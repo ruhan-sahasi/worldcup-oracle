@@ -49,6 +49,7 @@
   .legend { display: flex; gap: 14px; font-size: 11px; color: var(--muted); margin-top: 6px; }
   .legend i { display: inline-block; width: 9px; height: 9px; border-radius: 2px; margin-right: 4px; vertical-align: middle; }
   .empty { color: var(--muted); padding: 20px 0; text-align: center; }
+  .drama { width: 100%; height: 40px; display: block; margin-top: 8px; }
   #upsets h3 { font-size: 12px; text-transform: uppercase; letter-spacing: .05em; color: var(--muted); margin: 12px 0 6px; }
   #upsets h3:first-child { margin-top: 0; }
   .upset { display: flex; align-items: center; gap: 10px; padding: 5px 0; font-size: 13px; }
@@ -164,8 +165,31 @@
             <span>draw ${pct(p.draw)}</span>
             <span>${esc(m.away_name)} ${pct(p.away_win)}</span>
           </div>
+          ${dramaSvg(m.history, m.home_name)}
         </div>`;
     }).join("");
+  }
+
+  // The "drama graph": home-win probability over the match, biggest momentum swing marked.
+  function dramaSvg(h, homeName) {
+    if (!h || h.length < 2) return "";
+    const W = 300, H = 40, pad = 3;
+    const mins = h.map(s => s.minute);
+    const minM = Math.min(...mins), maxM = Math.max(...mins);
+    const x = (m) => pad + (maxM === minM ? 0 : (m - minM) / (maxM - minM)) * (W - 2 * pad);
+    const y = (v) => H - pad - v * (H - 2 * pad);
+    const pts = h.map(s => `${x(s.minute).toFixed(1)},${y(s.probabilities.home_win).toFixed(1)}`).join(" ");
+    let bi = 0, bd = 0;
+    for (let i = 1; i < h.length; i++) {
+      const d = Math.abs(h[i].probabilities.home_win - h[i - 1].probabilities.home_win);
+      if (d > bd) { bd = d; bi = i; }
+    }
+    const big = bd > 0.05;
+    const marker = big ? `<circle cx="${x(h[bi].minute).toFixed(1)}" cy="${y(h[bi].probabilities.home_win).toFixed(1)}" r="3" fill="var(--home)"/>` : "";
+    return `<svg class="drama" viewBox="0 0 ${W} ${H}" preserveAspectRatio="none">
+        <polyline points="${pts}" fill="none" stroke="var(--home)" stroke-width="1.5" vector-effect="non-scaling-stroke"/>${marker}
+      </svg>` +
+      (big ? `<div class="meta">${esc(homeName)} win probability · biggest swing ${(bd * 100).toFixed(0)}% at ${h[bi].minute}'</div>` : "");
   }
 
   function renderOdds(teams) {

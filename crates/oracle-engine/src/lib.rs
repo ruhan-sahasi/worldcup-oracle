@@ -27,7 +27,9 @@ mod snapshot;
 
 pub use event_log::EventLog;
 pub use query::{signal_sensitivity, Explorer, SignalContribution};
-pub use snapshot::{AdaptiveState, MatchPrediction, Metrics, RatingEntry, Snapshot, Upset};
+pub use snapshot::{
+    AdaptiveState, MatchPrediction, Metrics, RatingEntry, Snapshot, Upset, WinProbSample,
+};
 
 use arc_swap::ArcSwap;
 use oracle_domain::{
@@ -295,6 +297,8 @@ async fn event_loop(
                     }
                     let landed = state.apply_event(&event, &engine.metrics);
                     engine.metrics.events_processed.fetch_add(1, Ordering::Relaxed);
+                    // Record the live win-probability timeline (the fan drama graph).
+                    state.sample_live_history();
                     // Recompute when a result lands, a score-changing event arrives, or a
                     // lineup is confirmed, so the forecast reflects live scores and lineups.
                     if landed
@@ -415,6 +419,9 @@ struct EngineState {
     /// Each finished match's leak-free pre-match forecast, kept so the snapshot can flag the
     /// biggest upsets (favourite-failed-to-win) for the fan-facing upset radar.
     pre_match_forecast: HashMap<MatchId, Probabilities>,
+    /// Per-live-match win-probability timeline (one sample per minute), for the fan drama graph.
+    /// Dropped when a match finishes.
+    live_history: HashMap<MatchId, Vec<WinProbSample>>,
     /// Per-team knockout factors precomputed once: penalty-shootout skill and knockout pedigree.
     shootout_rating: HashMap<TeamId, f64>,
     knockout_pedigree: HashMap<TeamId, f64>,
@@ -440,6 +447,9 @@ const CONTEXT_CALIB_MIN: usize = 20;
 /// Prior precision (shrinkage toward gain 1) for the context recalibration. Deliberately strong:
 /// a tournament is a small, noisy sample, so the gain should barely move without clear evidence.
 const CONTEXT_PRIOR_PRECISION: f64 = 8.0;
+
+/// Cap on a single match's win-probability timeline (a match is ~90-120 minutes, one sample each).
+const MAX_LIVE_SAMPLES: usize = 130;
 
 /// Extra weight on the bookmaker market for **knockout** ties, where the single-match closing line
 /// is an especially sharp signal (the ensemble weights are learned mostly on group/league play, so
@@ -494,6 +504,7 @@ impl EngineState {
             context_gain: 1.0,
             context_calib: Vec::new(),
             pre_match_forecast: HashMap::new(),
+            live_history: HashMap::new(),
             shootout_rating,
             knockout_pedigree,
             source_healthy: true,
@@ -640,6 +651,7 @@ impl EngineState {
             let pred = self.pre_match_probs(&m);
             self.calib_pairs.push((pred, score.outcome()));
             self.pre_match_forecast.insert(event.match_id, pred);
+            self.live_history.remove(&event.match_id); // done; drop its live timeline
             self.refit_calibration();
             // Context recalibration: how much of this match's margin the context signals explain
             // (residual vs observed), to shrink the aggregate context gain toward what the
@@ -919,6 +931,43 @@ impl EngineState {
         }
     }
 
+    /// Sample every currently-live match's win probabilities into its timeline, one point per new
+    /// minute (the fan drama graph). Cheap: only in-play matches are touched.
+    fn sample_live_history(&mut self) {
+        let samples: Vec<(MatchId, WinProbSample)> = self
+            .tournament
+            .matches
+            .iter()
+            .filter(|m| {
+                let status = self.live.get(&m.id).map(|l| l.status).unwrap_or(m.status);
+                matches!(status, MatchStatus::Live { .. })
+            })
+            .map(|m| {
+                let p = self.predict_match(m);
+                (
+                    m.id,
+                    WinProbSample {
+                        minute: p.minute,
+                        probabilities: p.probabilities,
+                    },
+                )
+            })
+            .collect();
+        for (id, sample) in samples {
+            let hist = self.live_history.entry(id).or_default();
+            // One sample per minute (ticks can repeat a minute); overwrite the latest within a
+            // minute so a goal mid-minute is reflected.
+            if hist.last().map(|s| s.minute) == Some(sample.minute) {
+                *hist.last_mut().unwrap() = sample;
+            } else {
+                hist.push(sample);
+                if hist.len() > MAX_LIVE_SAMPLES {
+                    hist.remove(0);
+                }
+            }
+        }
+    }
+
     fn predict_match(&self, m: &oracle_domain::Match) -> MatchPrediction {
         let lm = self.live.get(&m.id).copied();
         let (status, score, minute, home_reds, away_reds) = match lm {
@@ -977,6 +1026,7 @@ impl EngineState {
             probabilities,
             score_grid,
             most_likely_score,
+            history: Vec::new(),
         }
     }
 
@@ -985,7 +1035,16 @@ impl EngineState {
             .tournament
             .matches
             .iter()
-            .map(|m| self.predict_match(m))
+            .map(|m| {
+                let mut p = self.predict_match(m);
+                // Attach the live win-probability timeline for the drama graph (live matches only).
+                if matches!(p.status, MatchStatus::Live { .. }) {
+                    if let Some(h) = self.live_history.get(&m.id) {
+                        p.history = h.clone();
+                    }
+                }
+                p
+            })
             .collect();
 
         let mut ratings: Vec<RatingEntry> = self
@@ -1748,5 +1807,39 @@ mod tests {
             .expect("a favoured side losing should be flagged as a shock");
         assert!(shock.shock > 0.0 && shock.favorite_prob > 0.0);
         assert_eq!(shock.favorite_name, state.name_of(m.home));
+    }
+
+    #[test]
+    fn live_history_records_the_win_probability_timeline() {
+        let mut state = fresh_state();
+        let metrics = Metrics::default();
+        let m = state.tournament.matches[0].clone();
+        for (minute, kind) in [
+            (1u16, EventKind::KickOff),
+            (10, EventKind::Tick),
+            (
+                25,
+                EventKind::Goal {
+                    team: m.home,
+                    scorer: None,
+                },
+            ),
+            (40, EventKind::Tick),
+        ] {
+            state.apply_event(&MatchEvent::new(m.id, minute, kind), &metrics);
+            state.sample_live_history();
+        }
+        let hist = state
+            .live_history
+            .get(&m.id)
+            .expect("a live match should accumulate a timeline");
+        assert!(hist.len() >= 2, "timeline should grow: {}", hist.len());
+        for s in hist {
+            assert!((s.probabilities.sum() - 1.0).abs() < 1e-6);
+        }
+        // The snapshot exposes the timeline on the live match.
+        let snap = state.build_snapshot("test");
+        let mp = snap.matches.iter().find(|p| p.match_id == m.id).unwrap();
+        assert_eq!(mp.history.len(), hist.len());
     }
 }

@@ -13,6 +13,13 @@ use oracle_domain::{
 use serde::Serialize;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+/// One point on a live match's win-probability timeline (the "drama graph").
+#[derive(Debug, Clone, Copy, Serialize)]
+pub struct WinProbSample {
+    pub minute: u16,
+    pub probabilities: Probabilities,
+}
+
 /// The engine's current prediction for a single match.
 #[derive(Debug, Clone, Serialize)]
 pub struct MatchPrediction {
@@ -33,6 +40,9 @@ pub struct MatchPrediction {
     /// Modal scoreline `(home, away, probability)`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub most_likely_score: Option<(u8, u8, f64)>,
+    /// Win-probability timeline while the match is live (empty otherwise): the drama graph.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub history: Vec<WinProbSample>,
 }
 
 /// A team's current Elo rating (for display).
