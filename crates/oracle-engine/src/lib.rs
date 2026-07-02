@@ -995,6 +995,7 @@ impl EngineState {
             .map(|t| RatingEntry {
                 team: t.id,
                 name: t.name.clone(),
+                code: t.code.clone(),
                 rating: self.ratings.rating(t.id),
             })
             .collect();

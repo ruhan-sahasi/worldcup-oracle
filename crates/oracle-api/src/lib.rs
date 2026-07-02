@@ -11,6 +11,8 @@
 //! |--------|------|---------|
 //! | GET | `/` | live tournament dashboard |
 //! | GET | `/explore` | interactive model explorer |
+//! | GET | `/team` | fan "your team" hub (page) |
+//! | GET | `/api/team?q=` | one team's journey odds, rank, and next match |
 //! | GET | `/health` | liveness probe |
 //! | GET | `/teams` | current Elo ratings |
 //! | GET | `/matches` | all match predictions (compact) |
@@ -93,6 +95,7 @@ pub fn router(engine: Arc<Engine>, explorer: ExplorerSlot) -> Router {
     Router::new()
         .route("/", get(dashboard))
         .route("/explore", get(explorer_page))
+        .route("/team", get(team_page))
         .route("/api", get(api_info))
         .route("/health", get(health))
         .route("/teams", get(teams))
@@ -100,6 +103,7 @@ pub fn router(engine: Arc<Engine>, explorer: ExplorerSlot) -> Router {
         .route("/predict/match/:id", get(predict_match))
         .route("/predict/tournament", get(predict_tournament))
         .route("/upsets", get(upsets))
+        .route("/api/team", get(team_hub))
         // On-demand model queries (any matchup, posterior, custom simulation, ratings).
         .route("/api/predict", get(api_predict))
         .route("/api/posterior", get(api_posterior))
@@ -162,8 +166,9 @@ async fn api_info(
             "context_gain": snap.adaptive.context_gain,
         },
         "endpoints": [
-            "/ (live dashboard)", "/explore (model explorer)", "/health", "/teams", "/matches",
-            "/predict/match/{id}", "/predict/tournament", "/upsets",
+            "/ (live dashboard)", "/explore (model explorer)", "/team (fan team hub)",
+            "/health", "/teams", "/matches",
+            "/predict/match/{id}", "/predict/tournament", "/upsets", "/api/team?q=",
             "/api/predict?home=&away=", "/api/posterior?home=&away=",
             "/api/simulate?iters=&seed=", "/api/sensitivity?iters=&seed=", "/api/ratings",
             "/metrics", "/live (websocket)"
@@ -390,6 +395,114 @@ async fn upsets(State(engine): State<Arc<Engine>>) -> Json<UpsetBoard> {
         upcoming,
         shocks: snap.shocks.clone(),
     })
+}
+
+#[derive(Deserialize)]
+struct TeamParams {
+    /// Team name or FIFA code (case-insensitive).
+    q: String,
+}
+
+/// A team's next unfinished fixture, from that team's perspective.
+#[derive(Debug, Clone, Serialize)]
+pub struct TeamNextMatch {
+    pub match_id: MatchId,
+    pub opponent: String,
+    pub is_home: bool,
+    pub stage: Stage,
+    pub status: MatchStatus,
+    pub win: f64,
+    pub draw: f64,
+    pub loss: f64,
+    pub most_likely_score: Option<(u8, u8, f64)>,
+}
+
+/// The fan "your team" hub: the team's stage-by-stage journey odds, championship rank, and next
+/// match, all read from the live tournament snapshot.
+#[derive(Debug, Clone, Serialize)]
+pub struct TeamHub {
+    pub team: String,
+    pub code: String,
+    pub rank: usize,
+    pub p_advance: f64,
+    pub p_round_of_16: f64,
+    pub p_quarter: f64,
+    pub p_semi: f64,
+    pub p_final: f64,
+    pub p_champion: f64,
+    pub next_match: Option<TeamNextMatch>,
+}
+
+async fn team_hub(
+    State(engine): State<Arc<Engine>>,
+    Query(p): Query<TeamParams>,
+) -> Result<Json<TeamHub>, StatusCode> {
+    let snap = engine.snapshot();
+    let q = p.q.trim().to_lowercase();
+    let entry = snap
+        .ratings
+        .iter()
+        .find(|r| r.code.to_lowercase() == q || r.name.to_lowercase() == q)
+        .or_else(|| {
+            snap.ratings
+                .iter()
+                .find(|r| r.name.to_lowercase().contains(&q))
+        })
+        .ok_or(StatusCode::NOT_FOUND)?;
+    let id = entry.team;
+
+    let ranked = snap.forecast.ranked();
+    let rank = ranked
+        .iter()
+        .position(|t| t.team == id)
+        .map(|i| i + 1)
+        .unwrap_or(0);
+    let f = ranked
+        .iter()
+        .find(|t| t.team == id)
+        .ok_or(StatusCode::NOT_FOUND)?;
+
+    let next_match = snap
+        .matches
+        .iter()
+        .find(|m| (m.home == id || m.away == id) && !matches!(m.status, MatchStatus::Finished))
+        .map(|m| {
+            let is_home = m.home == id;
+            let pr = m.probabilities;
+            TeamNextMatch {
+                match_id: m.match_id,
+                opponent: if is_home {
+                    m.away_name.clone()
+                } else {
+                    m.home_name.clone()
+                },
+                is_home,
+                stage: m.stage,
+                status: m.status,
+                win: if is_home { pr.home_win } else { pr.away_win },
+                draw: pr.draw,
+                loss: if is_home { pr.away_win } else { pr.home_win },
+                most_likely_score: m.most_likely_score,
+            }
+        });
+
+    Ok(Json(TeamHub {
+        team: entry.name.clone(),
+        code: entry.code.clone(),
+        rank,
+        p_advance: f.p_advance_group,
+        p_round_of_16: f.p_round_of_16,
+        p_quarter: f.p_quarter_final,
+        p_semi: f.p_semi_final,
+        p_final: f.p_final,
+        p_champion: f.p_champion,
+        next_match,
+    }))
+}
+
+/// The fan "your team" page, a self-contained page that calls `/api/team`.
+async fn team_page() -> Html<&'static str> {
+    Html(include_str!("../static/team.html"))
 }
 
 async fn metrics(State(engine): State<Arc<Engine>>) -> impl IntoResponse {
@@ -683,6 +796,17 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         let board = json(&body);
         assert!(board["upcoming"].is_array() && board["shocks"].is_array());
+
+        let (status, body) = get(&state, "/api/team?q=Brazil").await;
+        assert_eq!(status, StatusCode::OK);
+        let hub = json(&body);
+        assert_eq!(hub["team"], "Brazil");
+        assert!(hub["p_champion"].is_number() && hub["rank"].as_u64().unwrap() >= 1);
+        let (status, _) = get(&state, "/api/team?q=Atlantis").await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        let (status, body) = get(&state, "/team").await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(String::from_utf8_lossy(&body).contains("<title>"));
 
         let (status, body) = get(&state, "/metrics").await;
         assert_eq!(status, StatusCode::OK);

@@ -40,6 +40,8 @@ pub struct MatchPrediction {
 pub struct RatingEntry {
     pub team: TeamId,
     pub name: String,
+    /// FIFA code (e.g. `BRA`), so clients can resolve a team without a separate lookup.
+    pub code: String,
     pub rating: f64,
 }
 
