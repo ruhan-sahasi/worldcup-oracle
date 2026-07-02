@@ -507,10 +507,101 @@ async fn team_page() -> Html<&'static str> {
     Html(include_str!("../static/team.html"))
 }
 
-/// A shareable prediction card (`/card?team=` or `/card?home=&away=`), rendering the model's call
-/// for a team or matchup from the existing `/api/team` and `/api/predict` endpoints.
-async fn card_page() -> Html<&'static str> {
-    Html(include_str!("../static/card.html"))
+#[derive(Deserialize)]
+struct CardParams {
+    team: Option<String>,
+    home: Option<String>,
+    away: Option<String>,
+}
+
+/// A shareable prediction card (`/card?team=` or `/card?home=&away=`). The visible card is rendered
+/// client-side from `/api/team` and `/api/predict`, but the OpenGraph/Twitter meta is filled in
+/// **server-side** from the live snapshot, so a pasted link shows a rich preview (crawlers do not
+/// run the page's JavaScript).
+async fn card_page(State(engine): State<Arc<Engine>>, Query(p): Query<CardParams>) -> Html<String> {
+    let (title, desc) = card_social(&engine.snapshot(), &p);
+    let esc = |s: &str| {
+        s.replace('&', "&amp;")
+            .replace('<', "&lt;")
+            .replace('>', "&gt;")
+            .replace('"', "&quot;")
+    };
+    let (t, d) = (esc(&title), esc(&desc));
+    let meta = format!(
+        "<meta property=\"og:title\" content=\"{t}\">\n\
+         <meta property=\"og:description\" content=\"{d}\">\n\
+         <meta property=\"og:type\" content=\"website\">\n\
+         <meta name=\"twitter:card\" content=\"summary\">\n\
+         <meta name=\"description\" content=\"{d}\">"
+    );
+    Html(include_str!("../static/card.html").replace("<!--SOCIAL-->", &meta))
+}
+
+/// The `(og:title, og:description)` for a card, computed from the live snapshot. Team mode is rich
+/// (championship odds + rank, always available from the engine); a matchup is enriched when the two
+/// sides meet in a known fixture, else a clean generic line.
+fn card_social(snap: &Snapshot, p: &CardParams) -> (String, String) {
+    if let (Some(h), Some(a)) = (&p.home, &p.away) {
+        let (hl, al) = (h.to_lowercase(), a.to_lowercase());
+        let fixture = snap.matches.iter().find(|m| {
+            let (mh, ma) = (m.home_name.to_lowercase(), m.away_name.to_lowercase());
+            (mh.contains(&hl) && ma.contains(&al)) || (mh.contains(&al) && ma.contains(&hl))
+        });
+        let desc = match fixture {
+            Some(m) => {
+                let pr = m.probabilities;
+                let (fav, favp) = if pr.home_win >= pr.away_win {
+                    (&m.home_name, pr.home_win)
+                } else {
+                    (&m.away_name, pr.away_win)
+                };
+                format!(
+                    "The oracle's call: {} favoured ({:.0}%).",
+                    fav,
+                    favp * 100.0
+                )
+            }
+            None => "The oracle's call for this matchup.".to_string(),
+        };
+        return (format!("{h} vs {a} - worldcup-oracle"), desc);
+    }
+    if let Some(q) = &p.team {
+        let ql = q.trim().to_lowercase();
+        let entry = snap
+            .ratings
+            .iter()
+            .find(|r| r.code.to_lowercase() == ql || r.name.to_lowercase() == ql)
+            .or_else(|| {
+                snap.ratings
+                    .iter()
+                    .find(|r| r.name.to_lowercase().contains(&ql))
+            });
+        if let Some(e) = entry {
+            let ranked = snap.forecast.ranked();
+            let rank = ranked
+                .iter()
+                .position(|t| t.team == e.team)
+                .map(|i| i + 1)
+                .unwrap_or(0);
+            let champ = ranked
+                .iter()
+                .find(|t| t.team == e.team)
+                .map(|t| t.p_champion)
+                .unwrap_or(0.0);
+            return (
+                format!(
+                    "{} - {:.1}% to win the 2026 World Cup",
+                    e.name,
+                    champ * 100.0
+                ),
+                format!("worldcup-oracle rates {} the #{} favourite.", e.name, rank),
+            );
+        }
+    }
+    (
+        "worldcup-oracle - the call".to_string(),
+        "Share the model's 2026 World Cup predictions.".to_string(),
+    )
 }
 
 async fn metrics(State(engine): State<Arc<Engine>>) -> impl IntoResponse {
@@ -822,7 +913,10 @@ mod tests {
 
         let (status, body) = get(&state, "/card?team=Brazil").await;
         assert_eq!(status, StatusCode::OK);
-        assert!(String::from_utf8_lossy(&body).contains("<title>"));
+        let card = String::from_utf8_lossy(&body);
+        // Server-rendered social preview: og:title carries the team and its championship odds.
+        assert!(card.contains("og:title") && card.contains("Brazil"));
+        assert!(card.contains("% to win the 2026 World Cup"));
 
         let (status, body) = get(&state, "/metrics").await;
         assert_eq!(status, StatusCode::OK);
