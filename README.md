@@ -39,7 +39,8 @@ fully offline with **zero keys and zero network**.
 - **Lineup aware** -> a confirmed starting XI adjusts a team's effective attack and
   defense, so resting or losing a key player visibly moves that team's odds.
 - **Multiple surfaces** -> a REST API, a WebSocket live stream, a live web dashboard, an
-  interactive model explorer, and a polished CLI/TUI.
+  interactive model explorer, a polished CLI/TUI, and **fan pages**: a personal `/team` hub, a
+  shareable prediction `/card`, an upset radar, and a live-match win-probability "drama graph".
 
 ## 🧠 The model (in one breath)
 
@@ -274,14 +275,18 @@ team and confederation ratings. The current matchup lives in the URL, so any pre
 
 | Method | Path | Description |
 |--------|------|-------------|
-| `GET` | `/` | **live web dashboard** |
+| `GET` | `/` | **live web dashboard** (with the upset radar + live drama graphs) |
 | `GET` | `/explore` | **interactive model explorer** |
+| `GET` | `/team` | **fan "your team" hub** (page) |
+| `GET` | `/card` | **shareable prediction card** (team or matchup) |
 | `GET` | `/api` | service info + endpoint list (JSON) |
 | `GET` | `/health` | liveness probe |
 | `GET` | `/teams` | current Elo ratings |
-| `GET` | `/matches` | all match predictions (compact) |
+| `GET` | `/matches` | all match predictions (compact; live ones carry a win-prob timeline) |
 | `GET` | `/predict/match/{id}` | one tournament fixture: live odds + exact-score grid |
 | `GET` | `/predict/tournament` | live champion-odds table |
+| `GET` | `/upsets` | **fan upset radar**: upcoming shock-ripe matches + biggest shocks so far |
+| `GET` | `/api/team?q=` | one team's journey odds, championship rank, and next match |
 | `GET` | `/api/predict?home=&away=` | on-demand forecast for **any** matchup (+ optional odds) |
 | `GET` | `/api/posterior?home=&away=` | HMC posterior **credible intervals** for a matchup |
 | `GET` | `/api/simulate?iters=&seed=` | custom Monte-Carlo champion-odds run |

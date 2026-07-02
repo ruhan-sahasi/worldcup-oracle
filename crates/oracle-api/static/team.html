@@ -48,6 +48,7 @@
     <h1>⚽ worldcup-oracle</h1>
     <span class="chip">your team</span>
     <span class="spacer"></span>
+    <a id="cardlink" href="/card">share card</a>
     <a href="/">live dashboard</a>
     <a href="/explore">model explorer</a>
   </header>
@@ -125,6 +126,7 @@
   async function render() {
     const code = $("team").value;
     if (!code) return;
+    $("cardlink").href = "/card?team=" + encodeURIComponent(code);
     let hub;
     try { hub = await (await fetch(`/api/team?q=${encodeURIComponent(code)}`)).json(); }
     catch (_) { $("out").textContent = "could not load team"; return; }

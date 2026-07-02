@@ -1,0 +1,112 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>worldcup-oracle · the call</title>
+<style>
+  :root {
+    --bg: #0b1020; --panel: #141b2e; --line: #26314d; --text: #e7ecf5; --muted: #8892a6;
+    --home: #ffd24a; --draw: #8892a6; --away: #58a6ff; --accent: #3fb950;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; min-height: 100vh; background: radial-gradient(1200px 600px at 50% -10%, #16203a, var(--bg));
+    color: var(--text); font: 15px/1.5 system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+    display: flex; flex-direction: column; align-items: center; justify-content: center; padding: 24px; gap: 16px; }
+  .card { width: 100%; max-width: 480px; background: linear-gradient(180deg, #18213a, var(--panel));
+    border: 1px solid var(--line); border-radius: 18px; padding: 26px 28px; box-shadow: 0 12px 40px rgba(0,0,0,.4); }
+  .kicker { font-size: 12px; text-transform: uppercase; letter-spacing: .14em; color: var(--muted); }
+  .team { font-size: 38px; font-weight: 800; margin: 6px 0 2px; line-height: 1.1; }
+  .headline { font-size: 17px; margin-top: 10px; }
+  .big { font-size: 44px; font-weight: 800; color: var(--accent); }
+  .sub { color: var(--muted); font-size: 14px; margin-top: 4px; }
+  .wdl { display: flex; gap: 2px; height: 30px; border-radius: 8px; overflow: hidden; margin: 16px 0 6px; font-size: 12px; }
+  .wdl span { display: flex; align-items: center; justify-content: center; color: #06101f; font-weight: 700; }
+  .foot { display: flex; justify-content: space-between; align-items: center; margin-top: 18px; color: var(--muted); font-size: 12px; }
+  .actions { display: flex; gap: 8px; }
+  button { background: #0f1626; color: var(--text); border: 1px solid var(--line); border-radius: 8px; padding: 8px 12px; font-size: 13px; cursor: pointer; }
+  button:hover { border-color: var(--away); }
+  a { color: var(--away); text-decoration: none; font-size: 13px; }
+  .ok { color: var(--accent); font-size: 12px; }
+  .hidden { display: none; }
+</style>
+</head>
+<body>
+  <div class="card" id="card"><div class="kicker">worldcup-oracle</div><div class="sub" id="loading">Loading the call…</div></div>
+  <div class="actions">
+    <button id="copy-link">Copy link</button>
+    <button id="copy-text">Copy summary</button>
+    <span id="ok" class="ok hidden">copied</span>
+  </div>
+  <a href="/team">follow a team</a> · <a href="/">live dashboard</a>
+
+<script>
+  const $ = (id) => document.getElementById(id);
+  const q = new URLSearchParams(location.search);
+  const pct = (x) => (100 * x).toFixed(1) + "%";
+  const esc = (s) => String(s).replace(/[&<>"]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+  let summary = "worldcup-oracle";
+
+  async function getJson(url) {
+    const r = await fetch(url);
+    if (r.status === 503) throw new Error("The model is still warming up - try again in a moment.");
+    if (r.status === 404) throw new Error("Unknown team.");
+    if (!r.ok) throw new Error("Could not load the forecast.");
+    return r.json();
+  }
+
+  async function renderTeam(code) {
+    const t = await getJson(`/api/team?q=${encodeURIComponent(code)}`);
+    const nm = t.next_match
+      ? `Next: ${t.next_match.is_home ? "vs" : "at"} ${esc(t.next_match.opponent)} · ${(t.next_match.win * 100).toFixed(0)}% win`
+      : "Their tournament is done.";
+    summary = `worldcup-oracle's call: ${t.team} - ${pct(t.p_champion)} to win the 2026 World Cup (#${t.rank}). ${location.href}`;
+    $("card").innerHTML = `
+      <div class="kicker">worldcup-oracle's call</div>
+      <div class="team">${esc(t.team)}</div>
+      <div class="big">${pct(t.p_champion)}</div>
+      <div class="sub">to win the 2026 World Cup · #${t.rank} favourite</div>
+      <div class="foot"><span>${nm}</span><span>ruhan-sahasi/worldcup-oracle</span></div>`;
+  }
+
+  async function renderMatch(home, away) {
+    const f = await getJson(`/api/predict?home=${encodeURIComponent(home)}&away=${encodeURIComponent(away)}`);
+    const e = f.ensemble, w = e.home_win * 100, d = e.draw * 100, l = e.away_win * 100;
+    const ml = f.most_likely ? `${f.most_likely.home}-${f.most_likely.away}` : "";
+    const fav = e.home_win >= e.away_win ? f.home : f.away;
+    const favp = Math.max(e.home_win, e.away_win);
+    summary = `worldcup-oracle's call: ${f.home} vs ${f.away} - ${fav} favoured (${pct(favp)}), most likely ${ml}. ${location.href}`;
+    $("card").innerHTML = `
+      <div class="kicker">worldcup-oracle's call</div>
+      <div class="team">${esc(f.home)} <span class="sub">vs</span> ${esc(f.away)}</div>
+      <div class="wdl">
+        <span style="flex:${w};background:var(--home)" title="${esc(f.home)} win">${w.toFixed(0)}%</span>
+        <span style="flex:${d};background:var(--draw)" title="draw">${d.toFixed(0)}%</span>
+        <span style="flex:${l};background:var(--away)" title="${esc(f.away)} win">${l.toFixed(0)}%</span>
+      </div>
+      <div class="sub">${esc(fav)} favoured · most likely score ${ml}</div>
+      <div class="foot"><span>${esc(f.home)} win / draw / ${esc(f.away)} win</span><span>ruhan-sahasi/worldcup-oracle</span></div>`;
+  }
+
+  async function render() {
+    try {
+      if (q.get("home") && q.get("away")) await renderMatch(q.get("home"), q.get("away"));
+      else if (q.get("team")) await renderTeam(q.get("team"));
+      else {
+        $("card").innerHTML = `<div class="kicker">worldcup-oracle</div>
+          <div class="headline">Share the oracle's call. Try <a href="/card?team=Brazil">/card?team=Brazil</a>
+          or <a href="/card?home=Brazil&away=Argentina">/card?home=Brazil&away=Argentina</a>.</div>`;
+      }
+    } catch (err) {
+      $("card").innerHTML = `<div class="kicker">worldcup-oracle</div><div class="headline">${esc(err.message)}</div>`;
+    }
+  }
+
+  function flashOk() { $("ok").classList.remove("hidden"); setTimeout(() => $("ok").classList.add("hidden"), 1200); }
+  $("copy-link").onclick = async () => { try { await navigator.clipboard.writeText(location.href); flashOk(); } catch (_) {} };
+  $("copy-text").onclick = async () => { try { await navigator.clipboard.writeText(summary); flashOk(); } catch (_) {} };
+
+  render();
+</script>
+</body>
+</html>

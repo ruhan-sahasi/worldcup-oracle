@@ -12,6 +12,7 @@
 //! | GET | `/` | live tournament dashboard |
 //! | GET | `/explore` | interactive model explorer |
 //! | GET | `/team` | fan "your team" hub (page) |
+//! | GET | `/card` | shareable prediction card (team or matchup) |
 //! | GET | `/api/team?q=` | one team's journey odds, rank, and next match |
 //! | GET | `/health` | liveness probe |
 //! | GET | `/teams` | current Elo ratings |
@@ -96,6 +97,7 @@ pub fn router(engine: Arc<Engine>, explorer: ExplorerSlot) -> Router {
         .route("/", get(dashboard))
         .route("/explore", get(explorer_page))
         .route("/team", get(team_page))
+        .route("/card", get(card_page))
         .route("/api", get(api_info))
         .route("/health", get(health))
         .route("/teams", get(teams))
@@ -167,7 +169,7 @@ async fn api_info(
         },
         "endpoints": [
             "/ (live dashboard)", "/explore (model explorer)", "/team (fan team hub)",
-            "/health", "/teams", "/matches",
+            "/card (shareable prediction card)", "/health", "/teams", "/matches",
             "/predict/match/{id}", "/predict/tournament", "/upsets", "/api/team?q=",
             "/api/predict?home=&away=", "/api/posterior?home=&away=",
             "/api/simulate?iters=&seed=", "/api/sensitivity?iters=&seed=", "/api/ratings",
@@ -505,6 +507,12 @@ async fn team_page() -> Html<&'static str> {
     Html(include_str!("../static/team.html"))
 }
 
+/// A shareable prediction card (`/card?team=` or `/card?home=&away=`), rendering the model's call
+/// for a team or matchup from the existing `/api/team` and `/api/predict` endpoints.
+async fn card_page() -> Html<&'static str> {
+    Html(include_str!("../static/card.html"))
+}
+
 async fn metrics(State(engine): State<Arc<Engine>>) -> impl IntoResponse {
     (
         [("content-type", "text/plain; version=0.0.4")],
@@ -809,6 +817,10 @@ mod tests {
         let (status, _) = get(&state, "/api/team?q=Atlantis").await;
         assert_eq!(status, StatusCode::NOT_FOUND);
         let (status, body) = get(&state, "/team").await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(String::from_utf8_lossy(&body).contains("<title>"));
+
+        let (status, body) = get(&state, "/card?team=Brazil").await;
         assert_eq!(status, StatusCode::OK);
         assert!(String::from_utf8_lossy(&body).contains("<title>"));
 
