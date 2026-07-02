@@ -16,6 +16,7 @@
 //! | GET | `/matches` | all match predictions (compact) |
 //! | GET | `/predict/match/{id}` | one tournament fixture, full exact-score grid |
 //! | GET | `/predict/tournament` | live champion-odds table |
+//! | GET | `/upsets` | fan upset radar: upcoming shock-ripe matches + biggest shocks so far |
 //! | GET | `/api/predict?home=&away=` | on-demand matchup forecast (any two teams) |
 //! | GET | `/api/posterior?home=&away=` | HMC posterior credible intervals for a matchup |
 //! | GET | `/api/simulate?iters=&seed=` | custom Monte-Carlo champion-odds run |
@@ -40,7 +41,7 @@ use oracle_domain::{MatchId, MatchStatus, Probabilities, Scoreline, Stage, TeamI
 use oracle_engine::query::{
     MatchupForecast, PosteriorForecast, RatingsView, SensitivityForecast, SimForecast,
 };
-use oracle_engine::{AdaptiveState, Engine, Explorer, Snapshot};
+use oracle_engine::{AdaptiveState, Engine, Explorer, Snapshot, Upset};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::future::Future;
@@ -98,6 +99,7 @@ pub fn router(engine: Arc<Engine>, explorer: ExplorerSlot) -> Router {
         .route("/matches", get(matches))
         .route("/predict/match/:id", get(predict_match))
         .route("/predict/tournament", get(predict_tournament))
+        .route("/upsets", get(upsets))
         // On-demand model queries (any matchup, posterior, custom simulation, ratings).
         .route("/api/predict", get(api_predict))
         .route("/api/posterior", get(api_posterior))
@@ -161,7 +163,7 @@ async fn api_info(
         },
         "endpoints": [
             "/ (live dashboard)", "/explore (model explorer)", "/health", "/teams", "/matches",
-            "/predict/match/{id}", "/predict/tournament",
+            "/predict/match/{id}", "/predict/tournament", "/upsets",
             "/api/predict?home=&away=", "/api/posterior?home=&away=",
             "/api/simulate?iters=&seed=", "/api/sensitivity?iters=&seed=", "/api/ratings",
             "/metrics", "/live (websocket)"
@@ -318,6 +320,76 @@ async fn predict_match(
 
 async fn predict_tournament(State(engine): State<Arc<Engine>>) -> Json<TournamentView> {
     Json(TournamentView::from_snapshot(&engine.snapshot()))
+}
+
+/// An upcoming match with a clear favourite the underdog still has a real chance against.
+#[derive(Debug, Clone, Serialize)]
+pub struct UpcomingUpset {
+    pub match_id: MatchId,
+    pub stage: Stage,
+    pub status: MatchStatus,
+    pub favorite_name: String,
+    pub underdog_name: String,
+    pub favorite_prob: f64,
+    pub underdog_prob: f64,
+}
+
+/// The fan-facing upset radar: upcoming matches ripe for a shock, and the biggest shocks so far.
+#[derive(Debug, Clone, Serialize)]
+pub struct UpsetBoard {
+    pub upcoming: Vec<UpcomingUpset>,
+    pub shocks: Vec<Upset>,
+}
+
+async fn upsets(State(engine): State<Arc<Engine>>) -> Json<UpsetBoard> {
+    let snap = engine.snapshot();
+    // Upcoming: unfinished matches with a clear favourite but a live underdog, ranked by the
+    // underdog's chance (the most "upset-ripe" first).
+    let mut upcoming: Vec<UpcomingUpset> = snap
+        .matches
+        .iter()
+        .filter(|m| !matches!(m.status, MatchStatus::Finished))
+        .filter_map(|m| {
+            let p = m.probabilities;
+            let fav_is_home = p.home_win >= p.away_win;
+            let (favorite_prob, underdog_prob) = if fav_is_home {
+                (p.home_win, p.away_win)
+            } else {
+                (p.away_win, p.home_win)
+            };
+            // A clear favourite, but the underdog still has a real shot.
+            if favorite_prob < 0.55 || underdog_prob < 0.18 {
+                return None;
+            }
+            Some(UpcomingUpset {
+                match_id: m.match_id,
+                stage: m.stage,
+                status: m.status,
+                favorite_name: if fav_is_home {
+                    m.home_name.clone()
+                } else {
+                    m.away_name.clone()
+                },
+                underdog_name: if fav_is_home {
+                    m.away_name.clone()
+                } else {
+                    m.home_name.clone()
+                },
+                favorite_prob,
+                underdog_prob,
+            })
+        })
+        .collect();
+    upcoming.sort_by(|a, b| {
+        b.underdog_prob
+            .partial_cmp(&a.underdog_prob)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    upcoming.truncate(8);
+    Json(UpsetBoard {
+        upcoming,
+        shocks: snap.shocks.clone(),
+    })
 }
 
 async fn metrics(State(engine): State<Arc<Engine>>) -> impl IntoResponse {
@@ -606,6 +678,11 @@ mod tests {
             + p["draw"].as_f64().unwrap()
             + p["away_win"].as_f64().unwrap();
         assert!((sum - 1.0).abs() < 1e-6, "match probs sum to 1");
+
+        let (status, body) = get(&state, "/upsets").await;
+        assert_eq!(status, StatusCode::OK);
+        let board = json(&body);
+        assert!(board["upcoming"].is_array() && board["shocks"].is_array());
 
         let (status, body) = get(&state, "/metrics").await;
         assert_eq!(status, StatusCode::OK);

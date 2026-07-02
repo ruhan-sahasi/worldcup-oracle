@@ -27,7 +27,7 @@ mod snapshot;
 
 pub use event_log::EventLog;
 pub use query::{signal_sensitivity, Explorer, SignalContribution};
-pub use snapshot::{AdaptiveState, MatchPrediction, Metrics, RatingEntry, Snapshot};
+pub use snapshot::{AdaptiveState, MatchPrediction, Metrics, RatingEntry, Snapshot, Upset};
 
 use arc_swap::ArcSwap;
 use oracle_domain::{
@@ -412,6 +412,9 @@ struct EngineState {
     /// `(context contribution to predicted margin, residual vs observed margin)` per finished
     /// match, the regression that fits `context_gain`.
     context_calib: Vec<(f64, f64)>,
+    /// Each finished match's leak-free pre-match forecast, kept so the snapshot can flag the
+    /// biggest upsets (favourite-failed-to-win) for the fan-facing upset radar.
+    pre_match_forecast: HashMap<MatchId, Probabilities>,
     /// Per-team knockout factors precomputed once: penalty-shootout skill and knockout pedigree.
     shootout_rating: HashMap<TeamId, f64>,
     knockout_pedigree: HashMap<TeamId, f64>,
@@ -490,6 +493,7 @@ impl EngineState {
             style_adj,
             context_gain: 1.0,
             context_calib: Vec::new(),
+            pre_match_forecast: HashMap::new(),
             shootout_rating,
             knockout_pedigree,
             source_healthy: true,
@@ -635,6 +639,7 @@ impl EngineState {
             let m = self.tournament.matches[pos].clone();
             let pred = self.pre_match_probs(&m);
             self.calib_pairs.push((pred, score.outcome()));
+            self.pre_match_forecast.insert(event.match_id, pred);
             self.refit_calibration();
             // Context recalibration: how much of this match's margin the context signals explain
             // (residual vs observed), to shrink the aggregate context gain toward what the
@@ -1013,7 +1018,48 @@ impl EngineState {
                 calibration_temperature: self.calib_temperature,
                 context_gain: self.context_gain,
             },
+            shocks: self.biggest_shocks(8),
         }
+    }
+
+    /// The finished matches the model was most surprised by: the pre-match favourite failed to win.
+    /// Ranked by shock (`1 - P(actual outcome)` from the pre-match forecast), top `n`.
+    fn biggest_shocks(&self, n: usize) -> Vec<Upset> {
+        let mut shocks: Vec<Upset> = self
+            .tournament
+            .matches
+            .iter()
+            .filter(|m| m.is_finished())
+            .filter_map(|m| {
+                let p = self.pre_match_forecast.get(&m.id)?;
+                let outcome = m.score.outcome();
+                let fav_is_home = p.home_win >= p.away_win;
+                let fav_won = matches!(
+                    (fav_is_home, outcome),
+                    (true, Outcome::HomeWin) | (false, Outcome::AwayWin)
+                );
+                if fav_won {
+                    return None; // the favourite came through - not an upset
+                }
+                Some(Upset {
+                    match_id: m.id,
+                    home_name: self.name_of(m.home),
+                    away_name: self.name_of(m.away),
+                    stage: m.stage,
+                    score: m.score,
+                    favorite_name: self.name_of(if fav_is_home { m.home } else { m.away }),
+                    favorite_prob: if fav_is_home { p.home_win } else { p.away_win },
+                    shock: 1.0 - p.of(outcome),
+                })
+            })
+            .collect();
+        shocks.sort_by(|a, b| {
+            b.shock
+                .partial_cmp(&a.shock)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        shocks.truncate(n);
+        shocks
     }
 }
 
@@ -1668,5 +1714,38 @@ mod tests {
             shown.away_win,
             plain.away_win
         );
+    }
+
+    #[test]
+    fn a_favoured_side_losing_registers_as_a_shock() {
+        let mut state = state_with_lr(0.0);
+        let metrics = Metrics::default();
+        // A match where the home side is the stronger (lower-id) team, so it is the favourite.
+        let m = state
+            .tournament
+            .matches
+            .iter()
+            .find(|m| m.home.0 < m.away.0)
+            .unwrap()
+            .clone();
+        // The underdog away side wins 2-0: the favourite failed to win.
+        state.apply_event(
+            &MatchEvent::new(
+                m.id,
+                90,
+                EventKind::FullTime {
+                    score: Scoreline::new(0, 2),
+                },
+            ),
+            &metrics,
+        );
+        let snap = state.build_snapshot("test");
+        let shock = snap
+            .shocks
+            .iter()
+            .find(|s| s.match_id == m.id)
+            .expect("a favoured side losing should be flagged as a shock");
+        assert!(shock.shock > 0.0 && shock.favorite_prob > 0.0);
+        assert_eq!(shock.favorite_name, state.name_of(m.home));
     }
 }

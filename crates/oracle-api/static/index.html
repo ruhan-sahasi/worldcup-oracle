@@ -49,6 +49,13 @@
   .legend { display: flex; gap: 14px; font-size: 11px; color: var(--muted); margin-top: 6px; }
   .legend i { display: inline-block; width: 9px; height: 9px; border-radius: 2px; margin-right: 4px; vertical-align: middle; }
   .empty { color: var(--muted); padding: 20px 0; text-align: center; }
+  #upsets h3 { font-size: 12px; text-transform: uppercase; letter-spacing: .05em; color: var(--muted); margin: 12px 0 6px; }
+  #upsets h3:first-child { margin-top: 0; }
+  .upset { display: flex; align-items: center; gap: 10px; padding: 5px 0; font-size: 13px; }
+  .upset .meta { margin-left: 6px; }
+  .shock, .chance { flex: none; width: 42px; text-align: right; font-weight: 700; font-variant-numeric: tabular-nums; }
+  .shock { color: var(--away); }
+  .chance { color: var(--draw); }
   .odds-row { display: grid; grid-template-columns: 130px 1fr 52px; align-items: center; gap: 10px; padding: 5px 0; }
   .odds-row .name { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   .odds-bar { background: #0d1424; border-radius: 6px; height: 14px; overflow: hidden; }
@@ -84,6 +91,11 @@
     <section class="panel">
       <h2>Championship odds</h2>
       <div id="odds"><div class="empty">No forecast yet…</div></div>
+    </section>
+
+    <section class="panel">
+      <h2>Upset radar</h2>
+      <div id="upsets"><div class="empty">Loading…</div></div>
     </section>
 
     <section class="panel full">
@@ -212,6 +224,23 @@
 
   function esc(s) { return String(s).replace(/[&<>]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" }[c])); }
 
+  async function refreshUpsets() {
+    let board; try { board = await (await fetch("/upsets")).json(); } catch { return; }
+    const box = el("upsets");
+    const shocks = (board.shocks || []).map(s =>
+      `<div class="upset"><span class="shock">${(s.shock * 100).toFixed(0)}%</span>
+        <span>${esc(s.home_name)} ${s.score.home}-${s.score.away} ${esc(s.away_name)}
+        <span class="meta">${esc(s.favorite_name)} were favoured (${(s.favorite_prob * 100).toFixed(0)}%)</span></span></div>`).join("");
+    const upcoming = (board.upcoming || []).map(u =>
+      `<div class="upset"><span class="chance">${(u.underdog_prob * 100).toFixed(0)}%</span>
+        <span>${esc(u.underdog_name)} to stun ${esc(u.favorite_name)}
+        <span class="meta">${(u.favorite_prob * 100).toFixed(0)}% favourite</span></span></div>`).join("");
+    box.innerHTML =
+      (upcoming ? `<h3>Upset watch</h3>${upcoming}` : "") +
+      (shocks ? `<h3>Biggest shocks so far</h3>${shocks}` : "") ||
+      '<div class="empty">No clear favourites in danger right now.</div>';
+  }
+
   function connect() {
     const proto = location.protocol === "https:" ? "wss" : "ws";
     const ws = new WebSocket(`${proto}://${location.host}/live`);
@@ -227,6 +256,8 @@
     };
   }
   connect();
+  refreshUpsets();
+  setInterval(refreshUpsets, 20000);
 })();
 </script>
 </body>

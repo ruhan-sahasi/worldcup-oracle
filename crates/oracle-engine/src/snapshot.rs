@@ -43,6 +43,23 @@ pub struct RatingEntry {
     pub rating: f64,
 }
 
+/// A finished match the model got surprised by: the pre-match favourite failed to win. Ranked by
+/// `shock` (how little probability the model gave the outcome that actually happened).
+#[derive(Debug, Clone, Serialize)]
+pub struct Upset {
+    pub match_id: MatchId,
+    pub home_name: String,
+    pub away_name: String,
+    pub stage: Stage,
+    pub score: Scoreline,
+    /// The pre-match favourite (the side the model gave the higher win probability).
+    pub favorite_name: String,
+    /// The probability the model gave that favourite pre-match.
+    pub favorite_prob: f64,
+    /// Shock magnitude in `[0, 1]`: `1 - P(actual outcome)` from the pre-match forecast.
+    pub shock: f64,
+}
+
 /// The engine's in-tournament self-recalibration state, surfaced for observability. As results
 /// arrive the live features adjust these away from their neutral values, so a viewer can watch the
 /// model recalibrate itself against the tournament.
@@ -71,6 +88,8 @@ pub struct Snapshot {
     pub ratings: Vec<RatingEntry>,
     /// The engine's live self-recalibration state (temperature, context gain, results seen).
     pub adaptive: AdaptiveState,
+    /// Finished matches the model was most surprised by (favourite failed to win), ranked by shock.
+    pub shocks: Vec<Upset>,
 }
 
 impl Snapshot {
