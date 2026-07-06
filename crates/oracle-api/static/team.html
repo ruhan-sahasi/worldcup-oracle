@@ -41,6 +41,9 @@
   .hidden { display: none; }
   canvas { width: 100%; height: 90px; }
   .note { color: var(--muted); font-size: 12px; margin-top: 8px; }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; font-variant-numeric: tabular-nums; }
+  th, td { text-align: left; padding: 5px 6px; border-bottom: 1px solid var(--line); }
+  th { color: var(--muted); font-weight: 600; }
 </style>
 </head>
 <body>
@@ -62,6 +65,15 @@
     </div>
 
     <div id="out" class="muted">Loading…</div>
+
+    <div class="panel" id="kmpanel">
+      <h2>Rooting interest</h2>
+      <div class="row">
+        <button id="load-km">Who should you root for?</button>
+        <span id="km-status" class="muted"></span>
+      </div>
+      <div id="km-out" class="note">Which of your group rivals' results would most help your title odds (runs a few conditional simulations).</div>
+    </div>
   </main>
 
 <script>
@@ -152,7 +164,25 @@
     if (h && [...$("team").options].some(o => o.value === h)) $("team").value = h;
   }
 
-  $("team").onchange = () => { trend.length = 0; writeHash(); render(); };
+  async function loadKingmaker() {
+    const code = $("team").value; if (!code) return;
+    $("load-km").disabled = true; $("km-status").textContent = "simulating…"; $("km-out").innerHTML = "";
+    try {
+      const k = await (await fetch(`/api/kingmaker?q=${encodeURIComponent(code)}`)).json();
+      $("km-status").textContent = "";
+      if (!k.matches || !k.matches.length) { $("km-out").innerHTML = '<div class="muted">No group rivals to root for right now.</div>'; return; }
+      const sw = (v) => `<span style="color:${v >= 0 ? '#3fb950' : '#f85149'}">${v >= 0 ? '+' : ''}${(v * 100).toFixed(1)}pp</span>`;
+      let h = `<table><tr><th>Rival match</th><th>Home win</th><th>Draw</th><th>Away win</th></tr>`;
+      k.matches.forEach(m => {
+        h += `<tr><td>${esc(m.home_name)} v ${esc(m.away_name)}</td><td>${sw(m.home_win_swing)}</td><td>${sw(m.draw_swing)}</td><td>${sw(m.away_win_swing)}</td></tr>`;
+      });
+      $("km-out").innerHTML = h + `</table><div class="note">Swing to ${esc(k.team)}'s championship odds (base ${(k.base_champion * 100).toFixed(1)}%) under each result.</div>`;
+    } catch (_) { $("km-status").textContent = "could not load"; }
+    finally { $("load-km").disabled = false; }
+  }
+  $("load-km").onclick = loadKingmaker;
+
+  $("team").onchange = () => { trend.length = 0; $("km-out").innerHTML = '<div class="note">Which of your group rivals\' results would most help your title odds (runs a few conditional simulations).</div>'; writeHash(); render(); };
   $("share").onclick = async () => {
     try { await navigator.clipboard.writeText(location.href); $("share-ok").classList.remove("hidden"); setTimeout(() => $("share-ok").classList.add("hidden"), 1200); } catch (_) {}
   };

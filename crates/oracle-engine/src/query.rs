@@ -9,7 +9,9 @@
 //! Everything is fit once in [`Explorer::new`] and then queried; the type is cheap to share
 //! (`Arc<Explorer>`) across request handlers.
 
-use oracle_domain::{Confederation, MatchId, Probabilities, ScoreGrid, TeamId, Tournament};
+use oracle_domain::{
+    Confederation, MatchId, MatchStatus, Probabilities, ScoreGrid, Scoreline, TeamId, Tournament,
+};
 use oracle_ingest::data::{self, SignalMask, VenueAdj};
 use oracle_model::hmc::HmcConfig;
 use oracle_model::{
@@ -25,6 +27,8 @@ const SIM_MAX_ITERS: u64 = 100_000;
 const POSTERIOR_MAX_SAMPLES: usize = 1500;
 /// The sensitivity analysis runs ten simulations, so cap its per-variant iterations lower.
 const SENSITIVITY_MAX_ITERS: u64 = 50_000;
+/// Kingmaker runs a baseline plus several conditional simulations, so cap iterations similarly.
+const KINGMAKER_MAX_ITERS: u64 = 40_000;
 
 /// A fitted-once view of the model for interactive, on-demand queries.
 pub struct Explorer {
@@ -316,6 +320,109 @@ impl Explorer {
             iterations: forecast.iterations,
             seed,
             teams,
+        }
+    }
+
+    /// Per-team champion probabilities from a Monte-Carlo run on a given tournament state (which
+    /// may have some matches fixed to a result). Shared by [`kingmaker`](Self::kingmaker).
+    fn champ_probs(&self, tournament: &Tournament, iters: u64, seed: u64) -> HashMap<TeamId, f64> {
+        let inputs = LiveInputs {
+            venue: data::matchup_adjustments(tournament),
+            shootout_rating: self.shootout_rating.clone(),
+            knockout_pedigree: self.knockout_pedigree.clone(),
+            ..Default::default()
+        };
+        let config = SimConfig {
+            iterations: iters,
+            seed,
+            ..SimConfig::default()
+        };
+        simulate_with_live(
+            tournament,
+            &self.model,
+            config,
+            &inputs,
+            LiveConfig::default(),
+        )
+        .teams
+        .iter()
+        .map(|t| (t.team, t.p_champion))
+        .collect()
+    }
+
+    /// Rooting interest for a team: how much each of its group rivals' matches would swing its
+    /// championship odds. Conditions the tournament on each result (a representative scoreline) and
+    /// re-simulates, diffing the team's champion probability against the baseline. All runs share
+    /// the seed, so a swing reflects the result rather than Monte-Carlo noise.
+    pub fn kingmaker(&self, team: TeamId, iters: u64, seed: u64) -> KingmakerReport {
+        let iters = iters.clamp(2000, KINGMAKER_MAX_ITERS);
+        let base_champion = self
+            .champ_probs(&self.tournament, iters, seed)
+            .get(&team)
+            .copied()
+            .unwrap_or(0.0);
+        // The team's group rivals' matches (not involving the team) shape whether it advances.
+        let group_teams: Vec<TeamId> = self
+            .tournament
+            .groups
+            .iter()
+            .find(|g| g.teams.contains(&team))
+            .map(|g| g.teams.clone())
+            .unwrap_or_default();
+        let cand_ids: Vec<MatchId> = self
+            .tournament
+            .matches
+            .iter()
+            .filter(|m| {
+                !m.is_finished()
+                    && m.home != team
+                    && m.away != team
+                    && group_teams.contains(&m.home)
+                    && group_teams.contains(&m.away)
+            })
+            .map(|m| m.id)
+            .collect();
+        let swing = |id: MatchId, score: Scoreline| -> f64 {
+            let mut t = self.tournament.clone();
+            if let Some(mm) = t.matches.iter_mut().find(|x| x.id == id) {
+                mm.status = MatchStatus::Finished;
+                mm.score = score;
+            }
+            self.champ_probs(&t, iters, seed)
+                .get(&team)
+                .copied()
+                .unwrap_or(0.0)
+                - base_champion
+        };
+        let mut matches: Vec<KingmakerRow> = cand_ids
+            .into_iter()
+            .map(|id| {
+                let m = self.tournament.matches.iter().find(|x| x.id == id).unwrap();
+                KingmakerRow {
+                    match_id: id,
+                    home_name: self.name(m.home),
+                    away_name: self.name(m.away),
+                    home_win_swing: swing(id, Scoreline::new(1, 0)),
+                    draw_swing: swing(id, Scoreline::new(1, 1)),
+                    away_win_swing: swing(id, Scoreline::new(0, 1)),
+                }
+            })
+            .collect();
+        let magnitude = |r: &KingmakerRow| {
+            r.home_win_swing
+                .abs()
+                .max(r.draw_swing.abs())
+                .max(r.away_win_swing.abs())
+        };
+        matches.sort_by(|a, b| {
+            magnitude(b)
+                .partial_cmp(&magnitude(a))
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        KingmakerReport {
+            team: self.name(team),
+            base_champion,
+            matches,
         }
     }
 
@@ -691,6 +798,27 @@ pub struct SimForecast {
     pub teams: Vec<SimRow>,
 }
 
+/// One rooting-interest row: how a group rival's match result would swing the team's title odds.
+#[derive(Debug, Clone, Serialize)]
+pub struct KingmakerRow {
+    pub match_id: MatchId,
+    pub home_name: String,
+    pub away_name: String,
+    /// Signed change (in probability) to the team's championship odds under each result.
+    pub home_win_swing: f64,
+    pub draw_swing: f64,
+    pub away_win_swing: f64,
+}
+
+/// A team's rooting interest: how much each of its group rivals' matches moves its title odds,
+/// ranked by the biggest swing.
+#[derive(Debug, Clone, Serialize)]
+pub struct KingmakerReport {
+    pub team: String,
+    pub base_champion: f64,
+    pub matches: Vec<KingmakerRow>,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct RatingRow {
     pub team: String,
@@ -815,6 +943,22 @@ mod tests {
         let em = ex.explain(a, b, true, Some((1.2, 7.0, 12.0)));
         assert_eq!(em.members.len(), 4);
         assert_eq!(em.members[3].name, "Market");
+    }
+
+    #[test]
+    fn kingmaker_reports_group_rooting_interest() {
+        let ex = Explorer::new();
+        let team = ex.resolve("Brazil").unwrap();
+        let k = ex.kingmaker(team, 3000, 1);
+        assert_eq!(k.team, "Brazil");
+        assert!((0.0..=1.0).contains(&k.base_champion));
+        // A four-team group has three rival matches that do not involve the team.
+        assert_eq!(k.matches.len(), 3);
+        for r in &k.matches {
+            for s in [r.home_win_swing, r.draw_swing, r.away_win_swing] {
+                assert!(s.is_finite() && s.abs() <= 1.0);
+            }
+        }
     }
 
     #[test]
