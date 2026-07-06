@@ -18,7 +18,7 @@ use oracle_model::{
     implied_probabilities, DixonColesConfig, Ensemble, GoalModel, LiveConfig, Observation,
 };
 use oracle_ratings::{RatingStore, StateSpaceRatings};
-use oracle_sim::{simulate_with_live, LiveInputs, SimConfig};
+use oracle_sim::{meeting_probabilities, simulate_with_live, LiveInputs, SimConfig};
 use serde::Serialize;
 use std::collections::HashMap;
 
@@ -426,6 +426,52 @@ impl Explorer {
         }
     }
 
+    /// Collision course: how likely two teams are to meet in the knockouts, and at which round.
+    pub fn collision(&self, a: TeamId, b: TeamId, iters: u64, seed: u64) -> CollisionForecast {
+        let iters = iters.clamp(2000, SIM_MAX_ITERS);
+        let inputs = LiveInputs {
+            venue: data::matchup_adjustments(&self.tournament),
+            shootout_rating: self.shootout_rating.clone(),
+            knockout_pedigree: self.knockout_pedigree.clone(),
+            ..Default::default()
+        };
+        let config = SimConfig {
+            iterations: iters,
+            seed,
+            ..SimConfig::default()
+        };
+        let m = meeting_probabilities(
+            &self.tournament,
+            &self.model,
+            config,
+            &inputs,
+            LiveConfig::default(),
+            a,
+            b,
+        );
+        // The round they are most likely to meet at (if they meet at all).
+        let most_likely_round = m
+            .by_round
+            .iter()
+            .filter(|(_, p)| *p > 0.0)
+            .max_by(|x, y| x.1.partial_cmp(&y.1).unwrap_or(std::cmp::Ordering::Equal))
+            .map(|(label, _)| label.to_string());
+        CollisionForecast {
+            team_a: self.name(a),
+            team_b: self.name(b),
+            meet_probability: m.meet_probability,
+            most_likely_round,
+            by_round: m
+                .by_round
+                .into_iter()
+                .map(|(round, probability)| RoundProb {
+                    round: round.to_string(),
+                    probability,
+                })
+                .collect(),
+        }
+    }
+
     /// Team ratings (Elo, state-space mean, goal-model strength) and the fitted confederation
     /// strength levels, for the ratings browser.
     pub fn ratings(&self) -> RatingsView {
@@ -819,6 +865,23 @@ pub struct KingmakerReport {
     pub matches: Vec<KingmakerRow>,
 }
 
+/// The probability two teams meet at a given knockout round.
+#[derive(Debug, Clone, Serialize)]
+pub struct RoundProb {
+    pub round: String,
+    pub probability: f64,
+}
+
+/// Collision course: how likely two teams are to meet in the knockouts, overall and by round.
+#[derive(Debug, Clone, Serialize)]
+pub struct CollisionForecast {
+    pub team_a: String,
+    pub team_b: String,
+    pub meet_probability: f64,
+    pub most_likely_round: Option<String>,
+    pub by_round: Vec<RoundProb>,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct RatingRow {
     pub team: String,
@@ -959,6 +1022,21 @@ mod tests {
                 assert!(s.is_finite() && s.abs() <= 1.0);
             }
         }
+    }
+
+    #[test]
+    fn collision_reports_meeting_probabilities() {
+        let ex = Explorer::new();
+        let (a, b) = (
+            ex.resolve("Brazil").unwrap(),
+            ex.resolve("Argentina").unwrap(),
+        );
+        let c = ex.collision(a, b, 4000, 3);
+        assert_eq!(c.by_round.len(), 5);
+        assert!((0.0..=1.0).contains(&c.meet_probability));
+        // A meeting is counted at exactly one round, so the per-round probs sum to the total.
+        let sum: f64 = c.by_round.iter().map(|r| r.probability).sum();
+        assert!((c.meet_probability - sum).abs() < 1e-9);
     }
 
     #[test]

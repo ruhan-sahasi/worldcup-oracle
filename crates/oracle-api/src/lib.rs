@@ -27,6 +27,7 @@
 //! | GET | `/api/simulate?iters=&seed=` | custom Monte-Carlo champion-odds run |
 //! | GET | `/api/sensitivity?iters=&seed=` | per-signal ablation: how much each signal moves the title |
 //! | GET | `/api/kingmaker?q=` | rooting interest: which group results swing a team's title odds |
+//! | GET | `/api/collision?home=&away=` | probability two teams meet in the knockouts, by round |
 //! | GET | `/api/ratings` | team ratings + confederation strength levels |
 //! | GET | `/metrics` | Prometheus metrics |
 //! | GET | `/live` | WebSocket: pushes a compact live view on every update |
@@ -45,8 +46,8 @@ use axum::{
 use futures_util::{SinkExt, StreamExt};
 use oracle_domain::{MatchId, MatchStatus, Probabilities, Scoreline, Stage, TeamId};
 use oracle_engine::query::{
-    Explanation, KingmakerReport, MatchupForecast, PosteriorForecast, RatingsView,
-    SensitivityForecast, SimForecast,
+    CollisionForecast, Explanation, KingmakerReport, MatchupForecast, PosteriorForecast,
+    RatingsView, SensitivityForecast, SimForecast,
 };
 use oracle_engine::{AdaptiveState, Engine, Explorer, ReportCard, Snapshot, Upset, WinProbSample};
 use serde::{Deserialize, Serialize};
@@ -118,6 +119,7 @@ pub fn router(engine: Arc<Engine>, explorer: ExplorerSlot) -> Router {
         .route("/api/simulate", get(api_simulate))
         .route("/api/sensitivity", get(api_sensitivity))
         .route("/api/kingmaker", get(api_kingmaker))
+        .route("/api/collision", get(api_collision))
         .route("/api/ratings", get(api_ratings))
         .route("/metrics", get(metrics))
         .route("/live", get(live_ws))
@@ -180,7 +182,7 @@ async fn api_info(
             "/predict/match/{id}", "/predict/tournament", "/upsets", "/report", "/api/team?q=",
             "/api/predict?home=&away=", "/api/explain?home=&away=", "/api/posterior?home=&away=",
             "/api/simulate?iters=&seed=", "/api/sensitivity?iters=&seed=",
-            "/api/kingmaker?q=", "/api/ratings",
+            "/api/kingmaker?q=", "/api/collision?home=&away=", "/api/ratings",
             "/metrics", "/live (websocket)"
         ],
     }))
@@ -323,6 +325,32 @@ async fn api_kingmaker(
     let seed = p.seed.unwrap_or(42);
     // A baseline plus several conditional simulations; keep it off the async runtime.
     tokio::task::spawn_blocking(move || explorer.get().unwrap().kingmaker(team, iters, seed))
+        .await
+        .map(Json)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+}
+
+#[derive(Deserialize)]
+struct CollisionParams {
+    home: String,
+    away: String,
+    iters: Option<u64>,
+    seed: Option<u64>,
+}
+
+async fn api_collision(
+    State(explorer): State<ExplorerSlot>,
+    Query(p): Query<CollisionParams>,
+) -> Result<Json<CollisionForecast>, StatusCode> {
+    let (Some(a), Some(b)) = (
+        ready(&explorer)?.resolve(&p.home),
+        ready(&explorer)?.resolve(&p.away),
+    ) else {
+        return Err(StatusCode::NOT_FOUND);
+    };
+    let iters = p.iters.unwrap_or(20_000);
+    let seed = p.seed.unwrap_or(42);
+    tokio::task::spawn_blocking(move || explorer.get().unwrap().collision(a, b, iters, seed))
         .await
         .map(Json)
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
@@ -1108,6 +1136,17 @@ mod tests {
         let km = json(&body);
         assert_eq!(km["team"], "Brazil");
         assert!(km["matches"].is_array() && km["base_champion"].is_number());
+
+        // Collision course: two teams' knockout meeting probability, by round.
+        let (status, body) = get(
+            &state,
+            "/api/collision?home=Brazil&away=Argentina&iters=3000",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let col = json(&body);
+        assert!(col["meet_probability"].is_number());
+        assert_eq!(col["by_round"].as_array().unwrap().len(), 5);
 
         // The explorer page is served.
         let (status, body) = get(&state, "/explore").await;

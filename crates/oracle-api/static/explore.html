@@ -102,6 +102,7 @@
           <input class="odds" id="oa" placeholder="A" />
           <button id="predict">Predict</button>
           <button class="ghost" id="explain">Explain</button>
+          <button class="ghost" id="collision">Collision course</button>
           <button class="ghost" id="posterior">Posterior (HMC)</button>
           <button class="ghost" id="share" title="Copy a shareable link to this matchup">Copy link</button>
           <span id="share-ok" class="chip hidden">copied</span>
@@ -109,6 +110,7 @@
         <div class="note">Press <kbd>Enter</kbd> to predict. Links are shareable.</div>
         <div id="predict-out" class="hidden"></div>
         <div id="explain-out" class="hidden"></div>
+        <div id="collision-out" class="hidden"></div>
         <div id="posterior-out" class="hidden"></div>
       </div>
     </section>
@@ -326,6 +328,19 @@
     } catch (err) { $("explain-out").textContent = err.message; }
   }
 
+  // ----- collision course -----
+  async function doCollision() {
+    $("collision-out").classList.remove("hidden");
+    $("collision-out").innerHTML = "simulating…";
+    try {
+      const c = await api(`/api/collision?home=${encodeURIComponent($("home").value)}&away=${encodeURIComponent($("away").value)}`);
+      let h = `<div class="note"><b>${esc(c.team_a)}</b> and <b>${esc(c.team_b)}</b> meet in the knockouts: <span class="accent">${pct(c.meet_probability)}</span>${c.most_likely_round ? ` · most likely the ${esc(c.most_likely_round)}` : ""}.</div>`;
+      h += `<table style="margin-top:8px"><tr><th>Round</th><th>Meet here</th></tr>`;
+      c.by_round.forEach(r => { h += `<tr><td>${esc(r.round)}</td><td>${pct(r.probability)}</td></tr>`; });
+      $("collision-out").innerHTML = h + "</table>";
+    } catch (err) { $("collision-out").textContent = err.message; }
+  }
+
   // ----- simulation -----
   async function runSim() {
     $("run-sim").disabled = true; $("sim-status").textContent = "simulating…"; $("sim-out").innerHTML = "";
@@ -405,6 +420,7 @@
   // ----- wire up -----
   $("predict").onclick = doPredict;
   $("explain").onclick = doExplain;
+  $("collision").onclick = doCollision;
   $("posterior").onclick = doPosterior;
   $("swap").onclick = swapTeams;
   $("share").onclick = copyLink;

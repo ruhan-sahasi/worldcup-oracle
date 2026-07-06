@@ -221,6 +221,94 @@ pub fn simulate_with_live<S: MatchSampler>(
     tally.into_forecast(&prep.teams, config.iterations)
 }
 
+/// The knockout rounds two teams can meet at, in order (the 2026 shape).
+const MEETING_ROUNDS: [&str; 5] = [
+    "Round of 32",
+    "Round of 16",
+    "Quarter-final",
+    "Semi-final",
+    "Final",
+];
+
+/// How likely two teams are to meet in the knockouts, overall and by round.
+#[derive(Debug, Clone)]
+pub struct MeetingForecast {
+    pub iterations: u64,
+    pub meet_probability: f64,
+    /// `(round label, probability of meeting at that round)` for each knockout round.
+    pub by_round: Vec<(&'static str, f64)>,
+}
+
+/// Estimate the probability that two teams meet in the knockout bracket, and at which round, by
+/// Monte-Carlo. Reuses [`simulate_with_live`]'s machinery, observing each iteration's knockout
+/// pairings; a meeting is counted at the first round the pair faces off. Returns zeros if either
+/// team is unknown or they are the same team.
+pub fn meeting_probabilities<S: MatchSampler>(
+    tournament: &Tournament,
+    sampler: &S,
+    config: SimConfig,
+    inputs: &LiveInputs,
+    live_config: LiveConfig,
+    a: TeamId,
+    b: TeamId,
+) -> MeetingForecast {
+    let prep = Prepared::build(tournament, sampler, config, inputs, live_config);
+    let (a_ix, b_ix) = match (
+        prep.teams.iter().position(|&t| t == a),
+        prep.teams.iter().position(|&t| t == b),
+    ) {
+        (Some(x), Some(y)) if x != y => (x, y),
+        _ => {
+            return MeetingForecast {
+                iterations: config.iterations,
+                meet_probability: 0.0,
+                by_round: Vec::new(),
+            }
+        }
+    };
+    const ROUNDS: usize = MEETING_ROUNDS.len();
+    let counts = (0..config.iterations)
+        .into_par_iter()
+        .fold(
+            || [0u64; ROUNDS],
+            |mut acc, i| {
+                let mut rng = StdRng::seed_from_u64(config.seed.wrapping_add(i).wrapping_add(1));
+                let mut met: Option<u8> = None;
+                prep.simulate_once_with(&mut rng, |round, x, y| {
+                    if met.is_none() && ((x == a_ix && y == b_ix) || (x == b_ix && y == a_ix)) {
+                        met = Some(round);
+                    }
+                });
+                if let Some(r) = met {
+                    if (r as usize) < ROUNDS {
+                        acc[r as usize] += 1;
+                    }
+                }
+                acc
+            },
+        )
+        .reduce(
+            || [0u64; ROUNDS],
+            |mut x, y| {
+                for i in 0..ROUNDS {
+                    x[i] += y[i];
+                }
+                x
+            },
+        );
+    let n = config.iterations.max(1) as f64;
+    let total: u64 = counts.iter().sum();
+    MeetingForecast {
+        iterations: config.iterations,
+        meet_probability: total as f64 / n,
+        by_round: MEETING_ROUNDS
+            .iter()
+            .enumerate()
+            .map(|(i, &label)| (label, counts[i] as f64 / n))
+            .collect(),
+    }
+}
+
 /// Immutable, precomputed state shared (by reference) across all iterations.
 struct Prepared {
     teams: Vec<TeamId>,
@@ -730,10 +818,21 @@ impl Prepared {
         (draw(rng), draw(rng))
     }
 
-    /// Play one full tournament. Returns a per-team vector of knockout rounds won:
-    /// `-1` = did not qualify, `0` = qualified but lost first knockout match,
-    /// `total_rounds` = champion.
+    /// Play one full tournament (the normal forecast path).
     fn simulate_once(&self, rng: &mut StdRng) -> Vec<i64> {
+        self.simulate_once_with(rng, |_, _, _| {})
+    }
+
+    /// Play one full tournament, invoking `on_tie(round, home_ix, away_ix)` for every knockout tie
+    /// contested (round 0 = Round of 32, 1 = R16, 2 = QF, 3 = SF, 4 = Final). Returns a per-team
+    /// vector of knockout rounds won: `-1` = did not qualify, `0` = qualified but lost the first
+    /// knockout match, `total_rounds` = champion. The forecast passes a no-op observer; the
+    /// meeting analysis records the pairings.
+    fn simulate_once_with<F: FnMut(u8, usize, usize)>(
+        &self,
+        rng: &mut StdRng,
+        mut on_tie: F,
+    ) -> Vec<i64> {
         let mut wins = vec![-1i64; self.n];
         // Per-team log-attack penalty carried into a team's *next* knockout tie when its last tie
         // went to extra time (reset to 0 after a tie settled in regulation).
@@ -757,6 +856,7 @@ impl Prepared {
                 .map(|&(a, b)| {
                     wins[a] = 0;
                     wins[b] = 0;
+                    on_tie(0, a, b);
                     let (w, et) = self.play_ko_tie(rng, a, b, &att, &def, (0.0, 0.0));
                     wins[w] += 1;
                     fatigue[w] = if et { self.ko_fatigue_penalty } else { 0.0 };
@@ -824,6 +924,7 @@ impl Prepared {
                         let b = resolve_slot(bottom, &winners, &runners, &qualified_thirds);
                         wins[a] = 0;
                         wins[b] = 0;
+                        on_tie(0, a, b);
                         let (w, et) = self.sample_knockout(rng, a, b, &att, &def, (0.0, 0.0));
                         wins[w] += 1;
                         fatigue[w] = if et { self.ko_fatigue_penalty } else { 0.0 };
@@ -844,14 +945,11 @@ impl Prepared {
                 seed_order.resize(bracket, BYE);
                 (0..bracket / 2)
                     .map(|i| {
-                        let (w, et) = self.sample_knockout(
-                            rng,
-                            seed_order[i],
-                            seed_order[bracket - 1 - i],
-                            &att,
-                            &def,
-                            (0.0, 0.0),
-                        );
+                        let (a, b) = (seed_order[i], seed_order[bracket - 1 - i]);
+                        if a != BYE && b != BYE {
+                            on_tie(0, a, b);
+                        }
+                        let (w, et) = self.sample_knockout(rng, a, b, &att, &def, (0.0, 0.0));
                         if w != BYE {
                             wins[w] += 1;
                             fatigue[w] = if et { self.ko_fatigue_penalty } else { 0.0 };
@@ -864,11 +962,15 @@ impl Prepared {
         // ---- Fold R16 -> Final ----. `play_ko_tie` respects any materialized later-round
         // fixtures (finished/in-progress) and samples the rest. A side that needed extra time last
         // round carries a fatigue penalty into this one.
+        let mut round: u8 = 1;
         while survivors.len() > 1 {
             let mut next = Vec::with_capacity(survivors.len().div_ceil(2));
             let mut k = 0;
             while k + 1 < survivors.len() {
                 let (a, b) = (survivors[k], survivors[k + 1]);
+                if a != BYE && b != BYE {
+                    on_tie(round, a, b);
+                }
                 let fat = (
                     if a == BYE { 0.0 } else { fatigue[a] },
                     if b == BYE { 0.0 } else { fatigue[b] },
@@ -882,6 +984,7 @@ impl Prepared {
                 k += 2;
             }
             survivors = next;
+            round += 1;
         }
 
         wins
