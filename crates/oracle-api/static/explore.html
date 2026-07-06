@@ -101,12 +101,14 @@
           <input class="odds" id="od" placeholder="D" />
           <input class="odds" id="oa" placeholder="A" />
           <button id="predict">Predict</button>
+          <button class="ghost" id="explain">Explain</button>
           <button class="ghost" id="posterior">Posterior (HMC)</button>
           <button class="ghost" id="share" title="Copy a shareable link to this matchup">Copy link</button>
           <span id="share-ok" class="chip hidden">copied</span>
         </div>
         <div class="note">Press <kbd>Enter</kbd> to predict. Links are shareable.</div>
         <div id="predict-out" class="hidden"></div>
+        <div id="explain-out" class="hidden"></div>
         <div id="posterior-out" class="hidden"></div>
       </div>
     </section>
@@ -168,7 +170,7 @@
   const esc = s => String(s).replace(/[&<>"]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
   async function api(path) {
     const r = await fetch(path);
-    if (r.status === 503) throw new Error("model still warming up — try again in a moment");
+    if (r.status === 503) throw new Error("model still warming up - try again in a moment");
     if (!r.ok) throw new Error(r.status === 404 ? "unknown team" : "request failed (" + r.status + ")");
     return r.json();
   }
@@ -306,6 +308,24 @@
     });
   }
 
+  // ----- explain -----
+  async function doExplain() {
+    $("explain-out").classList.remove("hidden");
+    $("explain-out").innerHTML = "explaining…";
+    try {
+      let q = `/api/explain?home=${encodeURIComponent($("home").value)}&away=${encodeURIComponent($("away").value)}`;
+      const oh = $("oh").value, od = $("od").value, oa = $("oa").value;
+      if (oh && od && oa) q += `&home_odds=${oh}&draw_odds=${od}&away_odds=${oa}`;
+      const e = await api(q);
+      const factor = (f) => `<tr><td>${esc(f.name)}</td><td class="${f.effect >= 0 ? 'accent' : 'muted'}">${f.effect >= 0 ? '+' : ''}${f.effect.toFixed(2)}</td><td class="muted">${esc(f.note)}</td></tr>`;
+      const member = (m) => `<tr><td>${esc(m.name)}</td><td>${pct(m.probabilities.home_win)}</td><td>${pct(m.probabilities.draw)}</td><td>${pct(m.probabilities.away_win)}</td><td class="muted">${(m.weight * 100).toFixed(0)}%</td></tr>`;
+      $("explain-out").innerHTML = `
+        <div class="note">Expected goals <b>${e.expected_home.toFixed(2)}</b> - <b>${e.expected_away.toFixed(2)}</b>. Factors are log-rate contributions toward ${esc(e.home)} (positive) over ${esc(e.away)}.</div>
+        <table style="margin-top:8px"><tr><th>Factor</th><th>Effect</th><th></th></tr>${e.strength_factors.map(factor).join("")}</table>
+        <table style="margin-top:10px"><tr><th>Ensemble member</th><th>Home</th><th>Draw</th><th>Away</th><th>Weight</th></tr>${e.members.map(member).join("")}</table>`;
+    } catch (err) { $("explain-out").textContent = err.message; }
+  }
+
   // ----- simulation -----
   async function runSim() {
     $("run-sim").disabled = true; $("sim-status").textContent = "simulating…"; $("sim-out").innerHTML = "";
@@ -384,6 +404,7 @@
 
   // ----- wire up -----
   $("predict").onclick = doPredict;
+  $("explain").onclick = doExplain;
   $("posterior").onclick = doPosterior;
   $("swap").onclick = swapTeams;
   $("share").onclick = copyLink;

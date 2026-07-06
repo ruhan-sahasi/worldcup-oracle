@@ -22,6 +22,7 @@
 //! | GET | `/upsets` | fan upset radar: upcoming shock-ripe matches + biggest shocks so far |
 //! | GET | `/report` | the model's self-scored report card on its own pre-match calls |
 //! | GET | `/api/predict?home=&away=` | on-demand matchup forecast (any two teams) |
+//! | GET | `/api/explain?home=&away=` | factor attribution: why the model favours a side |
 //! | GET | `/api/posterior?home=&away=` | HMC posterior credible intervals for a matchup |
 //! | GET | `/api/simulate?iters=&seed=` | custom Monte-Carlo champion-odds run |
 //! | GET | `/api/sensitivity?iters=&seed=` | per-signal ablation: how much each signal moves the title |
@@ -43,7 +44,7 @@ use axum::{
 use futures_util::{SinkExt, StreamExt};
 use oracle_domain::{MatchId, MatchStatus, Probabilities, Scoreline, Stage, TeamId};
 use oracle_engine::query::{
-    MatchupForecast, PosteriorForecast, RatingsView, SensitivityForecast, SimForecast,
+    Explanation, MatchupForecast, PosteriorForecast, RatingsView, SensitivityForecast, SimForecast,
 };
 use oracle_engine::{AdaptiveState, Engine, Explorer, ReportCard, Snapshot, Upset, WinProbSample};
 use serde::{Deserialize, Serialize};
@@ -110,6 +111,7 @@ pub fn router(engine: Arc<Engine>, explorer: ExplorerSlot) -> Router {
         .route("/api/team", get(team_hub))
         // On-demand model queries (any matchup, posterior, custom simulation, ratings).
         .route("/api/predict", get(api_predict))
+        .route("/api/explain", get(api_explain))
         .route("/api/posterior", get(api_posterior))
         .route("/api/simulate", get(api_simulate))
         .route("/api/sensitivity", get(api_sensitivity))
@@ -173,7 +175,7 @@ async fn api_info(
             "/ (live dashboard)", "/explore (model explorer)", "/team (fan team hub)",
             "/card (shareable prediction card)", "/health", "/teams", "/matches",
             "/predict/match/{id}", "/predict/tournament", "/upsets", "/report", "/api/team?q=",
-            "/api/predict?home=&away=", "/api/posterior?home=&away=",
+            "/api/predict?home=&away=", "/api/explain?home=&away=", "/api/posterior?home=&away=",
             "/api/simulate?iters=&seed=", "/api/sensitivity?iters=&seed=", "/api/ratings",
             "/metrics", "/live (websocket)"
         ],
@@ -215,6 +217,26 @@ async fn api_predict(
         _ => None,
     };
     Ok(Json(ex.predict(
+        home,
+        away,
+        p.neutral.unwrap_or(true),
+        odds,
+    )))
+}
+
+async fn api_explain(
+    State(explorer): State<ExplorerSlot>,
+    Query(p): Query<MatchupParams>,
+) -> Result<Json<Explanation>, StatusCode> {
+    let ex = ready(&explorer)?;
+    let (Some(home), Some(away)) = (ex.resolve(&p.home), ex.resolve(&p.away)) else {
+        return Err(StatusCode::NOT_FOUND);
+    };
+    let odds = match (p.home_odds, p.draw_odds, p.away_odds) {
+        (Some(h), Some(d), Some(a)) => Some((h, d, a)),
+        _ => None,
+    };
+    Ok(Json(ex.explain(
         home,
         away,
         p.neutral.unwrap_or(true),
@@ -1008,6 +1030,14 @@ mod tests {
         // Unknown team -> 404.
         let (status, _) = get(&state, "/api/predict?home=Brazil&away=Atlantis").await;
         assert_eq!(status, StatusCode::NOT_FOUND);
+
+        // Explain: named factors + the ensemble member breakdown.
+        let (status, body) = get(&state, "/api/explain?home=Brazil&away=Japan").await;
+        assert_eq!(status, StatusCode::OK);
+        let ex = json(&body);
+        assert_eq!(ex["strength_factors"].as_array().unwrap().len(), 4);
+        assert!(ex["members"].as_array().unwrap().len() >= 3);
+        assert!(ex["expected_home"].as_f64().unwrap() > 0.0);
 
         // Custom simulation: champion mass ~1.
         let (status, body) = get(&state, "/api/simulate?iters=2000&seed=1").await;

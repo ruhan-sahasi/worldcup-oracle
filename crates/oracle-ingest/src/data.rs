@@ -941,6 +941,14 @@ fn style_profile(team: TeamId) -> StyleProfile {
     StyleProfile::new([theta.cos(), theta.sin()])
 }
 
+/// The style-matchup tilt for a matchup: the home side's attacking log-rate advantage from the
+/// antisymmetric bilinear "rock-paper-scissors" style edge. Positive favours the home side.
+pub fn matchup_style_tilt(home: TeamId, away: TeamId) -> f64 {
+    style_adjustment(&style_profile(home), &style_profile(away))
+        .0
+         .0
+}
+
 /// Per-match style matchup adjustments (the bilinear style tilt from `oracle-model`), keyed by
 /// match id, in the same log-space `((home_atk, home_def), (away_atk, away_def))` shape as venue.
 pub fn style_adjustments(tournament: &Tournament) -> HashMap<MatchId, VenueAdj> {

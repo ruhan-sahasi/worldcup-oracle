@@ -29,7 +29,7 @@ pub use calibration::{
     ReliabilityReport,
 };
 pub use context::{context_adjustment, Host, MatchContext};
-pub use dixon_coles::{DixonColesConfig, GoalModel, Observation, ScoreModel};
+pub use dixon_coles::{DixonColesConfig, GoalModel, Observation, RateBreakdown, ScoreModel};
 pub use ensemble::{Ensemble, EnsembleFitConfig};
 pub use live::{live_probabilities, live_score_grid, remaining_rates, LiveConfig, LiveState};
 pub use style::{style_adjustment, style_tilt, StyleProfile};

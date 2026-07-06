@@ -200,6 +200,20 @@ impl Default for GoalModel {
     }
 }
 
+/// A named additive breakdown of a matchup's log expected-goal edge (see
+/// [`GoalModel::rate_breakdown`]). The three edge terms sum to `ln λ_home - ln μ_away`.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct RateBreakdown {
+    pub expected_home: f64,
+    pub expected_away: f64,
+    /// Home attack minus away attack (who creates more).
+    pub attack_edge: f64,
+    /// Home defense minus away defense (who concedes less).
+    pub defense_edge: f64,
+    /// Home advantage in log-rate (0 at a neutral venue).
+    pub home_advantage: f64,
+}
+
 impl GoalModel {
     /// Fit a model to historical results by time-weighted maximum likelihood.
     /// Returns a sensible default model if `observations` is empty.
@@ -730,6 +744,21 @@ impl GoalModel {
         neutral: bool,
     ) -> Probabilities {
         self.score_grid(home, away, neutral).outcome_probabilities()
+    }
+
+    /// A named additive breakdown of a matchup's log expected-goal **edge** (`ln λ_home - ln μ_away`),
+    /// exactly as [`expected_goals`](Self::expected_goals) computes it (the shared intercept
+    /// cancels): the attack edge, the defense edge, and the home advantage. Used to explain *why*
+    /// the goal model favours one side.
+    pub fn rate_breakdown(&self, home: TeamId, away: TeamId, neutral: bool) -> RateBreakdown {
+        let (expected_home, expected_away) = self.expected_goals(home, away, neutral);
+        RateBreakdown {
+            expected_home,
+            expected_away,
+            attack_edge: self.attack_of(home) - self.attack_of(away),
+            defense_edge: self.defense_of(home) - self.defense_of(away),
+            home_advantage: if neutral { 0.0 } else { self.home_advantage },
+        }
     }
 
     /// Teams ranked by overall strength (attack − defense), strongest first.

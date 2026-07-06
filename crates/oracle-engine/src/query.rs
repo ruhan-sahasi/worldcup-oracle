@@ -146,6 +146,83 @@ impl Explorer {
         }
     }
 
+    /// Explain a matchup forecast: the named factors driving the goal model's edge (attacking and
+    /// defensive strength, home advantage, and the style matchup), the resulting expected goals,
+    /// and how the ensemble blends its members (with their learned weights). Answers *why* the
+    /// model favours one side, not just by how much.
+    pub fn explain(
+        &self,
+        home: TeamId,
+        away: TeamId,
+        neutral: bool,
+        odds: Option<(f64, f64, f64)>,
+    ) -> Explanation {
+        let f = self.predict(home, away, neutral, odds);
+        let rb = self.model.rate_breakdown(home, away, neutral);
+        let style_tilt = data::matchup_style_tilt(home, away);
+        let (hn, an) = (f.home.clone(), f.away.clone());
+        let strength_factors = vec![
+            Factor {
+                name: "Attacking strength".into(),
+                effect: rb.attack_edge,
+                note: format!("{hn}'s attack vs {an}'s"),
+            },
+            Factor {
+                name: "Defensive strength".into(),
+                effect: rb.defense_edge,
+                note: format!("{hn}'s defence vs {an}'s"),
+            },
+            Factor {
+                name: "Home advantage".into(),
+                effect: rb.home_advantage,
+                note: if neutral {
+                    "neutral venue".into()
+                } else {
+                    "host-side edge".into()
+                },
+            },
+            Factor {
+                name: "Style matchup".into(),
+                effect: 2.0 * style_tilt,
+                note: "rock-paper-scissors style edge (applies at real fixtures)".into(),
+            },
+        ];
+        let w = |i: usize| self.ensemble.weights.get(i).copied().unwrap_or(0.0);
+        let mut members = vec![
+            MemberView {
+                name: "Dixon-Coles".into(),
+                probabilities: f.dixon_coles,
+                weight: w(0),
+            },
+            MemberView {
+                name: "Elo".into(),
+                probabilities: f.elo,
+                weight: w(1),
+            },
+            MemberView {
+                name: "State-space".into(),
+                probabilities: f.state_space,
+                weight: w(2),
+            },
+        ];
+        if let Some(m) = f.market {
+            members.push(MemberView {
+                name: "Market".into(),
+                probabilities: m,
+                weight: w(3),
+            });
+        }
+        Explanation {
+            home: f.home,
+            away: f.away,
+            ensemble: f.ensemble,
+            expected_home: rb.expected_home,
+            expected_away: rb.expected_away,
+            strength_factors,
+            members,
+        }
+    }
+
     /// The HMC posterior over a matchup's win/draw/win probabilities, reduced to a mean plus a 90%
     /// credible interval per outcome - the model's uncertainty about its own forecast.
     pub fn posterior(
@@ -548,6 +625,36 @@ pub struct MatchupForecast {
     pub grid: ScoreGrid,
 }
 
+/// One named driver of a forecast, with its signed contribution to the home side's log
+/// expected-goal edge (positive favours home).
+#[derive(Debug, Clone, Serialize)]
+pub struct Factor {
+    pub name: String,
+    pub effect: f64,
+    pub note: String,
+}
+
+/// One ensemble member's view of a matchup, with its learned blend weight.
+#[derive(Debug, Clone, Serialize)]
+pub struct MemberView {
+    pub name: String,
+    pub probabilities: Probabilities,
+    pub weight: f64,
+}
+
+/// Why the model forecasts a matchup the way it does: the strength/style factors behind the goal
+/// model's edge, and how the ensemble blends its members.
+#[derive(Debug, Clone, Serialize)]
+pub struct Explanation {
+    pub home: String,
+    pub away: String,
+    pub ensemble: Probabilities,
+    pub expected_home: f64,
+    pub expected_away: f64,
+    pub strength_factors: Vec<Factor>,
+    pub members: Vec<MemberView>,
+}
+
 #[derive(Debug, Clone, Copy, Default, Serialize)]
 pub struct Interval {
     pub mean: f64,
@@ -680,6 +787,34 @@ mod tests {
         assert!(post.home_win.lo <= point.dixon_coles.home_win + 0.05);
         assert!(post.home_win.hi >= point.dixon_coles.home_win - 0.05);
         assert!(post.home_win.hi > post.home_win.lo);
+    }
+
+    #[test]
+    fn explain_decomposes_a_matchup() {
+        let ex = Explorer::new();
+        let (a, b) = (
+            ex.resolve("Argentina").unwrap(),
+            ex.resolve("New Zealand").unwrap(),
+        );
+        let e = ex.explain(a, b, true, None);
+        assert_eq!(e.strength_factors.len(), 4);
+        assert_eq!(e.members.len(), 3, "no odds -> DC, Elo, state-space");
+        assert!(e.expected_home > 0.0 && e.expected_away > 0.0);
+        // The strong side's attacking + defensive + home-advantage edges net positive.
+        let edge: f64 = e
+            .strength_factors
+            .iter()
+            .filter(|f| f.name != "Style matchup")
+            .map(|f| f.effect)
+            .sum();
+        assert!(
+            edge > 0.0,
+            "Argentina should carry a positive strength edge"
+        );
+        // Odds add the market as a fourth member.
+        let em = ex.explain(a, b, true, Some((1.2, 7.0, 12.0)));
+        assert_eq!(em.members.len(), 4);
+        assert_eq!(em.members[3].name, "Market");
     }
 
     #[test]
