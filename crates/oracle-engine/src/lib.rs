@@ -28,7 +28,8 @@ mod snapshot;
 pub use event_log::EventLog;
 pub use query::{signal_sensitivity, Explorer, SignalContribution};
 pub use snapshot::{
-    AdaptiveState, MatchPrediction, Metrics, RatingEntry, Snapshot, Upset, WinProbSample,
+    AdaptiveState, Call, MatchPrediction, Metrics, RatingEntry, ReportCard, Snapshot, Upset,
+    WinProbSample,
 };
 
 use arc_swap::ArcSwap;
@@ -39,7 +40,7 @@ use oracle_domain::{
 use oracle_ingest::DataProvider;
 use oracle_model::{
     apply_temperature, fit_gain_toward_one, fit_temperature, implied_probabilities,
-    live_score_grid, Ensemble, GoalModel, LiveConfig, LiveState,
+    live_score_grid, score, CalibrationReport, Ensemble, GoalModel, LiveConfig, LiveState,
 };
 use oracle_ratings::{EloConfig, RatingStore, StateSpaceRatings};
 use oracle_sim::{simulate_with_live, InProgress, LiveInputs, SimConfig, VenueAdj};
@@ -1079,6 +1080,7 @@ impl EngineState {
                 context_gain: self.context_gain,
             },
             shocks: self.biggest_shocks(8),
+            report_card: self.report_card(),
         }
     }
 
@@ -1120,6 +1122,54 @@ impl EngineState {
         });
         shocks.truncate(n);
         shocks
+    }
+
+    /// Score the model's own pre-match calls on the finished matches: accuracy, Brier / log-loss
+    /// (against the uniform baseline), and its most confident correct calls and misses. Almost free
+    /// - the pre-match forecasts and results are already on hand.
+    fn report_card(&self) -> ReportCard {
+        let mut pairs: Vec<(Probabilities, Outcome)> = Vec::new();
+        let mut calls: Vec<Call> = Vec::new();
+        for m in self.tournament.matches.iter().filter(|m| m.is_finished()) {
+            let Some(&p) = self.pre_match_forecast.get(&m.id) else {
+                continue;
+            };
+            let actual = m.score.outcome();
+            let predicted = p.most_likely();
+            pairs.push((p, actual));
+            calls.push(Call {
+                match_id: m.id,
+                home_name: self.name_of(m.home),
+                away_name: self.name_of(m.away),
+                score: m.score,
+                confidence: p.of(predicted),
+                correct: predicted == actual,
+            });
+        }
+        let report = score(&pairs);
+        let scored = pairs.len();
+        let winners_called = calls.iter().filter(|c| c.correct).count();
+        let by_confidence = |a: &Call, b: &Call| {
+            b.confidence
+                .partial_cmp(&a.confidence)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        };
+        let mut best: Vec<Call> = calls.iter().filter(|c| c.correct).cloned().collect();
+        best.sort_by(by_confidence);
+        best.truncate(3);
+        let mut worst: Vec<Call> = calls.iter().filter(|c| !c.correct).cloned().collect();
+        worst.sort_by(by_confidence);
+        worst.truncate(3);
+        ReportCard {
+            scored,
+            winners_called,
+            accuracy: report.accuracy,
+            brier: report.brier,
+            log_loss: report.log_loss,
+            baseline_brier: CalibrationReport::uniform_baseline(scored.max(1)).brier,
+            best_calls: best,
+            worst_calls: worst,
+        }
     }
 }
 
@@ -1841,5 +1891,42 @@ mod tests {
         let snap = state.build_snapshot("test");
         let mp = snap.matches.iter().find(|p| p.match_id == m.id).unwrap();
         assert_eq!(mp.history.len(), hist.len());
+    }
+
+    #[test]
+    fn report_card_scores_the_models_own_calls() {
+        let mut state = state_with_lr(0.0);
+        let metrics = Metrics::default();
+        // Finish 10 matches with the stronger (lower-id) side winning - the model's favourite - so
+        // most calls come off and it comfortably beats the uniform baseline.
+        let group: Vec<(MatchId, TeamId, TeamId)> = state
+            .tournament
+            .matches
+            .iter()
+            .take(10)
+            .map(|m| (m.id, m.home, m.away))
+            .collect();
+        for (id, home, away) in group {
+            let score = if home.0 < away.0 {
+                Scoreline::new(2, 0)
+            } else {
+                Scoreline::new(0, 2)
+            };
+            state.apply_event(
+                &MatchEvent::new(id, 90, EventKind::FullTime { score }),
+                &metrics,
+            );
+        }
+        let rc = state.build_snapshot("test").report_card;
+        assert_eq!(rc.scored, 10);
+        assert!((0.0..=1.0).contains(&rc.accuracy));
+        assert!(
+            rc.brier < rc.baseline_brier,
+            "the model should beat the uniform baseline ({} vs {})",
+            rc.brier,
+            rc.baseline_brier
+        );
+        assert!(rc.best_calls.iter().all(|c| c.correct));
+        assert!(rc.worst_calls.iter().all(|c| !c.correct));
     }
 }

@@ -20,6 +20,7 @@
 //! | GET | `/predict/match/{id}` | one tournament fixture, full exact-score grid |
 //! | GET | `/predict/tournament` | live champion-odds table |
 //! | GET | `/upsets` | fan upset radar: upcoming shock-ripe matches + biggest shocks so far |
+//! | GET | `/report` | the model's self-scored report card on its own pre-match calls |
 //! | GET | `/api/predict?home=&away=` | on-demand matchup forecast (any two teams) |
 //! | GET | `/api/posterior?home=&away=` | HMC posterior credible intervals for a matchup |
 //! | GET | `/api/simulate?iters=&seed=` | custom Monte-Carlo champion-odds run |
@@ -44,7 +45,7 @@ use oracle_domain::{MatchId, MatchStatus, Probabilities, Scoreline, Stage, TeamI
 use oracle_engine::query::{
     MatchupForecast, PosteriorForecast, RatingsView, SensitivityForecast, SimForecast,
 };
-use oracle_engine::{AdaptiveState, Engine, Explorer, Snapshot, Upset, WinProbSample};
+use oracle_engine::{AdaptiveState, Engine, Explorer, ReportCard, Snapshot, Upset, WinProbSample};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::future::Future;
@@ -105,6 +106,7 @@ pub fn router(engine: Arc<Engine>, explorer: ExplorerSlot) -> Router {
         .route("/predict/match/:id", get(predict_match))
         .route("/predict/tournament", get(predict_tournament))
         .route("/upsets", get(upsets))
+        .route("/report", get(report))
         .route("/api/team", get(team_hub))
         // On-demand model queries (any matchup, posterior, custom simulation, ratings).
         .route("/api/predict", get(api_predict))
@@ -170,7 +172,7 @@ async fn api_info(
         "endpoints": [
             "/ (live dashboard)", "/explore (model explorer)", "/team (fan team hub)",
             "/card (shareable prediction card)", "/health", "/teams", "/matches",
-            "/predict/match/{id}", "/predict/tournament", "/upsets", "/api/team?q=",
+            "/predict/match/{id}", "/predict/tournament", "/upsets", "/report", "/api/team?q=",
             "/api/predict?home=&away=", "/api/posterior?home=&away=",
             "/api/simulate?iters=&seed=", "/api/sensitivity?iters=&seed=", "/api/ratings",
             "/metrics", "/live (websocket)"
@@ -397,6 +399,11 @@ async fn upsets(State(engine): State<Arc<Engine>>) -> Json<UpsetBoard> {
         upcoming,
         shocks: snap.shocks.clone(),
     })
+}
+
+/// The model's self-scored report card on its own pre-match calls (from the live snapshot).
+async fn report(State(engine): State<Arc<Engine>>) -> Json<ReportCard> {
+    Json(engine.snapshot().report_card.clone())
 }
 
 #[derive(Deserialize)]
@@ -899,6 +906,12 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         let board = json(&body);
         assert!(board["upcoming"].is_array() && board["shocks"].is_array());
+
+        let (status, body) = get(&state, "/report").await;
+        assert_eq!(status, StatusCode::OK);
+        let rc = json(&body);
+        assert!(rc["scored"].is_number() && rc["brier"].is_number());
+        assert!(rc["best_calls"].is_array() && rc["worst_calls"].is_array());
 
         let (status, body) = get(&state, "/api/team?q=Brazil").await;
         assert_eq!(status, StatusCode::OK);

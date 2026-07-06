@@ -50,8 +50,9 @@
   .legend i { display: inline-block; width: 9px; height: 9px; border-radius: 2px; margin-right: 4px; vertical-align: middle; }
   .empty { color: var(--muted); padding: 20px 0; text-align: center; }
   .drama { width: 100%; height: 40px; display: block; margin-top: 8px; }
-  #upsets h3 { font-size: 12px; text-transform: uppercase; letter-spacing: .05em; color: var(--muted); margin: 12px 0 6px; }
-  #upsets h3:first-child { margin-top: 0; }
+  #upsets h3, #report h3 { font-size: 12px; text-transform: uppercase; letter-spacing: .05em; color: var(--muted); margin: 12px 0 6px; }
+  #upsets h3:first-child, #report h3:first-child { margin-top: 0; }
+  .rcstat { font-size: 13px; margin-bottom: 4px; }
   .upset { display: flex; align-items: center; gap: 10px; padding: 5px 0; font-size: 13px; }
   .upset .meta { margin-left: 6px; }
   .shock, .chance { flex: none; width: 42px; text-align: right; font-weight: 700; font-variant-numeric: tabular-nums; }
@@ -97,6 +98,11 @@
     <section class="panel">
       <h2>Upset radar</h2>
       <div id="upsets"><div class="empty">Loading…</div></div>
+    </section>
+
+    <section class="panel">
+      <h2>The oracle's report card</h2>
+      <div id="report"><div class="empty">Loading…</div></div>
     </section>
 
     <section class="panel full">
@@ -265,6 +271,20 @@
       '<div class="empty">No clear favourites in danger right now.</div>';
   }
 
+  async function refreshReport() {
+    let r; try { r = await (await fetch("/report")).json(); } catch { return; }
+    const box = el("report");
+    if (!r.scored) { box.innerHTML = '<div class="empty">No results scored yet.</div>'; return; }
+    const call = (c) => `<div class="upset"><span class="${c.correct ? 'chance' : 'shock'}">${(c.confidence * 100).toFixed(0)}%</span>
+      <span>${esc(c.home_name)} ${c.score.home}-${c.score.away} ${esc(c.away_name)} <span class="meta">${c.correct ? "called" : "missed"}</span></span></div>`;
+    box.innerHTML =
+      `<div class="rcstat"><b>${r.winners_called}/${r.scored}</b> winners called (${(r.accuracy * 100).toFixed(0)}%)
+        · Brier <b>${r.brier.toFixed(3)}</b> <span class="meta">vs ${r.baseline_brier.toFixed(3)} baseline</span>
+        · log-loss ${r.log_loss.toFixed(3)}</div>` +
+      (r.best_calls.length ? `<h3>Best calls</h3>${r.best_calls.map(call).join("")}` : "") +
+      (r.worst_calls.length ? `<h3>Biggest misses</h3>${r.worst_calls.map(call).join("")}` : "");
+  }
+
   function connect() {
     const proto = location.protocol === "https:" ? "wss" : "ws";
     const ws = new WebSocket(`${proto}://${location.host}/live`);
@@ -281,7 +301,8 @@
   }
   connect();
   refreshUpsets();
-  setInterval(refreshUpsets, 20000);
+  refreshReport();
+  setInterval(() => { refreshUpsets(); refreshReport(); }, 20000);
 })();
 </script>
 </body>

@@ -72,6 +72,34 @@ pub struct Upset {
     pub shock: f64,
 }
 
+/// One scored pre-match call: what the model predicted for a now-finished match, and whether it
+/// came off. `confidence` is the pre-match probability the model gave its most-likely outcome.
+#[derive(Debug, Clone, Serialize)]
+pub struct Call {
+    pub match_id: MatchId,
+    pub home_name: String,
+    pub away_name: String,
+    pub score: Scoreline,
+    pub confidence: f64,
+    pub correct: bool,
+}
+
+/// The model's self-scored "report card": how its own pre-match calls have held up so far. Honest
+/// accountability - most of the numbers come free from the pre-match forecasts + results already
+/// stored. `baseline_brier` is the naive uniform baseline, for context.
+#[derive(Debug, Clone, Serialize)]
+pub struct ReportCard {
+    pub scored: usize,
+    pub winners_called: usize,
+    pub accuracy: f64,
+    pub brier: f64,
+    pub log_loss: f64,
+    pub baseline_brier: f64,
+    /// Its most confident correct calls, and its most confident misses.
+    pub best_calls: Vec<Call>,
+    pub worst_calls: Vec<Call>,
+}
+
 /// The engine's in-tournament self-recalibration state, surfaced for observability. As results
 /// arrive the live features adjust these away from their neutral values, so a viewer can watch the
 /// model recalibrate itself against the tournament.
@@ -102,6 +130,8 @@ pub struct Snapshot {
     pub adaptive: AdaptiveState,
     /// Finished matches the model was most surprised by (favourite failed to win), ranked by shock.
     pub shocks: Vec<Upset>,
+    /// The model's self-scored report card on its own pre-match calls so far.
+    pub report_card: ReportCard,
 }
 
 impl Snapshot {
