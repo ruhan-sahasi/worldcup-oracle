@@ -128,6 +128,22 @@ pub fn router(engine: Arc<Engine>, explorer: ExplorerSlot) -> Router {
         .with_state(AppState { engine, explorer })
 }
 
+/// Resolve the address to listen on from the environment, for portable deploys. `$PORT` wins (the
+/// platform-as-a-service convention: Render, Heroku, and friends inject it), then an explicit
+/// `$ORACLE_ADDR`, then the default `0.0.0.0:8080`. Pass the raw env values in (so it stays pure
+/// and testable).
+pub fn resolve_listen_addr(
+    port: Option<String>,
+    oracle_addr: Option<String>,
+) -> anyhow::Result<SocketAddr> {
+    if let Some(p) = port.filter(|p| !p.trim().is_empty()) {
+        return Ok(format!("0.0.0.0:{}", p.trim()).parse()?);
+    }
+    Ok(oracle_addr
+        .unwrap_or_else(|| "0.0.0.0:8080".to_string())
+        .parse()?)
+}
+
 /// Serve the API until `shutdown` resolves (graceful shutdown).
 pub async fn serve<F>(
     engine: Arc<Engine>,
@@ -929,6 +945,34 @@ mod tests {
 
     fn json(bytes: &[u8]) -> serde_json::Value {
         serde_json::from_slice(bytes).expect("valid JSON body")
+    }
+
+    #[test]
+    fn listen_addr_prefers_port_then_oracle_addr() {
+        use super::resolve_listen_addr;
+        // $PORT wins (the PaaS convention).
+        assert_eq!(
+            resolve_listen_addr(Some("3000".into()), Some("0.0.0.0:8080".into()))
+                .unwrap()
+                .port(),
+            3000
+        );
+        // Then $ORACLE_ADDR.
+        assert_eq!(
+            resolve_listen_addr(None, Some("127.0.0.1:9000".into()))
+                .unwrap()
+                .port(),
+            9000
+        );
+        // Then the default. An empty $PORT is ignored.
+        assert_eq!(
+            resolve_listen_addr(None, None).unwrap().to_string(),
+            "0.0.0.0:8080"
+        );
+        assert_eq!(
+            resolve_listen_addr(Some("  ".into()), None).unwrap().port(),
+            8080
+        );
     }
 
     #[tokio::test]

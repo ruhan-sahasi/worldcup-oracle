@@ -1,10 +1,9 @@
 //! `oracle-server` - standalone binary that boots the engine and serves the API.
 //!
 //! Picks the live football-data.org feed when `FOOTBALL_DATA_API_KEY` is set,
-//! otherwise runs the deterministic simulation. Listen address comes from
-//! `ORACLE_ADDR` (default `0.0.0.0:8080`).
+//! otherwise runs the deterministic simulation. Listen address comes from `$PORT` (the PaaS
+//! convention), else `$ORACLE_ADDR`, else `0.0.0.0:8080`.
 
-use std::net::SocketAddr;
 use tokio_util::sync::CancellationToken;
 use tracing_subscriber::EnvFilter;
 
@@ -16,9 +15,10 @@ async fn main() -> anyhow::Result<()> {
         )
         .init();
 
-    let addr: SocketAddr = std::env::var("ORACLE_ADDR")
-        .unwrap_or_else(|_| "0.0.0.0:8080".to_string())
-        .parse()?;
+    let addr = oracle_api::resolve_listen_addr(
+        std::env::var("PORT").ok(),
+        std::env::var("ORACLE_ADDR").ok(),
+    )?;
 
     let cancel = CancellationToken::new();
     let (engine, engine_join) = oracle_engine::spawn(

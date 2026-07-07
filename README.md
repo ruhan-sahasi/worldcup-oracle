@@ -310,13 +310,30 @@ No key? It runs the deterministic simulation, and every command above works unch
 
 ```bash
 docker compose up --build         # serves on :8080  (live dashboard + /explore)
+
+# ...or run the pre-built published image (no local build):
+docker run -p 8080:8080 ghcr.io/ruhan-sahasi/worldcup-oracle:latest
 ```
 
 A multi-stage build (with **cargo-chef** dependency caching, so a source change recompiles only the
 workspace crates) produces a slim, non-root image with a `/health` healthcheck. The server binds
 and serves the live dashboard immediately; the model explorer fits its baseline in the background
 (its `/api/*` endpoints return 503 for the first few seconds, then go live), so liveness never
-waits on the fit. CI builds the image on every push so the deploy path can't silently break.
+waits on the fit. CI builds the image on every push so the deploy path can't silently break, and a
+version tag (`git tag v0.1.0 && git push --tags`) publishes it to **GHCR** via the release workflow.
+
+### Deploy
+
+The server honours `$PORT` (the platform convention), else `$ORACLE_ADDR`, else `0.0.0.0:8080`, so
+it drops onto any container host. Two turnkey paths are included:
+
+- **Render** (no CLI): `render.yaml` is a Blueprint. Connect the repo at render.com (New >
+  Blueprint) and it builds and deploys the Dockerfile with a `/health` check.
+- **Fly.io**: `fly launch --copy-config --no-deploy` (pick a unique app name), then `fly deploy`.
+
+Either way, **go live** by setting the feed key on the host - `fly secrets set
+FOOTBALL_DATA_API_KEY=...` or the Render Environment tab - and the engine switches from the
+deterministic simulation to the real 2026 feed automatically.
 
 ## 🛠️ What this project demonstrates
 

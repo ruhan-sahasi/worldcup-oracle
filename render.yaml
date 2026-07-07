@@ -1,0 +1,15 @@
+# Render blueprint. Connect this repo at https://render.com (New > Blueprint) and it builds and
+# deploys the Dockerfile - no CLI needed. The server honours Render's injected $PORT. Set the live
+# feed by adding FOOTBALL_DATA_API_KEY in the service's Environment tab.
+services:
+  - type: web
+    name: worldcup-oracle
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    healthCheckPath: /health
+    plan: free
+    envVars:
+      - key: RUST_LOG
+        value: info
+      - key: FOOTBALL_DATA_API_KEY
+        sync: false

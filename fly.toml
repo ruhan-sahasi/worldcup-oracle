@@ -1,0 +1,25 @@
+# Fly.io deploy config. First time: `fly launch --copy-config --no-deploy` (pick a unique app
+# name), then `fly deploy`. Set the live feed with `fly secrets set FOOTBALL_DATA_API_KEY=...`.
+app = "worldcup-oracle"
+primary_region = "iad"
+
+[build]
+  dockerfile = "Dockerfile"
+
+[env]
+  ORACLE_ADDR = "0.0.0.0:8080"
+  RUST_LOG = "info"
+
+[http_service]
+  internal_port = 8080
+  force_https = true
+  auto_stop_machines = "stop"
+  auto_start_machines = true
+  min_machines_running = 0
+
+  [[http_service.checks]]
+    interval = "15s"
+    timeout = "3s"
+    grace_period = "20s"
+    method = "GET"
+    path = "/health"
