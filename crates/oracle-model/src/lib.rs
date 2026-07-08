@@ -14,6 +14,7 @@
 #![forbid(unsafe_code)]
 
 pub mod bayes_opt;
+pub mod bradley_terry;
 pub mod calibration;
 pub mod context;
 pub mod dixon_coles;
@@ -23,6 +24,7 @@ pub mod live;
 pub mod poisson;
 pub mod style;
 
+pub use bradley_terry::{BradleyTerry, BradleyTerryConfig};
 pub use calibration::{
     apply_temperature, bootstrap_score_ci, fit_gain_toward_one, fit_temperature,
     implied_probabilities, reliability, score, CalibrationReport, MetricCi, ReliabilityBin,
