@@ -15,7 +15,8 @@ use oracle_domain::{
 use oracle_ingest::data::{self, SignalMask, VenueAdj};
 use oracle_model::hmc::HmcConfig;
 use oracle_model::{
-    implied_probabilities, DixonColesConfig, Ensemble, GoalModel, LiveConfig, Observation,
+    implied_probabilities, BradleyTerry, DixonColesConfig, Ensemble, GoalModel, LiveConfig,
+    Observation,
 };
 use oracle_ratings::{RatingStore, StateSpaceRatings};
 use oracle_sim::{meeting_probabilities, simulate_with_live, LiveInputs, SimConfig};
@@ -42,6 +43,9 @@ pub struct Explorer {
     confederations: HashMap<TeamId, Confederation>,
     shootout_rating: HashMap<TeamId, f64>,
     knockout_pedigree: HashMap<TeamId, f64>,
+    /// The second, outcome-based forecaster (Bradley-Terry-Davidson), an alternative to the goal
+    /// model that predicts win/draw/loss directly and yields knockout advance probabilities.
+    bradley_terry: BradleyTerry,
 }
 
 impl Default for Explorer {
@@ -78,6 +82,7 @@ impl Explorer {
             confederations: data::confederations(),
             shootout_rating: data::shootout_ratings(),
             knockout_pedigree: data::knockout_pedigree(),
+            bradley_terry: data::fit_bradley_terry(7),
         }
     }
 
@@ -472,6 +477,77 @@ impl Explorer {
         }
     }
 
+    /// The second model's take on a matchup: Bradley-Terry-Davidson win/draw/loss (outcome-based,
+    /// not goal-based), an alternative to the ensemble forecast.
+    pub fn bt_predict(&self, home: TeamId, away: TeamId, neutral: bool) -> BtMatchup {
+        BtMatchup {
+            home: self.name(home),
+            away: self.name(away),
+            probabilities: self
+                .bradley_terry
+                .outcome_probabilities(home, away, neutral),
+        }
+    }
+
+    /// The second model's winner prediction: exact champion odds over a projected knockout bracket
+    /// (top two per group plus the eight strongest third-placed teams, by Bradley-Terry strength,
+    /// seeded so the strongest sides start apart), computed by bracket dynamic programming from the
+    /// model's pairwise advance probabilities - no Monte-Carlo needed.
+    pub fn bt_champion_odds(&self) -> BtChampions {
+        let leaves = self.projected_bracket();
+        if leaves.len() != 32 {
+            return BtChampions { teams: Vec::new() };
+        }
+        let odds =
+            bracket_champion_odds(&leaves, |a, b| self.bradley_terry.advance_probability(a, b));
+        BtChampions {
+            teams: odds
+                .into_iter()
+                .map(|(team, champion)| BtTeamOdds {
+                    team: self.name(team),
+                    champion,
+                })
+                .collect(),
+        }
+    }
+
+    /// The 32 knockout qualifiers projected by Bradley-Terry strength (top two per group plus the
+    /// best eight thirds), returned as bracket leaves in standard seeded order.
+    fn projected_bracket(&self) -> Vec<TeamId> {
+        let strength: HashMap<TeamId, f64> =
+            self.bradley_terry.strength_ranking().into_iter().collect();
+        let key = |t: &TeamId| strength.get(t).copied().unwrap_or(0.0);
+        let cmp = |a: &TeamId, b: &TeamId| {
+            key(b)
+                .partial_cmp(&key(a))
+                .unwrap_or(std::cmp::Ordering::Equal)
+        };
+        let mut qualifiers: Vec<TeamId> = Vec::new();
+        let mut thirds: Vec<TeamId> = Vec::new();
+        for g in &self.tournament.groups {
+            let mut ts = g.teams.clone();
+            ts.sort_by(cmp);
+            if ts.len() < 2 {
+                return Vec::new();
+            }
+            qualifiers.push(ts[0]);
+            qualifiers.push(ts[1]);
+            if ts.len() > 2 {
+                thirds.push(ts[2]);
+            }
+        }
+        thirds.sort_by(cmp);
+        qualifiers.extend(thirds.into_iter().take(8));
+        if qualifiers.len() != 32 {
+            return Vec::new();
+        }
+        qualifiers.sort_by(cmp); // strongest first (seed 1..32)
+        seed_order(32)
+            .into_iter()
+            .map(|s| qualifiers[s - 1])
+            .collect()
+    }
+
     /// Team ratings (Elo, state-space mean, goal-model strength) and the fitted confederation
     /// strength levels, for the ratings browser.
     pub fn ratings(&self) -> RatingsView {
@@ -729,6 +805,67 @@ pub fn signal_sensitivity(
     out
 }
 
+/// Standard single-elimination seed order for `n` (a power of two): 1 plays `n`, 2 plays `n-1`,
+/// and top seeds are kept in opposite halves. Returns 1-based seed positions in bracket-leaf order.
+fn seed_order(n: usize) -> Vec<usize> {
+    let mut seeds = vec![1usize];
+    while seeds.len() < n {
+        let rounds = seeds.len() * 2;
+        let mut next = Vec::with_capacity(rounds);
+        for &s in &seeds {
+            next.push(s);
+            next.push(rounds + 1 - s);
+        }
+        seeds = next;
+    }
+    seeds
+}
+
+/// Exact champion probability per team over a single-elimination bracket, by dynamic programming:
+/// merge sibling sub-brackets bottom-up, where a team wins a node by winning its own side and then
+/// beating the (probability-weighted) field from the other side. `leaves` are the teams in bracket
+/// order (a power-of-two length); `advance(a, b)` is `P(a beats b)`. Champion probabilities sum to 1.
+fn bracket_champion_odds(
+    leaves: &[TeamId],
+    advance: impl Fn(TeamId, TeamId) -> f64,
+) -> Vec<(TeamId, f64)> {
+    let mut layer: Vec<HashMap<TeamId, f64>> = leaves
+        .iter()
+        .map(|&t| {
+            let mut m = HashMap::new();
+            m.insert(t, 1.0);
+            m
+        })
+        .collect();
+    while layer.len() > 1 {
+        let mut next: Vec<HashMap<TeamId, f64>> = Vec::with_capacity(layer.len() / 2);
+        let mut k = 0;
+        while k + 1 < layer.len() {
+            let (left, right) = (&layer[k], &layer[k + 1]);
+            let mut merged: HashMap<TeamId, f64> = HashMap::new();
+            for (&a, &pa) in left {
+                let beats: f64 = right.iter().map(|(&b, &pb)| pb * advance(a, b)).sum();
+                *merged.entry(a).or_insert(0.0) += pa * beats;
+            }
+            for (&b, &pb) in right {
+                let beats: f64 = left.iter().map(|(&a, &pa)| pa * advance(b, a)).sum();
+                *merged.entry(b).or_insert(0.0) += pb * beats;
+            }
+            next.push(merged);
+            k += 2;
+        }
+        layer = next;
+    }
+    let mut v: Vec<(TeamId, f64)> = layer
+        .into_iter()
+        .next()
+        .unwrap_or_default()
+        .into_iter()
+        .collect();
+    v.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    v
+}
+
 fn top_scorelines(grid: &ScoreGrid, n: usize) -> Vec<ScoreLine> {
     let mut cells: Vec<ScoreLine> = grid
         .grid
@@ -870,6 +1007,27 @@ pub struct KingmakerReport {
 pub struct RoundProb {
     pub round: String,
     pub probability: f64,
+}
+
+/// The second model's (Bradley-Terry-Davidson) win/draw/loss for a matchup.
+#[derive(Debug, Clone, Serialize)]
+pub struct BtMatchup {
+    pub home: String,
+    pub away: String,
+    pub probabilities: Probabilities,
+}
+
+/// One team's champion probability from the second model's bracket dynamic programming.
+#[derive(Debug, Clone, Serialize)]
+pub struct BtTeamOdds {
+    pub team: String,
+    pub champion: f64,
+}
+
+/// The second model's winner prediction: champion odds over the projected knockout bracket.
+#[derive(Debug, Clone, Serialize)]
+pub struct BtChampions {
+    pub teams: Vec<BtTeamOdds>,
 }
 
 /// Collision course: how likely two teams are to meet in the knockouts, overall and by round.
@@ -1037,6 +1195,50 @@ mod tests {
         // A meeting is counted at exactly one round, so the per-round probs sum to the total.
         let sum: f64 = c.by_round.iter().map(|r| r.probability).sum();
         assert!((c.meet_probability - sum).abs() < 1e-9);
+    }
+
+    #[test]
+    fn bracket_dp_sums_to_one_and_favours_the_top_seed() {
+        let leaves = [TeamId(0), TeamId(3), TeamId(2), TeamId(1)];
+        // Higher id = stronger, via a logistic on the id difference.
+        let advance = |a: TeamId, b: TeamId| {
+            let (x, y) = (a.0 as f64, b.0 as f64);
+            x.exp() / (x.exp() + y.exp())
+        };
+        let odds = bracket_champion_odds(&leaves, advance);
+        let total: f64 = odds.iter().map(|(_, p)| p).sum();
+        assert!(
+            (total - 1.0).abs() < 1e-9,
+            "champion odds sum to 1: {total}"
+        );
+        assert_eq!(
+            odds[0].0,
+            TeamId(3),
+            "the strongest team leads the champion odds"
+        );
+    }
+
+    #[test]
+    fn bradley_terry_second_model_predicts_and_picks_a_winner() {
+        let ex = Explorer::new();
+        let (a, b) = (
+            ex.resolve("Argentina").unwrap(),
+            ex.resolve("New Zealand").unwrap(),
+        );
+        let m = ex.bt_predict(a, b, true);
+        assert!((m.probabilities.sum() - 1.0).abs() < 1e-9);
+        assert!(
+            m.probabilities.home_win > m.probabilities.away_win,
+            "the second model should favour Argentina over NZ"
+        );
+        let champs = ex.bt_champion_odds();
+        assert_eq!(champs.teams.len(), 32, "a projected 32-team bracket");
+        let total: f64 = champs.teams.iter().map(|t| t.champion).sum();
+        assert!(
+            (total - 1.0).abs() < 1e-6,
+            "champion odds sum to 1: {total}"
+        );
+        assert!(champs.teams[0].champion >= champs.teams[1].champion);
     }
 
     #[test]

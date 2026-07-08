@@ -97,6 +97,24 @@ The goal-model parameters progressed deliberately:
 Hyperparameters (`ξ`, ridge, score model) are chosen by **Bayesian optimization** (a Gaussian-process
 surrogate + Expected Improvement) over a continuous space, not a hand-specified grid.
 
+## A second model: Bradley-Terry-Davidson
+
+The Dixon-Coles model above reasons about *goals*. As a tournament fills up with real results, a
+second, deliberately different forecaster earns its place: one that reasons about *outcomes*
+directly. **Bradley-Terry-Davidson** gives each team a single latent strength and reads a match as a
+paired comparison - `P(i beats j) = πᵢ / (πᵢ + πⱼ + ν√(πᵢπⱼ))`, with a tie parameter `ν` (Davidson
+1970) for the draw. It is fit by time-weighted maximum likelihood on who-beat-whom, so **deep in the
+tournament the accumulated results dominate the priors** - exactly when a second opinion is most
+useful. Dropping the tie term recovers plain Bradley-Terry, `πᵢ/(πᵢ+πⱼ)`, the natural "who advances"
+probability for a knockout tie.
+
+Its **winner prediction is exact, not Monte-Carlo**: given a knockout bracket, champion odds fall
+out of a bottom-up **dynamic program** - a team wins a node by winning its own sub-bracket and then
+beating the probability-weighted field from the other side, and the champion probabilities provably
+sum to one. This is a genuinely distinct model (a different family, a different fit target, and a
+different inference) offered *alongside* the goal-model ensemble, not folded into it - two
+independent reads on the same tournament.
+
 ## Evaluation philosophy
 
 Skill is the point, so it is measured carefully:

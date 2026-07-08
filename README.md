@@ -51,6 +51,7 @@ fully offline with **zero keys and zero network**.
 | **State-space (Kalman) rating** - each team a Gaussian `N(mean, var)`, random-walk between matches + Kalman update from each result, with a **per-match process-noise bump for tournament games** so the filter keeps tracking form fast instead of growing overconfident | principled in-tournament learning that stays reactive mid-competition, *and* a per-team uncertainty that the Monte-Carlo consumes |
 | **Log-opinion-pool ensemble** (`[Dixon-Coles, Elo, State-space, Market]` weights + temperature **learned by out-of-fold stacking**, with the **market up-weighted for knockout ties**) | a single sharper forecast, anchored to the bookmaker when odds are present and leaning harder on the closing line in knockouts where it is sharpest; weights trained on leakage-free predictions over the whole dataset |
 | **Live recalibration** - as matches finish, their leak-free pre-match forecasts are scored against the results and a **temperature-scaling** correction is refit and applied to the remaining forecasts | the model recalibrates itself against the tournament as it plays, correcting any over/under-confidence the offline fit could not anticipate |
+| **Bradley-Terry-Davidson** - a **second, outcome-based model** (win/draw/loss from a per-team strength + a Davidson tie term), time-weighted so real results dominate deep in the tournament; its winner prediction is an **exact knockout bracket DP** | a genuinely different second opinion that leans on the growing result set, offered alongside the goal-model ensemble rather than folded into it |
 | **Bayesian live updater** with **score effects** | conditions on score, minute, and red cards; a trailing team chases and a leading team defends |
 | **Lineup adjustment** | a confirmed XI shifts each team's attack and defense |
 | **Suspension tracking** | yellow-card accumulation drops a suspended starter from the next match before its lineup is known |
@@ -289,6 +290,8 @@ team and confederation ratings. The current matchup lives in the URL, so any pre
 | `GET` | `/api/team?q=` | one team's journey odds, championship rank, and next match |
 | `GET` | `/api/predict?home=&away=` | on-demand forecast for **any** matchup (+ optional odds) |
 | `GET` | `/api/posterior?home=&away=` | HMC posterior **credible intervals** for a matchup |
+| `GET` | `/api/bt?home=&away=` | **second model** (Bradley-Terry-Davidson) win/draw/loss |
+| `GET` | `/api/bt/champions` | second model's **champion odds** (exact bracket DP) |
 | `GET` | `/api/simulate?iters=&seed=` | custom Monte-Carlo champion-odds run |
 | `GET` | `/api/sensitivity?iters=&seed=` | per-signal ablation: how much each signal moves the title |
 | `GET` | `/api/ratings` | team ratings + confederation strength levels |

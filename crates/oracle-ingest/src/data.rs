@@ -24,8 +24,8 @@ use oracle_domain::{
 };
 use oracle_model::poisson::poisson_pmf;
 use oracle_model::{
-    context_adjustment, implied_probabilities, style_adjustment, DixonColesConfig, Ensemble,
-    GoalModel, Host, MatchContext, Observation, StyleProfile,
+    context_adjustment, implied_probabilities, style_adjustment, BradleyTerry, BradleyTerryConfig,
+    DixonColesConfig, Ensemble, GoalModel, Host, MatchContext, Observation, StyleProfile,
 };
 use oracle_ratings::{RatingStore, StateSpaceRatings};
 use rand::rngs::StdRng;
@@ -1271,6 +1271,16 @@ pub fn fit_baseline(seed: u64) -> Baseline {
 /// Convenience: just the goal model from [`fit_baseline`].
 pub fn fit_baseline_model(seed: u64) -> GoalModel {
     fit_baseline(seed).model
+}
+
+/// Fit the **Bradley-Terry-Davidson** model (the second, outcome-based forecaster) on the same
+/// synthetic history. Time-weighted, so real tournament results replayed into it later dominate.
+pub fn fit_bradley_terry(seed: u64) -> BradleyTerry {
+    let obs: Vec<Observation> = synthetic_history_with_market(4000, seed)
+        .into_iter()
+        .map(|r| r.obs)
+        .collect();
+    BradleyTerry::fit(&obs, BradleyTerryConfig::default())
 }
 
 /// A goal model fit on the same synthetic history but **without confederation pooling**: plain

@@ -102,6 +102,7 @@
           <input class="odds" id="oa" placeholder="A" />
           <button id="predict">Predict</button>
           <button class="ghost" id="explain">Explain</button>
+          <button class="ghost" id="bt">2nd model (BT)</button>
           <button class="ghost" id="collision">Collision course</button>
           <button class="ghost" id="posterior">Posterior (HMC)</button>
           <button class="ghost" id="share" title="Copy a shareable link to this matchup">Copy link</button>
@@ -110,6 +111,7 @@
         <div class="note">Press <kbd>Enter</kbd> to predict. Links are shareable.</div>
         <div id="predict-out" class="hidden"></div>
         <div id="explain-out" class="hidden"></div>
+        <div id="bt-out" class="hidden"></div>
         <div id="collision-out" class="hidden"></div>
         <div id="posterior-out" class="hidden"></div>
       </div>
@@ -130,6 +132,15 @@
           <span id="sim-status" class="muted"></span>
         </div>
         <div id="sim-out"></div>
+      </div>
+
+      <div class="panel">
+        <h2>Second model: Bradley-Terry champions</h2>
+        <div class="row">
+          <button id="run-btchamp">Compute (bracket DP)</button>
+          <span id="btchamp-status" class="muted"></span>
+        </div>
+        <div id="btchamp-out" class="note">An outcome-based alternative: champion odds from the Bradley-Terry model over its projected knockout bracket, by exact dynamic programming (no Monte-Carlo).</div>
       </div>
     </section>
 
@@ -328,6 +339,32 @@
     } catch (err) { $("explain-out").textContent = err.message; }
   }
 
+  // ----- second model (Bradley-Terry) -----
+  async function doBt() {
+    $("bt-out").classList.remove("hidden");
+    $("bt-out").innerHTML = "…";
+    try {
+      const b = await api(`/api/bt?home=${encodeURIComponent($("home").value)}&away=${encodeURIComponent($("away").value)}`);
+      const p = b.probabilities;
+      $("bt-out").innerHTML = `<div class="note">2nd model - Bradley-Terry-Davidson (outcome-based, not goals):</div>
+        <table style="margin-top:6px"><tr><th>${esc(b.home)}</th><th>Draw</th><th>${esc(b.away)}</th></tr>
+        <tr><td class="accent">${pct(p.home_win)}</td><td>${pct(p.draw)}</td><td class="away">${pct(p.away_win)}</td></tr></table>`;
+    } catch (err) { $("bt-out").textContent = err.message; }
+  }
+
+  async function doBtChampions() {
+    $("run-btchamp").disabled = true; $("btchamp-status").textContent = "computing…"; $("btchamp-out").innerHTML = "";
+    try {
+      const c = await api("/api/bt/champions");
+      $("btchamp-status").textContent = "";
+      if (!c.teams || !c.teams.length) { $("btchamp-out").innerHTML = '<div class="muted">unavailable for this tournament shape</div>'; return; }
+      let h = `<table><tr><th>#</th><th>Team</th><th>Champion (BT)</th></tr>`;
+      c.teams.slice(0, 16).forEach((t, i) => { h += `<tr><td>${i + 1}</td><td>${esc(t.team)}</td><td class="accent">${pct(t.champion)}</td></tr>`; });
+      $("btchamp-out").innerHTML = h + "</table>";
+    } catch (err) { $("btchamp-status").textContent = err.message; }
+    finally { $("run-btchamp").disabled = false; }
+  }
+
   // ----- collision course -----
   async function doCollision() {
     $("collision-out").classList.remove("hidden");
@@ -420,6 +457,8 @@
   // ----- wire up -----
   $("predict").onclick = doPredict;
   $("explain").onclick = doExplain;
+  $("bt").onclick = doBt;
+  $("run-btchamp").onclick = doBtChampions;
   $("collision").onclick = doCollision;
   $("posterior").onclick = doPosterior;
   $("swap").onclick = swapTeams;

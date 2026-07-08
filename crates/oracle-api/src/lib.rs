@@ -23,6 +23,8 @@
 //! | GET | `/report` | the model's self-scored report card on its own pre-match calls |
 //! | GET | `/api/predict?home=&away=` | on-demand matchup forecast (any two teams) |
 //! | GET | `/api/explain?home=&away=` | factor attribution: why the model favours a side |
+//! | GET | `/api/bt?home=&away=` | second model (Bradley-Terry-Davidson) win/draw/loss |
+//! | GET | `/api/bt/champions` | second model's champion odds (bracket DP) |
 //! | GET | `/api/posterior?home=&away=` | HMC posterior credible intervals for a matchup |
 //! | GET | `/api/simulate?iters=&seed=` | custom Monte-Carlo champion-odds run |
 //! | GET | `/api/sensitivity?iters=&seed=` | per-signal ablation: how much each signal moves the title |
@@ -46,8 +48,8 @@ use axum::{
 use futures_util::{SinkExt, StreamExt};
 use oracle_domain::{MatchId, MatchStatus, Probabilities, Scoreline, Stage, TeamId};
 use oracle_engine::query::{
-    CollisionForecast, Explanation, KingmakerReport, MatchupForecast, PosteriorForecast,
-    RatingsView, SensitivityForecast, SimForecast,
+    BtChampions, BtMatchup, CollisionForecast, Explanation, KingmakerReport, MatchupForecast,
+    PosteriorForecast, RatingsView, SensitivityForecast, SimForecast,
 };
 use oracle_engine::{AdaptiveState, Engine, Explorer, ReportCard, Snapshot, Upset, WinProbSample};
 use serde::{Deserialize, Serialize};
@@ -115,6 +117,8 @@ pub fn router(engine: Arc<Engine>, explorer: ExplorerSlot) -> Router {
         // On-demand model queries (any matchup, posterior, custom simulation, ratings).
         .route("/api/predict", get(api_predict))
         .route("/api/explain", get(api_explain))
+        .route("/api/bt", get(api_bt))
+        .route("/api/bt/champions", get(api_bt_champions))
         .route("/api/posterior", get(api_posterior))
         .route("/api/simulate", get(api_simulate))
         .route("/api/sensitivity", get(api_sensitivity))
@@ -197,6 +201,7 @@ async fn api_info(
             "/card (shareable prediction card)", "/health", "/teams", "/matches",
             "/predict/match/{id}", "/predict/tournament", "/upsets", "/report", "/api/team?q=",
             "/api/predict?home=&away=", "/api/explain?home=&away=", "/api/posterior?home=&away=",
+            "/api/bt?home=&away=", "/api/bt/champions",
             "/api/simulate?iters=&seed=", "/api/sensitivity?iters=&seed=",
             "/api/kingmaker?q=", "/api/collision?home=&away=", "/api/ratings",
             "/metrics", "/live (websocket)"
@@ -264,6 +269,25 @@ async fn api_explain(
         p.neutral.unwrap_or(true),
         odds,
     )))
+}
+
+/// Second model (Bradley-Terry-Davidson) win/draw/loss for a matchup.
+async fn api_bt(
+    State(explorer): State<ExplorerSlot>,
+    Query(p): Query<MatchupParams>,
+) -> Result<Json<BtMatchup>, StatusCode> {
+    let ex = ready(&explorer)?;
+    let (Some(home), Some(away)) = (ex.resolve(&p.home), ex.resolve(&p.away)) else {
+        return Err(StatusCode::NOT_FOUND);
+    };
+    Ok(Json(ex.bt_predict(home, away, p.neutral.unwrap_or(true))))
+}
+
+/// Second model's winner prediction: champion odds over its projected knockout bracket.
+async fn api_bt_champions(
+    State(explorer): State<ExplorerSlot>,
+) -> Result<Json<BtChampions>, StatusCode> {
+    Ok(Json(ready(&explorer)?.bt_champion_odds()))
 }
 
 #[derive(Deserialize)]
@@ -1137,6 +1161,18 @@ mod tests {
         assert_eq!(ex["strength_factors"].as_array().unwrap().len(), 4);
         assert!(ex["members"].as_array().unwrap().len() >= 3);
         assert!(ex["expected_home"].as_f64().unwrap() > 0.0);
+
+        // Second model (Bradley-Terry): a matchup W/D/L and champion odds.
+        let (status, body) = get(&state, "/api/bt?home=Brazil&away=Japan").await;
+        assert_eq!(status, StatusCode::OK);
+        let bt = json(&body);
+        let s = bt["probabilities"]["home_win"].as_f64().unwrap()
+            + bt["probabilities"]["draw"].as_f64().unwrap()
+            + bt["probabilities"]["away_win"].as_f64().unwrap();
+        assert!((s - 1.0).abs() < 1e-6, "BT probabilities sum to 1");
+        let (status, body) = get(&state, "/api/bt/champions").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json(&body)["teams"].as_array().unwrap().len(), 32);
 
         // Custom simulation: champion mass ~1.
         let (status, body) = get(&state, "/api/simulate?iters=2000&seed=1").await;
