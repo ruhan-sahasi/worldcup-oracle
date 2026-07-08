@@ -15,6 +15,7 @@ fn with_baseline(deps: EngineDeps) -> EngineDeps {
         .with_elo_seeds(baseline.elo_seeds)
         .with_state_space(baseline.state_space)
         .with_ensemble(baseline.ensemble)
+        .with_bradley_terry(data::fit_bradley_terry(7))
 }
 
 /// Deterministic simulation over the embedded 2026 World Cup, with the fitted baseline

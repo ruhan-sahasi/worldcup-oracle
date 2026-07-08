@@ -28,8 +28,8 @@ mod snapshot;
 pub use event_log::EventLog;
 pub use query::{signal_sensitivity, Explorer, SignalContribution};
 pub use snapshot::{
-    AdaptiveState, Call, MatchPrediction, Metrics, RatingEntry, ReportCard, Snapshot, Upset,
-    WinProbSample,
+    AdaptiveState, Call, MatchPrediction, Metrics, ModelScore, RatingEntry, ReportCard, Snapshot,
+    Upset, WinProbSample,
 };
 
 use arc_swap::ArcSwap;
@@ -40,7 +40,8 @@ use oracle_domain::{
 use oracle_ingest::DataProvider;
 use oracle_model::{
     apply_temperature, fit_gain_toward_one, fit_temperature, implied_probabilities,
-    live_score_grid, score, CalibrationReport, Ensemble, GoalModel, LiveConfig, LiveState,
+    live_score_grid, score, BradleyTerry, CalibrationReport, Ensemble, GoalModel, LiveConfig,
+    LiveState,
 };
 use oracle_ratings::{EloConfig, RatingStore, StateSpaceRatings};
 use oracle_sim::{simulate_with_live, InProgress, LiveInputs, SimConfig, VenueAdj};
@@ -72,6 +73,9 @@ pub struct EngineDeps {
     /// State-space (Kalman) rating: a dynamic in-tournament rating that also supplies the
     /// per-team uncertainty the Monte-Carlo resamples from.
     pub state_space: StateSpaceRatings,
+    /// The second, outcome-based forecaster (Bradley-Terry-Davidson), scored head-to-head with the
+    /// goal-model ensemble and updated online from results.
+    pub bradley_terry: BradleyTerry,
 }
 
 impl EngineDeps {
@@ -93,6 +97,7 @@ impl EngineDeps {
             tournament_lr: 0.05,
             suspension_threshold: 2,
             state_space: StateSpaceRatings::with_defaults(),
+            bradley_terry: BradleyTerry::default(),
         }
     }
 
@@ -128,6 +133,11 @@ impl EngineDeps {
 
     pub fn with_ensemble(mut self, ensemble: Ensemble) -> Self {
         self.ensemble = ensemble;
+        self
+    }
+
+    pub fn with_bradley_terry(mut self, bt: BradleyTerry) -> Self {
+        self.bradley_terry = bt;
         self
     }
 }
@@ -423,6 +433,10 @@ struct EngineState {
     /// Per-live-match win-probability timeline (one sample per minute), for the fan drama graph.
     /// Dropped when a match finishes.
     live_history: HashMap<MatchId, Vec<WinProbSample>>,
+    /// The second forecaster (Bradley-Terry-Davidson), online-updated from each result.
+    bradley_terry: BradleyTerry,
+    /// Each finished match's pre-match Bradley-Terry forecast (leak-free), for the head-to-head.
+    bt_pre_match_forecast: HashMap<MatchId, Probabilities>,
     /// Per-team knockout factors precomputed once: penalty-shootout skill and knockout pedigree.
     shootout_rating: HashMap<TeamId, f64>,
     knockout_pedigree: HashMap<TeamId, f64>,
@@ -506,6 +520,8 @@ impl EngineState {
             context_calib: Vec::new(),
             pre_match_forecast: HashMap::new(),
             live_history: HashMap::new(),
+            bradley_terry: deps.bradley_terry,
+            bt_pre_match_forecast: HashMap::new(),
             shootout_rating,
             knockout_pedigree,
             source_healthy: true,
@@ -652,6 +668,9 @@ impl EngineState {
             let pred = self.pre_match_probs(&m);
             self.calib_pairs.push((pred, score.outcome()));
             self.pre_match_forecast.insert(event.match_id, pred);
+            // Second model's pre-match call, recorded before it learns from the result (leak-free).
+            let bt_pred = self.bradley_terry.outcome_probabilities(home, away, true);
+            self.bt_pre_match_forecast.insert(event.match_id, bt_pred);
             self.live_history.remove(&event.match_id); // done; drop its live timeline
             self.refit_calibration();
             // Context recalibration: how much of this match's margin the context signals explain
@@ -682,6 +701,14 @@ impl EngineState {
             // observe injects a per-match process-noise bump so the filter keeps tracking form
             // fast instead of growing overconfident across the competition.
             self.state_space.observe_tournament(home, away, score, true);
+            // The second model learns from the same result (an online step on the two strengths).
+            self.bradley_terry.update_with_result(
+                home,
+                away,
+                score.outcome(),
+                true,
+                self.tournament_lr,
+            );
             self.tournament.matches[pos].status = MatchStatus::Finished;
             self.tournament.matches[pos].score = score;
             // If that was the last group result, the knockout participants are now known:
@@ -1160,6 +1187,10 @@ impl EngineState {
         let mut worst: Vec<Call> = calls.iter().filter(|c| !c.correct).cloned().collect();
         worst.sort_by(by_confidence);
         worst.truncate(3);
+        let head_to_head = vec![
+            self.score_model("Dixon-Coles ensemble", &self.pre_match_forecast),
+            self.score_model("Bradley-Terry", &self.bt_pre_match_forecast),
+        ];
         ReportCard {
             scored,
             winners_called,
@@ -1169,6 +1200,27 @@ impl EngineState {
             baseline_brier: CalibrationReport::uniform_baseline(scored.max(1)).brier,
             best_calls: best,
             worst_calls: worst,
+            head_to_head,
+        }
+    }
+
+    /// Score one forecaster's pre-match calls against the finished matches (accuracy, Brier,
+    /// log-loss), for the head-to-head between the two models.
+    fn score_model(&self, name: &str, forecasts: &HashMap<MatchId, Probabilities>) -> ModelScore {
+        let pairs: Vec<(Probabilities, Outcome)> = self
+            .tournament
+            .matches
+            .iter()
+            .filter(|m| m.is_finished())
+            .filter_map(|m| forecasts.get(&m.id).map(|&p| (p, m.score.outcome())))
+            .collect();
+        let r = score(&pairs);
+        ModelScore {
+            model: name.to_string(),
+            scored: pairs.len(),
+            accuracy: r.accuracy,
+            brier: r.brier,
+            log_loss: r.log_loss,
         }
     }
 }
@@ -1928,5 +1980,40 @@ mod tests {
         );
         assert!(rc.best_calls.iter().all(|c| c.correct));
         assert!(rc.worst_calls.iter().all(|c| !c.correct));
+    }
+
+    #[test]
+    fn head_to_head_scores_both_models() {
+        let mut state = state_with_lr(0.05);
+        let metrics = Metrics::default();
+        let group: Vec<(MatchId, TeamId, TeamId)> = state
+            .tournament
+            .matches
+            .iter()
+            .take(12)
+            .map(|m| (m.id, m.home, m.away))
+            .collect();
+        for (id, home, away) in group {
+            let score = if home.0 < away.0 {
+                Scoreline::new(2, 0)
+            } else {
+                Scoreline::new(0, 2)
+            };
+            state.apply_event(
+                &MatchEvent::new(id, 90, EventKind::FullTime { score }),
+                &metrics,
+            );
+        }
+        // The second model recorded a leak-free pre-match call for every finished match...
+        assert_eq!(state.bt_pre_match_forecast.len(), 12);
+        // ...and the report card scores both forecasters on the same results.
+        let rc = state.build_snapshot("test").report_card;
+        assert_eq!(rc.head_to_head.len(), 2);
+        let names: Vec<&str> = rc.head_to_head.iter().map(|m| m.model.as_str()).collect();
+        assert!(names.contains(&"Dixon-Coles ensemble") && names.contains(&"Bradley-Terry"));
+        for m in &rc.head_to_head {
+            assert_eq!(m.scored, 12);
+            assert!((0.0..=1.0).contains(&m.accuracy) && m.brier >= 0.0);
+        }
     }
 }

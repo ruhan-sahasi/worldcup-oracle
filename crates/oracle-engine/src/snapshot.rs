@@ -84,9 +84,20 @@ pub struct Call {
     pub correct: bool,
 }
 
+/// One model's scorecard on the finished matches, for the head-to-head between the two forecasters.
+#[derive(Debug, Clone, Serialize)]
+pub struct ModelScore {
+    pub model: String,
+    pub scored: usize,
+    pub accuracy: f64,
+    pub brier: f64,
+    pub log_loss: f64,
+}
+
 /// The model's self-scored "report card": how its own pre-match calls have held up so far. Honest
 /// accountability - most of the numbers come free from the pre-match forecasts + results already
-/// stored. `baseline_brier` is the naive uniform baseline, for context.
+/// stored. `baseline_brier` is the naive uniform baseline, for context. `head_to_head` scores both
+/// forecasters (the Dixon-Coles ensemble and Bradley-Terry) on the same results.
 #[derive(Debug, Clone, Serialize)]
 pub struct ReportCard {
     pub scored: usize,
@@ -98,6 +109,8 @@ pub struct ReportCard {
     /// Its most confident correct calls, and its most confident misses.
     pub best_calls: Vec<Call>,
     pub worst_calls: Vec<Call>,
+    /// Both models scored on the same finished matches (ensemble vs Bradley-Terry).
+    pub head_to_head: Vec<ModelScore>,
 }
 
 /// The engine's in-tournament self-recalibration state, surfaced for observability. As results

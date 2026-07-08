@@ -53,6 +53,9 @@
   #upsets h3, #report h3 { font-size: 12px; text-transform: uppercase; letter-spacing: .05em; color: var(--muted); margin: 12px 0 6px; }
   #upsets h3:first-child, #report h3:first-child { margin-top: 0; }
   .rcstat { font-size: 13px; margin-bottom: 4px; }
+  #report table { width: 100%; border-collapse: collapse; font-size: 13px; font-variant-numeric: tabular-nums; }
+  #report th, #report td { text-align: left; padding: 4px 6px; border-bottom: 1px solid var(--line); }
+  #report th { color: var(--muted); font-weight: 600; }
   .upset { display: flex; align-items: center; gap: 10px; padding: 5px 0; font-size: 13px; }
   .upset .meta { margin-left: 6px; }
   .shock, .chance { flex: none; width: 42px; text-align: right; font-weight: 700; font-variant-numeric: tabular-nums; }
@@ -277,10 +280,16 @@
     if (!r.scored) { box.innerHTML = '<div class="empty">No results scored yet.</div>'; return; }
     const call = (c) => `<div class="upset"><span class="${c.correct ? 'chance' : 'shock'}">${(c.confidence * 100).toFixed(0)}%</span>
       <span>${esc(c.home_name)} ${c.score.home}-${c.score.away} ${esc(c.away_name)} <span class="meta">${c.correct ? "called" : "missed"}</span></span></div>`;
+    const h2h = (r.head_to_head || []).filter(m => m.scored > 0);
+    const h2hTable = h2h.length
+      ? `<h3>Two models, same results</h3><table><tr><th>Model</th><th>Winners</th><th>Brier</th><th>Log-loss</th></tr>` +
+        h2h.map(m => `<tr><td>${esc(m.model)}</td><td>${(m.accuracy * 100).toFixed(0)}%</td><td>${m.brier.toFixed(3)}</td><td>${m.log_loss.toFixed(3)}</td></tr>`).join("") + "</table>"
+      : "";
     box.innerHTML =
       `<div class="rcstat"><b>${r.winners_called}/${r.scored}</b> winners called (${(r.accuracy * 100).toFixed(0)}%)
         · Brier <b>${r.brier.toFixed(3)}</b> <span class="meta">vs ${r.baseline_brier.toFixed(3)} baseline</span>
         · log-loss ${r.log_loss.toFixed(3)}</div>` +
+      h2hTable +
       (r.best_calls.length ? `<h3>Best calls</h3>${r.best_calls.map(call).join("")}` : "") +
       (r.worst_calls.length ? `<h3>Biggest misses</h3>${r.worst_calls.map(call).join("")}` : "");
   }
