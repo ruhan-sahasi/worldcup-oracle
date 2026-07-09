@@ -115,6 +115,15 @@ sum to one. This is a genuinely distinct model (a different family, a different 
 different inference) offered *alongside* the goal-model ensemble, not folded into it - two
 independent reads on the same tournament.
 
+Deep in the tournament that DP runs over the **real, current bracket**. The live engine
+**materializes each knockout round as it is decided** - the Round of 32 the moment the group stage
+finishes, then the Round of 16, quarters, semis and final each time the round beneath it is fully
+played, pairing the adjacent winners up the bracket (a level tie resolves the way the simulator's
+shootout does). The champion DP then starts from the **deepest round that exists**: a decided tie
+enters as a point mass on its winner, an undecided one as the pairwise advance split. So the second
+model's live champion odds condition on the knockout results already played and project only what
+remains, and eliminated teams correctly carry zero title probability.
+
 ## Evaluation philosophy
 
 Skill is the point, so it is measured carefully:

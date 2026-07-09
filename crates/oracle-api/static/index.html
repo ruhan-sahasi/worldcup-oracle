@@ -108,6 +108,12 @@
       <div id="report"><div class="empty">Loading…</div></div>
     </section>
 
+    <section class="panel">
+      <h2>Second model · live title odds</h2>
+      <div id="btchamps"><div class="empty">Materializes once the knockout bracket is set.</div></div>
+      <div class="legend"><span>Bradley-Terry over the current bracket, conditioning on ties already decided</span></div>
+    </section>
+
     <section class="panel full">
       <h2>Championship probability over time</h2>
       <canvas id="chart" width="1120" height="220"></canvas>
@@ -294,6 +300,23 @@
       (r.worst_calls.length ? `<h3>Biggest misses</h3>${r.worst_calls.map(call).join("")}` : "");
   }
 
+  async function refreshBtChampions() {
+    let rows; try { rows = await (await fetch("/bt/champions")).json(); } catch { return; }
+    const box = el("btchamps");
+    if (!rows || rows.length === 0) {
+      box.innerHTML = '<div class="empty">Materializes once the knockout bracket is set.</div>';
+      return;
+    }
+    const top = rows.slice(0, 12);
+    const max = Math.max(...top.map(t => t.champion), 1e-6);
+    box.innerHTML = top.map((t) => `
+      <div class="odds-row">
+        <span class="name">${esc(t.team)}</span>
+        <span class="odds-bar"><span style="width:${100 * t.champion / max}%"></span></span>
+        <span class="pct">${pct(t.champion)}</span>
+      </div>`).join("");
+  }
+
   function connect() {
     const proto = location.protocol === "https:" ? "wss" : "ws";
     const ws = new WebSocket(`${proto}://${location.host}/live`);
@@ -311,7 +334,8 @@
   connect();
   refreshUpsets();
   refreshReport();
-  setInterval(() => { refreshUpsets(); refreshReport(); }, 20000);
+  refreshBtChampions();
+  setInterval(() => { refreshUpsets(); refreshReport(); refreshBtChampions(); }, 20000);
 })();
 </script>
 </body>

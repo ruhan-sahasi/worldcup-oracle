@@ -291,7 +291,8 @@ team and confederation ratings. The current matchup lives in the URL, so any pre
 | `GET` | `/api/predict?home=&away=` | on-demand forecast for **any** matchup (+ optional odds) |
 | `GET` | `/api/posterior?home=&away=` | HMC posterior **credible intervals** for a matchup |
 | `GET` | `/api/bt?home=&away=` | **second model** (Bradley-Terry-Davidson) win/draw/loss |
-| `GET` | `/api/bt/champions` | second model's **champion odds** (exact bracket DP) |
+| `GET` | `/api/bt/champions` | second model's **champion odds** over its projected bracket (exact DP) |
+| `GET` | `/bt/champions` | second model's **live** champion odds over the current bracket, conditioning on ties already decided |
 | `GET` | `/api/simulate?iters=&seed=` | custom Monte-Carlo champion-odds run |
 | `GET` | `/api/sensitivity?iters=&seed=` | per-signal ablation: how much each signal moves the title |
 | `GET` | `/api/ratings` | team ratings + confederation strength levels |

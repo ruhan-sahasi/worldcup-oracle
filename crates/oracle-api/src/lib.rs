@@ -21,6 +21,7 @@
 //! | GET | `/predict/tournament` | live champion-odds table |
 //! | GET | `/upsets` | fan upset radar: upcoming shock-ripe matches + biggest shocks so far |
 //! | GET | `/report` | the model's self-scored report card on its own pre-match calls |
+//! | GET | `/bt/champions` | second model's live champion odds over the current knockout bracket |
 //! | GET | `/api/predict?home=&away=` | on-demand matchup forecast (any two teams) |
 //! | GET | `/api/explain?home=&away=` | factor attribution: why the model favours a side |
 //! | GET | `/api/bt?home=&away=` | second model (Bradley-Terry-Davidson) win/draw/loss |
@@ -113,6 +114,7 @@ pub fn router(engine: Arc<Engine>, explorer: ExplorerSlot) -> Router {
         .route("/predict/tournament", get(predict_tournament))
         .route("/upsets", get(upsets))
         .route("/report", get(report))
+        .route("/bt/champions", get(bt_champions))
         .route("/api/team", get(team_hub))
         // On-demand model queries (any matchup, posterior, custom simulation, ratings).
         .route("/api/predict", get(api_predict))
@@ -199,7 +201,8 @@ async fn api_info(
         "endpoints": [
             "/ (live dashboard)", "/explore (model explorer)", "/team (fan team hub)",
             "/card (shareable prediction card)", "/health", "/teams", "/matches",
-            "/predict/match/{id}", "/predict/tournament", "/upsets", "/report", "/api/team?q=",
+            "/predict/match/{id}", "/predict/tournament", "/upsets", "/report", "/bt/champions",
+            "/api/team?q=",
             "/api/predict?home=&away=", "/api/explain?home=&away=", "/api/posterior?home=&away=",
             "/api/bt?home=&away=", "/api/bt/champions",
             "/api/simulate?iters=&seed=", "/api/sensitivity?iters=&seed=",
@@ -521,6 +524,13 @@ async fn upsets(State(engine): State<Arc<Engine>>) -> Json<UpsetBoard> {
 /// The model's self-scored report card on its own pre-match calls (from the live snapshot).
 async fn report(State(engine): State<Arc<Engine>>) -> Json<ReportCard> {
     Json(engine.snapshot().report_card.clone())
+}
+
+/// The second model's (Bradley-Terry) live champion odds over the current knockout bracket, from the
+/// running tournament. Conditions on the knockout ties already decided; empty until the Round of 32
+/// is materialized. Distinct from `/api/bt/champions`, which is the explorer's static projection.
+async fn bt_champions(State(engine): State<Arc<Engine>>) -> Json<Vec<oracle_engine::BtChampion>> {
+    Json(engine.snapshot().bt_champions.clone())
 }
 
 #[derive(Deserialize)]
@@ -1057,6 +1067,11 @@ mod tests {
         let rc = json(&body);
         assert!(rc["scored"].is_number() && rc["brier"].is_number());
         assert!(rc["best_calls"].is_array() && rc["worst_calls"].is_array());
+
+        // The second model's live champion odds are an array (empty before the bracket is set).
+        let (status, body) = get(&state, "/bt/champions").await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(json(&body).is_array());
 
         let (status, body) = get(&state, "/api/team?q=Brazil").await;
         assert_eq!(status, StatusCode::OK);

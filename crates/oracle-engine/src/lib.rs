@@ -28,14 +28,14 @@ mod snapshot;
 pub use event_log::EventLog;
 pub use query::{signal_sensitivity, Explorer, SignalContribution};
 pub use snapshot::{
-    AdaptiveState, Call, MatchPrediction, Metrics, ModelScore, RatingEntry, ReportCard, Snapshot,
-    Upset, WinProbSample,
+    AdaptiveState, BtChampion, Call, MatchPrediction, Metrics, ModelScore, RatingEntry, ReportCard,
+    Snapshot, Upset, WinProbSample,
 };
 
 use arc_swap::ArcSwap;
 use oracle_domain::{
-    EventKind, MatchEvent, MatchId, MatchStatus, Outcome, Probabilities, Scoreline, TeamId,
-    Tournament,
+    EventKind, Match, MatchEvent, MatchId, MatchStatus, Outcome, Probabilities, Scoreline, Stage,
+    TeamId, Tournament,
 };
 use oracle_ingest::DataProvider;
 use oracle_model::{
@@ -745,22 +745,152 @@ impl EngineState {
     /// the group stage is unfinished, or the tournament is not the 2026 shape (see
     /// [`oracle_ingest::data::materialize_knockout`]).
     fn materialize_knockout_if_ready(&mut self) {
-        let ko = oracle_ingest::data::materialize_knockout(&self.tournament);
-        if ko.is_empty() {
-            return;
+        // Round of 32, derived from the completed group stage.
+        let r32 = oracle_ingest::data::materialize_knockout(&self.tournament);
+        if !r32.is_empty() {
+            tracing::info!(
+                fixtures = r32.len(),
+                "group stage complete - materialized the Round of 32"
+            );
+            self.append_fixtures(r32);
         }
-        tracing::info!(
-            fixtures = ko.len(),
-            "group stage complete - materialized the knockout bracket"
-        );
+        // Then each subsequent round, once the prior one is fully decided. This only fires when the
+        // bracket was derived here and its ties get played; a provider that supplies the full
+        // bracket up front leaves it a no-op (the next round already exists).
+        self.materialize_next_knockout_round();
+    }
+
+    /// Append fixtures to the live tournament, re-index them, and refresh the per-match context and
+    /// style adjustments so they cover the new fixtures.
+    fn append_fixtures(&mut self, fixtures: Vec<Match>) {
         let start = self.tournament.matches.len();
-        self.tournament.matches.extend(ko);
+        self.tournament.matches.extend(fixtures);
         for i in start..self.tournament.matches.len() {
             self.match_index.insert(self.tournament.matches[i].id, i);
         }
-        // Match context + style matchup now cover the knockout fixtures too.
         self.context_adj = oracle_ingest::data::venue_adjustments(&self.tournament);
         self.style_adj = oracle_ingest::data::style_adjustments(&self.tournament);
+    }
+
+    /// Materialize the next knockout round once the current one is fully decided: pair the adjacent
+    /// ties' winners up the bracket (the Round-of-32 fixtures are stored in bracket order, so
+    /// adjacent ties feed one next-round tie). A level tie resolves to the home side, matching the
+    /// simulator's documented penalty-shootout rule. One round per call.
+    fn materialize_next_knockout_round(&mut self) {
+        const PATH: [Stage; 5] = [
+            Stage::RoundOf32,
+            Stage::RoundOf16,
+            Stage::QuarterFinal,
+            Stage::SemiFinal,
+            Stage::Final,
+        ];
+        for w in PATH.windows(2) {
+            let (cur, next) = (w[0], w[1]);
+            let ties: Vec<(TeamId, TeamId, Scoreline, bool)> = self
+                .tournament
+                .matches
+                .iter()
+                .filter(|m| m.stage == cur)
+                .map(|m| (m.home, m.away, m.score, m.is_finished()))
+                .collect();
+            let next_exists = self.tournament.matches.iter().any(|m| m.stage == next);
+            if ties.len() < 2 || next_exists || !ties.iter().all(|(_, _, _, fin)| *fin) {
+                continue;
+            }
+            let winners: Vec<TeamId> = ties
+                .iter()
+                .map(|(h, a, s, _)| if s.away > s.home { *a } else { *h })
+                .collect();
+            let base_id = self
+                .tournament
+                .matches
+                .iter()
+                .map(|m| m.id.0)
+                .max()
+                .unwrap_or(0);
+            let last_kickoff = self
+                .tournament
+                .matches
+                .iter()
+                .map(|m| m.kickoff)
+                .max()
+                .unwrap_or_else(chrono::Utc::now);
+            let fixtures: Vec<Match> = winners
+                .chunks(2)
+                .enumerate()
+                .filter(|(_, pair)| pair.len() == 2)
+                .map(|(i, pair)| Match {
+                    id: MatchId(base_id + 1 + i as u32),
+                    home: pair[0],
+                    away: pair[1],
+                    stage: next,
+                    kickoff: last_kickoff + chrono::Duration::hours(24 + (i as i64) * 3),
+                    status: MatchStatus::Scheduled,
+                    score: Scoreline::new(0, 0),
+                })
+                .collect();
+            if fixtures.is_empty() {
+                continue;
+            }
+            tracing::info!(round = %next, fixtures = fixtures.len(), "knockout round decided - materialized the next round");
+            self.append_fixtures(fixtures);
+            break;
+        }
+    }
+
+    /// The second model's live champion odds over the current knockout bracket: run the bracket
+    /// dynamic program from the deepest materialized round (a decided tie enters as its winner, an
+    /// undecided tie as the Bradley-Terry advance split), so it conditions on knockout results
+    /// already played and projects the rest. Empty until the Round of 32 is materialized.
+    fn bt_champions(&self) -> Vec<BtChampion> {
+        const PATH: [Stage; 5] = [
+            Stage::RoundOf32,
+            Stage::RoundOf16,
+            Stage::QuarterFinal,
+            Stage::SemiFinal,
+            Stage::Final,
+        ];
+        let Some(&stage) = PATH
+            .iter()
+            .rev()
+            .find(|s| self.tournament.matches.iter().any(|m| m.stage == **s))
+        else {
+            return Vec::new();
+        };
+        let layer: Vec<HashMap<TeamId, f64>> = self
+            .tournament
+            .matches
+            .iter()
+            .filter(|m| m.stage == stage)
+            .map(|m| {
+                let mut d = HashMap::new();
+                if m.is_finished() {
+                    let winner = if m.score.away > m.score.home {
+                        m.away
+                    } else {
+                        m.home
+                    };
+                    d.insert(winner, 1.0);
+                } else {
+                    let p = self.bradley_terry.advance_probability(m.home, m.away);
+                    d.insert(m.home, p);
+                    d.insert(m.away, 1.0 - p);
+                }
+                d
+            })
+            .collect();
+        if layer.is_empty() {
+            return Vec::new();
+        }
+        crate::query::champion_odds_from_layer(layer, |a, b| {
+            self.bradley_terry.advance_probability(a, b)
+        })
+        .into_iter()
+        .map(|(team, champion)| BtChampion {
+            team: self.name_of(team),
+            champion,
+        })
+        .collect()
     }
 
     /// The team's next unplayed match by kickoff (where a suspension would be served).
@@ -1108,6 +1238,7 @@ impl EngineState {
             },
             shocks: self.biggest_shocks(8),
             report_card: self.report_card(),
+            bt_champions: self.bt_champions(),
         }
     }
 
@@ -1292,6 +1423,12 @@ mod tests {
         EngineState::new(data::world_cup_2026(), deps)
     }
 
+    fn fresh_state_bt() -> EngineState {
+        let deps = EngineDeps::new(Arc::new(SimProvider::new()))
+            .with_bradley_terry(data::fit_bradley_terry(7));
+        EngineState::new(data::world_cup_2026(), deps)
+    }
+
     fn state_with_lr(lr: f64) -> EngineState {
         let deps = EngineDeps::new(Arc::new(SimProvider::new()))
             .with_model(data::fit_baseline_model(7))
@@ -1411,6 +1548,81 @@ mod tests {
         state.recompute_forecast();
         let total: f64 = state.last_forecast.teams.iter().map(|t| t.p_champion).sum();
         assert!((total - 1.0).abs() < 0.05, "champion mass = {total}");
+    }
+
+    #[test]
+    fn knockout_rounds_materialize_round_by_round_and_drive_bt_champions() {
+        let mut state = fresh_state_bt();
+        let metrics = Metrics::default();
+
+        // Before the group stage finishes there is no bracket, so the second model publishes no
+        // live champion odds.
+        assert!(state.bt_champions().is_empty());
+
+        // Finish a set of ties decisively: the lower-id (stronger seed) side wins, matching the
+        // engine's level-tie-goes-to-home materialization rule.
+        let finish = |state: &mut EngineState, ties: &[(MatchId, TeamId, TeamId)]| {
+            for &(id, home, away) in ties {
+                let score = if home.0 < away.0 {
+                    Scoreline::new(2, 0)
+                } else {
+                    Scoreline::new(0, 2)
+                };
+                state.apply_event(
+                    &MatchEvent::new(id, 90, EventKind::FullTime { score }),
+                    &metrics,
+                );
+            }
+        };
+        let ties_of = |state: &EngineState, stage: Stage| -> Vec<(MatchId, TeamId, TeamId)> {
+            state
+                .tournament
+                .matches
+                .iter()
+                .filter(|m| m.stage == stage)
+                .map(|m| (m.id, m.home, m.away))
+                .collect()
+        };
+
+        let groups: Vec<(MatchId, TeamId, TeamId)> = state
+            .tournament
+            .matches
+            .iter()
+            .filter(|m| matches!(m.stage, Stage::Group(_)))
+            .map(|m| (m.id, m.home, m.away))
+            .collect();
+        finish(&mut state, &groups);
+
+        // The Round of 32 is materialized, so the live champion odds now span all 32 bracket teams
+        // and are a proper distribution.
+        let r32 = ties_of(&state, Stage::RoundOf32);
+        assert_eq!(r32.len(), 16, "16 Round-of-32 fixtures materialized");
+        let champs = state.bt_champions();
+        assert_eq!(champs.len(), 32, "all 32 bracket teams carry title odds");
+        let total: f64 = champs.iter().map(|c| c.champion).sum();
+        assert!((total - 1.0).abs() < 1e-6, "champion mass = {total}");
+
+        // Finish the whole Round of 32; note who goes out.
+        let eliminated: Vec<String> = r32
+            .iter()
+            .map(|&(_, h, a)| state.name_of(if h.0 < a.0 { a } else { h }))
+            .collect();
+        finish(&mut state, &r32);
+
+        // The Round of 16 is now materialized off the winners, and the live odds condition on it:
+        // only the 16 survivors carry title probability, and the eliminated sides are gone.
+        let r16 = ties_of(&state, Stage::RoundOf16);
+        assert_eq!(r16.len(), 8, "8 Round-of-16 fixtures materialized");
+        let champs = state.bt_champions();
+        assert_eq!(champs.len(), 16, "only the 16 survivors carry title odds");
+        let total: f64 = champs.iter().map(|c| c.champion).sum();
+        assert!((total - 1.0).abs() < 1e-6, "champion mass = {total}");
+        for name in &eliminated {
+            assert!(
+                !champs.iter().any(|c| &c.team == name),
+                "eliminated team {name} should carry no title odds"
+            );
+        }
     }
 
     fn state_with_threshold(threshold: u8) -> EngineState {

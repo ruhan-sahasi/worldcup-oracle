@@ -145,6 +145,17 @@ pub struct Snapshot {
     pub shocks: Vec<Upset>,
     /// The model's self-scored report card on its own pre-match calls so far.
     pub report_card: ReportCard,
+    /// The second model's (Bradley-Terry) live champion odds over the current knockout bracket,
+    /// conditioning on knockout results already played. Empty until the bracket is materialized.
+    pub bt_champions: Vec<BtChampion>,
+}
+
+/// One team's live champion probability from the second model (Bradley-Terry) over the current
+/// knockout bracket.
+#[derive(Debug, Clone, Serialize)]
+pub struct BtChampion {
+    pub team: String,
+    pub champion: f64,
 }
 
 impl Snapshot {

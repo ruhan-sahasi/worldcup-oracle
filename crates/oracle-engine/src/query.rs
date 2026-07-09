@@ -829,7 +829,7 @@ fn bracket_champion_odds(
     leaves: &[TeamId],
     advance: impl Fn(TeamId, TeamId) -> f64,
 ) -> Vec<(TeamId, f64)> {
-    let mut layer: Vec<HashMap<TeamId, f64>> = leaves
+    let layer: Vec<HashMap<TeamId, f64>> = leaves
         .iter()
         .map(|&t| {
             let mut m = HashMap::new();
@@ -837,6 +837,17 @@ fn bracket_champion_odds(
             m
         })
         .collect();
+    champion_odds_from_layer(layer, advance)
+}
+
+/// The dynamic program's core: merge a starting `layer` (one probability distribution per bracket
+/// node, in bracket order) bottom-up into champion odds. A finished tie enters as a point mass on
+/// its winner; an unfinished tie as the pairwise advance split - so the same DP conditions on
+/// results already played and projects the rest. Champion probabilities sum to 1.
+pub(crate) fn champion_odds_from_layer(
+    mut layer: Vec<HashMap<TeamId, f64>>,
+    advance: impl Fn(TeamId, TeamId) -> f64,
+) -> Vec<(TeamId, f64)> {
     while layer.len() > 1 {
         let mut next: Vec<HashMap<TeamId, f64>> = Vec::with_capacity(layer.len() / 2);
         let mut k = 0;
