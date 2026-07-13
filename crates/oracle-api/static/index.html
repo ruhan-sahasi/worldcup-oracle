@@ -114,6 +114,11 @@
       <div class="legend"><span>Bradley-Terry over the current bracket, conditioning on ties already decided</span></div>
     </section>
 
+    <section class="panel">
+      <h2>Consensus · where the two models agree</h2>
+      <div id="consensus"><div class="empty">Materializes once the knockout bracket is set.</div></div>
+    </section>
+
     <section class="panel full">
       <h2>Championship probability over time</h2>
       <canvas id="chart" width="1120" height="220"></canvas>
@@ -317,6 +322,35 @@
       </div>`).join("");
   }
 
+  async function refreshConsensus() {
+    let c; try { c = await (await fetch("/consensus")).json(); } catch { return; }
+    const box = el("consensus");
+    if (!c.teams || c.teams.length === 0) {
+      box.innerHTML = '<div class="empty">Materializes once the knockout bracket is set.</div>';
+      return;
+    }
+    // Jensen-Shannon divergence in bits [0, 1]: 0 = identical, higher = more disagreement.
+    const jsd = c.jsd;
+    const mood = jsd < 0.02 ? "the two models agree closely"
+               : jsd < 0.08 ? "the two models mostly agree"
+               : jsd < 0.2  ? "the two models diverge noticeably"
+               : "the two models disagree sharply";
+    const top = c.teams.slice(0, 10);
+    const max = Math.max(...top.map(t => t.consensus), 1e-6);
+    const rows = top.map((t) => {
+      const d = t.delta;
+      const tag = Math.abs(d) < 0.005 ? ""
+        : `<span class="meta" style="color:${d > 0 ? 'var(--away)' : 'var(--home)'}">${d > 0 ? "BT +" : "DC +"}${Math.abs(d * 100).toFixed(1)}pt</span>`;
+      return `<div class="odds-row">
+        <span class="name">${esc(t.team)}</span>
+        <span class="odds-bar"><span style="width:${100 * t.consensus / max}%"></span></span>
+        <span class="pct">${pct(t.consensus)} ${tag}</span>
+      </div>`;
+    }).join("");
+    box.innerHTML =
+      `<div class="rcstat">divergence <b>${jsd.toFixed(3)}</b> <span class="meta">JSD in bits · ${mood}</span></div>` + rows;
+  }
+
   function connect() {
     const proto = location.protocol === "https:" ? "wss" : "ws";
     const ws = new WebSocket(`${proto}://${location.host}/live`);
@@ -335,7 +369,8 @@
   refreshUpsets();
   refreshReport();
   refreshBtChampions();
-  setInterval(() => { refreshUpsets(); refreshReport(); refreshBtChampions(); }, 20000);
+  refreshConsensus();
+  setInterval(() => { refreshUpsets(); refreshReport(); refreshBtChampions(); refreshConsensus(); }, 20000);
 })();
 </script>
 </body>

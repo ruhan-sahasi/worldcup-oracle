@@ -124,6 +124,14 @@ enters as a point mass on its winner, an undecided one as the pairwise advance s
 model's live champion odds condition on the knockout results already played and project only what
 remains, and eliminated teams correctly carry zero title probability.
 
+With two independent title forecasts live, the engine also publishes a **consensus**: a plain 50/50
+average of the two champion distributions (model averaging tends to be better calibrated than either
+input), alongside a single measure of how far the two disagree right now, the **Jensen-Shannon
+divergence** between them (in bits, bounded `[0, 1]`; zero when the two models are identical). The
+per-team gap `bradley_terry - ensemble` then shows exactly *which* contenders the two models see
+differently. This is deliberately honest: rather than hide the second model inside a blend, it keeps
+both reads visible and quantifies their disagreement as a live uncertainty signal.
+
 ## Evaluation philosophy
 
 Skill is the point, so it is measured carefully:

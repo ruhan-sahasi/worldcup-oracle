@@ -28,8 +28,8 @@ mod snapshot;
 pub use event_log::EventLog;
 pub use query::{signal_sensitivity, Explorer, SignalContribution};
 pub use snapshot::{
-    AdaptiveState, BtChampion, Call, MatchPrediction, Metrics, ModelScore, RatingEntry, ReportCard,
-    Snapshot, Upset, WinProbSample,
+    AdaptiveState, BtChampion, Call, Consensus, ConsensusTeam, MatchPrediction, Metrics,
+    ModelScore, RatingEntry, ReportCard, Snapshot, Upset, WinProbSample,
 };
 
 use arc_swap::ArcSwap;
@@ -843,6 +843,19 @@ impl EngineState {
     /// undecided tie as the Bradley-Terry advance split), so it conditions on knockout results
     /// already played and projects the rest. Empty until the Round of 32 is materialized.
     fn bt_champions(&self) -> Vec<BtChampion> {
+        self.bt_champion_odds_by_team()
+            .into_iter()
+            .map(|(team, champion)| BtChampion {
+                team: self.name_of(team),
+                champion,
+            })
+            .collect()
+    }
+
+    /// The raw Bradley-Terry champion odds keyed by team id (what [`Self::bt_champions`] renders and
+    /// what [`Self::consensus`] aligns against the goal-model forecast). Empty until the bracket is
+    /// materialized.
+    fn bt_champion_odds_by_team(&self) -> Vec<(TeamId, f64)> {
         const PATH: [Stage; 5] = [
             Stage::RoundOf32,
             Stage::RoundOf16,
@@ -885,12 +898,68 @@ impl EngineState {
         crate::query::champion_odds_from_layer(layer, |a, b| {
             self.bradley_terry.advance_probability(a, b)
         })
-        .into_iter()
-        .map(|(team, champion)| BtChampion {
-            team: self.name_of(team),
-            champion,
-        })
-        .collect()
+    }
+
+    /// A consensus title forecast from the two independent models: the goal-model Monte-Carlo
+    /// forecast and the Bradley-Terry bracket dynamic program. The consensus is a plain 50/50 average
+    /// of the two champion distributions (both already condition on the live bracket), and `jsd` is
+    /// the Jensen-Shannon divergence between them in bits `[0, 1]` - a single honest measure of how
+    /// far the two models disagree right now. Empty until the bracket is materialized.
+    fn consensus(&self) -> Consensus {
+        let bt: HashMap<TeamId, f64> = self.bt_champion_odds_by_team().into_iter().collect();
+        if bt.is_empty() {
+            return Consensus {
+                jsd: 0.0,
+                teams: Vec::new(),
+            };
+        }
+        let ens: HashMap<TeamId, f64> = self
+            .last_forecast
+            .teams
+            .iter()
+            .map(|t| (t.team, t.p_champion))
+            .collect();
+        let ids: std::collections::HashSet<TeamId> = ens.keys().chain(bt.keys()).copied().collect();
+        // Jensen-Shannon divergence between the two champion distributions (log base 2, so bounded
+        // in [0, 1]). KL terms vanish wherever a distribution puts no mass.
+        let m = |id: TeamId| {
+            0.5 * (ens.get(&id).copied().unwrap_or(0.0) + bt.get(&id).copied().unwrap_or(0.0))
+        };
+        let kl = |a: &HashMap<TeamId, f64>| -> f64 {
+            ids.iter()
+                .map(|&id| {
+                    let ai = a.get(&id).copied().unwrap_or(0.0);
+                    let mi = m(id);
+                    if ai > 0.0 && mi > 0.0 {
+                        ai * (ai / mi).log2()
+                    } else {
+                        0.0
+                    }
+                })
+                .sum()
+        };
+        let jsd = (0.5 * kl(&ens) + 0.5 * kl(&bt)).clamp(0.0, 1.0);
+        let mut teams: Vec<ConsensusTeam> = ids
+            .iter()
+            .map(|&id| {
+                let ensemble = ens.get(&id).copied().unwrap_or(0.0);
+                let bradley_terry = bt.get(&id).copied().unwrap_or(0.0);
+                ConsensusTeam {
+                    team: self.name_of(id),
+                    ensemble,
+                    bradley_terry,
+                    consensus: 0.5 * (ensemble + bradley_terry),
+                    delta: bradley_terry - ensemble,
+                }
+            })
+            .filter(|t| t.consensus > 0.0)
+            .collect();
+        teams.sort_by(|a, b| {
+            b.consensus
+                .partial_cmp(&a.consensus)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        Consensus { jsd, teams }
     }
 
     /// The team's next unplayed match by kickoff (where a suspension would be served).
@@ -1239,6 +1308,7 @@ impl EngineState {
             shocks: self.biggest_shocks(8),
             report_card: self.report_card(),
             bt_champions: self.bt_champions(),
+            consensus: self.consensus(),
         }
     }
 
@@ -1623,6 +1693,59 @@ mod tests {
                 "eliminated team {name} should carry no title odds"
             );
         }
+    }
+
+    #[test]
+    fn consensus_blends_the_two_models_and_measures_their_divergence() {
+        let mut state = fresh_state_bt();
+        let metrics = Metrics::default();
+
+        // No bracket yet, so there is nothing to reconcile: empty consensus, zero divergence.
+        let pre = state.consensus();
+        assert!(pre.teams.is_empty());
+        assert_eq!(pre.jsd, 0.0);
+
+        // Finish the group stage (lower id wins) so the Round of 32 materializes, then refresh the
+        // goal-model forecast so it conditions on the live bracket.
+        let groups: Vec<(MatchId, TeamId, TeamId)> = state
+            .tournament
+            .matches
+            .iter()
+            .filter(|m| matches!(m.stage, Stage::Group(_)))
+            .map(|m| (m.id, m.home, m.away))
+            .collect();
+        for (id, home, away) in groups {
+            let score = if home.0 < away.0 {
+                Scoreline::new(2, 0)
+            } else {
+                Scoreline::new(0, 2)
+            };
+            state.apply_event(
+                &MatchEvent::new(id, 90, EventKind::FullTime { score }),
+                &metrics,
+            );
+        }
+        state.recompute_forecast();
+
+        let c = state.consensus();
+        assert!(!c.teams.is_empty(), "consensus covers the bracket teams");
+        // Divergence is a Jensen-Shannon distance in bits: bounded, and non-trivial for two
+        // genuinely different models.
+        assert!((0.0..=1.0).contains(&c.jsd), "jsd in [0,1], got {}", c.jsd);
+        // The consensus is exactly the 50/50 average, the delta is the signed model gap, and the
+        // consensus mass is a proper distribution.
+        let mut total = 0.0;
+        for t in &c.teams {
+            assert!(
+                (t.consensus - 0.5 * (t.ensemble + t.bradley_terry)).abs() < 1e-9,
+                "consensus is the mean of the two models"
+            );
+            assert!((t.delta - (t.bradley_terry - t.ensemble)).abs() < 1e-9);
+            total += t.consensus;
+        }
+        assert!((total - 1.0).abs() < 1e-6, "consensus mass = {total}");
+        // Ranked by consensus, descending.
+        assert!(c.teams.windows(2).all(|w| w[0].consensus >= w[1].consensus));
     }
 
     fn state_with_threshold(threshold: u8) -> EngineState {

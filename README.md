@@ -52,6 +52,7 @@ fully offline with **zero keys and zero network**.
 | **Log-opinion-pool ensemble** (`[Dixon-Coles, Elo, State-space, Market]` weights + temperature **learned by out-of-fold stacking**, with the **market up-weighted for knockout ties**) | a single sharper forecast, anchored to the bookmaker when odds are present and leaning harder on the closing line in knockouts where it is sharpest; weights trained on leakage-free predictions over the whole dataset |
 | **Live recalibration** - as matches finish, their leak-free pre-match forecasts are scored against the results and a **temperature-scaling** correction is refit and applied to the remaining forecasts | the model recalibrates itself against the tournament as it plays, correcting any over/under-confidence the offline fit could not anticipate |
 | **Bradley-Terry-Davidson** - a **second, outcome-based model** (win/draw/loss from a per-team strength + a Davidson tie term), time-weighted so real results dominate deep in the tournament; its winner prediction is an **exact knockout bracket DP** | a genuinely different second opinion that leans on the growing result set, offered alongside the goal-model ensemble rather than folded into it |
+| **Consensus + live divergence** - a 50/50 blend of the two independent title forecasts, plus the **Jensen-Shannon divergence** between them and the per-team gap | one reconciled read, with an honest live measure of how far the two models disagree and on which contenders |
 | **Bayesian live updater** with **score effects** | conditions on score, minute, and red cards; a trailing team chases and a leading team defends |
 | **Lineup adjustment** | a confirmed XI shifts each team's attack and defense |
 | **Suspension tracking** | yellow-card accumulation drops a suspended starter from the next match before its lineup is known |
@@ -293,6 +294,7 @@ team and confederation ratings. The current matchup lives in the URL, so any pre
 | `GET` | `/api/bt?home=&away=` | **second model** (Bradley-Terry-Davidson) win/draw/loss |
 | `GET` | `/api/bt/champions` | second model's **champion odds** over its projected bracket (exact DP) |
 | `GET` | `/bt/champions` | second model's **live** champion odds over the current bracket, conditioning on ties already decided |
+| `GET` | `/consensus` | **consensus** title forecast blending both models + their live **divergence** (Jensen-Shannon) |
 | `GET` | `/api/simulate?iters=&seed=` | custom Monte-Carlo champion-odds run |
 | `GET` | `/api/sensitivity?iters=&seed=` | per-signal ablation: how much each signal moves the title |
 | `GET` | `/api/ratings` | team ratings + confederation strength levels |

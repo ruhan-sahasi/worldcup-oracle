@@ -148,6 +148,9 @@ pub struct Snapshot {
     /// The second model's (Bradley-Terry) live champion odds over the current knockout bracket,
     /// conditioning on knockout results already played. Empty until the bracket is materialized.
     pub bt_champions: Vec<BtChampion>,
+    /// A consensus title forecast blending the two models, with a live Jensen-Shannon divergence
+    /// measuring how far they disagree. Empty until the bracket is materialized.
+    pub consensus: Consensus,
 }
 
 /// One team's live champion probability from the second model (Bradley-Terry) over the current
@@ -156,6 +159,26 @@ pub struct Snapshot {
 pub struct BtChampion {
     pub team: String,
     pub champion: f64,
+}
+
+/// One team's line in the consensus title forecast: what each of the two models gives it, their
+/// 50/50 average, and the signed gap between them (`bradley_terry - ensemble`).
+#[derive(Debug, Clone, Serialize)]
+pub struct ConsensusTeam {
+    pub team: String,
+    pub ensemble: f64,
+    pub bradley_terry: f64,
+    pub consensus: f64,
+    pub delta: f64,
+}
+
+/// A consensus title forecast from the two independent models plus a single measure of how far they
+/// disagree. `jsd` is the Jensen-Shannon divergence between the two champion distributions in bits
+/// `[0, 1]` (0 = identical, higher = more disagreement). `teams` is the per-team consensus, ranked.
+#[derive(Debug, Clone, Serialize)]
+pub struct Consensus {
+    pub jsd: f64,
+    pub teams: Vec<ConsensusTeam>,
 }
 
 impl Snapshot {
