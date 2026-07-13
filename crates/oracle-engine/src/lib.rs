@@ -30,8 +30,8 @@ pub use oracle_model::ReliabilityReport;
 pub use query::{signal_sensitivity, Explorer, SignalContribution};
 pub use snapshot::{
     AdaptiveState, BtChampion, Call, Consensus, ConsensusTeam, FormLine, MatchPrediction, Metrics,
-    ModelScore, PowerRanking, PowerTeam, RatingEntry, ReportCard, Snapshot, TournamentForm, Upset,
-    WinProbSample,
+    ModelScore, PowerRanking, PowerTeam, RatingEntry, ReportCard, RoadBoard, RoadRound, RoadTeam,
+    Snapshot, TournamentForm, Upset, WinProbSample,
 };
 
 use arc_swap::ArcSwap;
@@ -854,24 +854,24 @@ impl EngineState {
             .collect()
     }
 
-    /// The raw Bradley-Terry champion odds keyed by team id (what [`Self::bt_champions`] renders and
-    /// what [`Self::consensus`] aligns against the goal-model forecast). Empty until the bracket is
-    /// materialized.
-    fn bt_champion_odds_by_team(&self) -> Vec<(TeamId, f64)> {
-        const PATH: [Stage; 5] = [
-            Stage::RoundOf32,
-            Stage::RoundOf16,
-            Stage::QuarterFinal,
-            Stage::SemiFinal,
-            Stage::Final,
-        ];
-        let Some(&stage) = PATH
+    /// The knockout path stages, in order, over which the Bradley-Terry bracket DP runs.
+    const KO_PATH: [Stage; 5] = [
+        Stage::RoundOf32,
+        Stage::RoundOf16,
+        Stage::QuarterFinal,
+        Stage::SemiFinal,
+        Stage::Final,
+    ];
+
+    /// The deepest materialized knockout round (the live "frontier"), as its index into
+    /// [`Self::KO_PATH`] plus, in bracket order, each tie's per-node distribution over which team
+    /// advances (a point mass on the winner if decided, else the Bradley-Terry advance split). None
+    /// until the Round of 32 is materialized.
+    fn bt_frontier(&self) -> Option<(usize, Vec<HashMap<TeamId, f64>>)> {
+        let idx = Self::KO_PATH
             .iter()
-            .rev()
-            .find(|s| self.tournament.matches.iter().any(|m| m.stage == **s))
-        else {
-            return Vec::new();
-        };
+            .rposition(|s| self.tournament.matches.iter().any(|m| m.stage == *s))?;
+        let stage = Self::KO_PATH[idx];
         let layer: Vec<HashMap<TeamId, f64>> = self
             .tournament
             .matches
@@ -894,12 +894,92 @@ impl EngineState {
                 d
             })
             .collect();
-        if layer.is_empty() {
+        (!layer.is_empty()).then_some((idx, layer))
+    }
+
+    /// The raw Bradley-Terry champion odds keyed by team id (what [`Self::bt_champions`] renders and
+    /// what [`Self::consensus`] aligns against the goal-model forecast). Empty until the bracket is
+    /// materialized.
+    fn bt_champion_odds_by_team(&self) -> Vec<(TeamId, f64)> {
+        let Some((_, layer)) = self.bt_frontier() else {
             return Vec::new();
-        }
+        };
         crate::query::champion_odds_from_layer(layer, |a, b| {
             self.bradley_terry.advance_probability(a, b)
         })
+    }
+
+    /// Each surviving contender's "road to the final": for every round it has yet to play, the
+    /// probability-weighted strength of the opponent it would face and that round's single most
+    /// likely opponent. The opponent for round `k` is the winner of the sibling sub-bracket of size
+    /// `2^(k-1)` frontier ties, whose win distribution comes from the same bracket DP that yields
+    /// champion odds; expected strength weights each possible opponent's Elo by its chance of getting
+    /// there. Every frontier team faces the same number of remaining rounds, so `difficulty` (the
+    /// mean expected opponent Elo) is comparable across teams. Empty until the bracket is set.
+    fn road_to_final(&self) -> RoadBoard {
+        let Some((idx, layer)) = self.bt_frontier() else {
+            return RoadBoard::default();
+        };
+        let n = layer.len();
+        let advance = |a: TeamId, b: TeamId| self.bradley_terry.advance_probability(a, b);
+        let champ: HashMap<TeamId, f64> =
+            crate::query::champion_odds_from_layer(layer.clone(), advance)
+                .into_iter()
+                .collect();
+
+        // Every team still alive in the frontier (a decided tie contributes only its winner).
+        let mut alive: Vec<(TeamId, usize)> = Vec::new();
+        for (node, dist) in layer.iter().enumerate() {
+            for (&team, &p) in dist {
+                if p > 0.0 {
+                    alive.push((team, node));
+                }
+            }
+        }
+
+        let mut teams: Vec<RoadTeam> = alive
+            .into_iter()
+            .map(|(team, pos)| {
+                let mut rounds = Vec::new();
+                let mut k = 1;
+                while (1usize << k) <= n {
+                    let block = 1usize << (k - 1);
+                    let opp_start = ((pos >> (k - 1)) ^ 1) * block;
+                    let slice = layer[opp_start..opp_start + block].to_vec();
+                    let opp = crate::query::champion_odds_from_layer(slice, advance);
+                    let expected_opponent_elo =
+                        opp.iter().map(|(o, p)| p * self.ratings.rating(*o)).sum();
+                    let likely_opponent = opp
+                        .first()
+                        .map(|(o, _)| self.name_of(*o))
+                        .unwrap_or_default();
+                    rounds.push(RoadRound {
+                        stage: Self::KO_PATH[idx + k].to_string(),
+                        expected_opponent_elo,
+                        likely_opponent,
+                    });
+                    k += 1;
+                }
+                let difficulty = if rounds.is_empty() {
+                    0.0
+                } else {
+                    rounds.iter().map(|r| r.expected_opponent_elo).sum::<f64>()
+                        / rounds.len() as f64
+                };
+                RoadTeam {
+                    team: self.name_of(team),
+                    champion: champ.get(&team).copied().unwrap_or(0.0),
+                    difficulty,
+                    rounds,
+                }
+            })
+            .collect();
+        teams.sort_by(|a, b| {
+            b.champion
+                .partial_cmp(&a.champion)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        RoadBoard { teams }
     }
 
     /// A consensus title forecast from the two independent models: the goal-model Monte-Carlo
@@ -1314,6 +1394,7 @@ impl EngineState {
             reliability: self.reliability_curve(),
             power_ranking: self.power_ranking(),
             form: self.tournament_form(),
+            road: self.road_to_final(),
         }
     }
 
@@ -2033,6 +2114,81 @@ mod tests {
         // Risers are ordered by the biggest climb first; fallers by the biggest drop first.
         assert!(form.risers.windows(2).all(|w| w[0].delta >= w[1].delta));
         assert!(form.fallers.windows(2).all(|w| w[0].delta <= w[1].delta));
+    }
+
+    #[test]
+    fn road_to_final_lays_out_each_contenders_remaining_path() {
+        let mut state = fresh_state_bt();
+        let metrics = Metrics::default();
+
+        // No bracket yet: no road.
+        assert!(state.road_to_final().teams.is_empty());
+
+        // Finish the group stage so the Round of 32 materializes.
+        let groups: Vec<(MatchId, TeamId, TeamId)> = state
+            .tournament
+            .matches
+            .iter()
+            .filter(|m| matches!(m.stage, Stage::Group(_)))
+            .map(|m| (m.id, m.home, m.away))
+            .collect();
+        for (id, home, away) in groups {
+            let score = if home.0 < away.0 {
+                Scoreline::new(2, 0)
+            } else {
+                Scoreline::new(0, 2)
+            };
+            state.apply_event(
+                &MatchEvent::new(id, 90, EventKind::FullTime { score }),
+                &metrics,
+            );
+        }
+
+        let road = state.road_to_final();
+        // All 32 bracket teams are alive (every Round-of-32 tie is undecided).
+        assert_eq!(road.teams.len(), 32);
+        // Championship mass across the contenders is a proper distribution.
+        let champ_sum: f64 = road.teams.iter().map(|t| t.champion).sum();
+        assert!(
+            (champ_sum - 1.0).abs() < 1e-6,
+            "champion mass = {champ_sum}"
+        );
+        // Ranked by championship probability.
+        assert!(road
+            .teams
+            .windows(2)
+            .all(|w| w[0].champion >= w[1].champion));
+        // The Elo band the expected opponent strengths must fall inside.
+        let elos: Vec<f64> = state
+            .tournament
+            .teams
+            .iter()
+            .map(|t| state.ratings.rating(t.id))
+            .collect();
+        let (lo, hi) = (
+            elos.iter().cloned().fold(f64::INFINITY, f64::min),
+            elos.iter().cloned().fold(f64::NEG_INFINITY, f64::max),
+        );
+        for t in &road.teams {
+            // From the Round of 32 there are four rounds left (R16, QF, SF, final).
+            assert_eq!(t.rounds.len(), 4, "{} should have four rounds left", t.team);
+            for r in &t.rounds {
+                assert!(!r.likely_opponent.is_empty());
+                assert!(
+                    r.expected_opponent_elo >= lo - 1e-6 && r.expected_opponent_elo <= hi + 1e-6,
+                    "expected opponent Elo {} outside [{lo}, {hi}]",
+                    r.expected_opponent_elo
+                );
+            }
+            // Difficulty is exactly the mean of the per-round expected strengths.
+            let mean = t
+                .rounds
+                .iter()
+                .map(|r| r.expected_opponent_elo)
+                .sum::<f64>()
+                / 4.0;
+            assert!((t.difficulty - mean).abs() < 1e-9);
+        }
     }
 
     fn state_with_threshold(threshold: u8) -> EngineState {

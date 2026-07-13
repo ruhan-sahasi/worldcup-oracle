@@ -56,6 +56,7 @@ fully offline with **zero keys and zero network**.
 | **Live reliability curve + ECE** - the model's leak-free pre-match calls binned by predicted probability against how often they came true, with the **expected calibration error** | honest, visible accountability: is a 70% call right about 70% of the time, right now, as the tournament plays |
 | **Massey power ranking** - a **least-squares** rating solved from every goal margin at once over *this tournament's results only*, with an offense/defense split | a prior-free, strength-of-schedule-adjusted read on who has actually been strongest here, a different method (linear algebra) than the game-by-game raters |
 | **Risers and fallers** - each team's live power-ranking place against its pre-tournament seeding | who has most over- or under-performed expectations, straight from the gap between the prior and the prior-free ranking |
+| **Road to the final** - each contender's remaining path, with the probability-weighted strength of the opponent it would face each round (from the same bracket DP) | who has the easiest or hardest road left, computed exactly rather than sampled |
 | **Bayesian live updater** with **score effects** | conditions on score, minute, and red cards; a trailing team chases and a leading team defends |
 | **Lineup adjustment** | a confirmed XI shifts each team's attack and defense |
 | **Suspension tracking** | yellow-card accumulation drops a suspended starter from the next match before its lineup is known |

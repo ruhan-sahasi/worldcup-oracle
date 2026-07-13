@@ -157,6 +157,14 @@ fit over the same set, and the gap `pre_rank - power_rank` is how many places a 
 slid. The biggest movers each way are the tournament's risers and fallers, straight from the
 difference between what was expected and what the results alone now say.
 
+The same bracket dynamic program that produces the champion odds also yields each contender's **road
+to the final**. A team's opponent in the round that is `k` steps ahead is the winner of the sibling
+sub-bracket of `2^(k-1)` current ties, and that sub-bracket's win distribution is exactly the DP run
+over that slice of the bracket. Weighting each possible opponent's Elo by its chance of getting there
+gives the expected strength of the opponent each remaining round, and their mean is a single
+`difficulty` for the whole path. Because every surviving team faces the same number of rounds, those
+difficulties are directly comparable: an exact, not sampled, read on who has the easier road left.
+
 ## Evaluation philosophy
 
 Skill is the point, so it is measured carefully:

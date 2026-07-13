@@ -161,6 +161,9 @@ pub struct Snapshot {
     /// The biggest over- and under-performers versus their pre-tournament seeding (the gap between
     /// the strength prior's ranking and the live power ranking). Empty until matches finish.
     pub form: TournamentForm,
+    /// Each surviving contender's road to the final: the expected strength of the opponents it still
+    /// has to get through. Empty until the knockout bracket is materialized.
+    pub road: RoadBoard,
 }
 
 /// One team's live champion probability from the second model (Bradley-Terry) over the current
@@ -230,6 +233,33 @@ pub struct FormLine {
 pub struct TournamentForm {
     pub risers: Vec<FormLine>,
     pub fallers: Vec<FormLine>,
+}
+
+/// One future round on a team's road to the title: the probability-weighted strength of the
+/// opponent it would face there, and that round's single most likely opponent.
+#[derive(Debug, Clone, Serialize)]
+pub struct RoadRound {
+    pub stage: String,
+    /// Expected opponent Elo, weighting each possible opponent by its chance of reaching this round.
+    pub expected_opponent_elo: f64,
+    pub likely_opponent: String,
+}
+
+/// One contender's remaining path to the title: its live champion probability, the rounds it has
+/// yet to play, and an overall `difficulty` (the mean expected opponent Elo across those rounds).
+#[derive(Debug, Clone, Serialize)]
+pub struct RoadTeam {
+    pub team: String,
+    pub champion: f64,
+    pub difficulty: f64,
+    pub rounds: Vec<RoadRound>,
+}
+
+/// Each surviving contender's road to the final, ranked by championship probability: who they would
+/// have to get through and how hard that path is. Empty until the knockout bracket is materialized.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct RoadBoard {
+    pub teams: Vec<RoadTeam>,
 }
 
 impl Snapshot {

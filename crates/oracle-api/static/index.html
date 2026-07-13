@@ -135,6 +135,12 @@
       <div id="form"><div class="empty">Loading…</div></div>
     </section>
 
+    <section class="panel">
+      <h2>Road to the final · remaining opponent strength</h2>
+      <div id="road"><div class="empty">Materializes once the knockout bracket is set.</div></div>
+      <div class="legend"><span>expected opponent Elo each remaining round, from the bracket DP · lower average = easier road</span></div>
+    </section>
+
     <section class="panel full">
       <h2>Championship probability over time</h2>
       <canvas id="chart" width="1120" height="220"></canvas>
@@ -427,6 +433,25 @@
       (fallers.length ? `<h3>Underperforming</h3>${fallers.map(l => row(l, false)).join("")}` : "");
   }
 
+  async function refreshRoad() {
+    let r; try { r = await (await fetch("/road")).json(); } catch { return; }
+    const box = el("road");
+    const teams = (r.teams || []).filter(t => t.rounds && t.rounds.length);
+    if (teams.length === 0) {
+      box.innerHTML = '<div class="empty">Materializes once the knockout bracket is set.</div>';
+      return;
+    }
+    const top = teams.slice(0, 8);
+    box.innerHTML = top.map((t) => {
+      const path = t.rounds.map(rd =>
+        `${esc(rd.stage)}: ${esc(rd.likely_opponent)} <span class="meta">(${Math.round(rd.expected_opponent_elo)})</span>`).join(" &rarr; ");
+      return `<div class="upset">
+        <span class="chance">${(t.champion * 100).toFixed(1)}%</span>
+        <span>${esc(t.team)} <span class="meta">road difficulty ${Math.round(t.difficulty)} Elo</span>
+        <div class="meta">${path}</div></span></div>`;
+    }).join("");
+  }
+
   function connect() {
     const proto = location.protocol === "https:" ? "wss" : "ws";
     const ws = new WebSocket(`${proto}://${location.host}/live`);
@@ -449,7 +474,8 @@
   refreshCalibration();
   refreshPower();
   refreshForm();
-  setInterval(() => { refreshUpsets(); refreshReport(); refreshBtChampions(); refreshConsensus(); refreshCalibration(); refreshPower(); refreshForm(); }, 20000);
+  refreshRoad();
+  setInterval(() => { refreshUpsets(); refreshReport(); refreshBtChampions(); refreshConsensus(); refreshCalibration(); refreshPower(); refreshForm(); refreshRoad(); }, 20000);
 })();
 </script>
 </body>
