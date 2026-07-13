@@ -155,6 +155,9 @@ pub struct Snapshot {
     /// The headline forecaster's live reliability curve over its own leak-free pre-match calls, with
     /// the expected calibration error: is a 70% call right about 70% of the time?
     pub reliability: ReliabilityReport,
+    /// A prior-free Massey power ranking over only this tournament's results: who has been strongest
+    /// here, strength-of-schedule adjusted. Empty until matches finish.
+    pub power_ranking: PowerRanking,
 }
 
 /// One team's live champion probability from the second model (Bradley-Terry) over the current
@@ -183,6 +186,26 @@ pub struct ConsensusTeam {
 pub struct Consensus {
     pub jsd: f64,
     pub teams: Vec<ConsensusTeam>,
+}
+
+/// One team's line in the within-tournament Massey power ranking: its least-squares rating and the
+/// offense/defense split, in goal-difference units (centered so the field averages zero).
+#[derive(Debug, Clone, Serialize)]
+pub struct PowerTeam {
+    pub team: String,
+    pub rating: f64,
+    pub offense: f64,
+    pub defense: f64,
+    pub games: u32,
+}
+
+/// A prior-free power ranking built by a Massey least-squares fit over only the matches played in
+/// this tournament: who has actually been strongest here, strength-of-schedule adjusted. `matches`
+/// is how many results fed the fit. Empty until matches finish.
+#[derive(Debug, Clone, Serialize)]
+pub struct PowerRanking {
+    pub matches: usize,
+    pub teams: Vec<PowerTeam>,
 }
 
 impl Snapshot {

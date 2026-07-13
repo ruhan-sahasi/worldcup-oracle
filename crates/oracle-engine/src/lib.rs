@@ -30,7 +30,7 @@ pub use oracle_model::ReliabilityReport;
 pub use query::{signal_sensitivity, Explorer, SignalContribution};
 pub use snapshot::{
     AdaptiveState, BtChampion, Call, Consensus, ConsensusTeam, MatchPrediction, Metrics,
-    ModelScore, RatingEntry, ReportCard, Snapshot, Upset, WinProbSample,
+    ModelScore, PowerRanking, PowerTeam, RatingEntry, ReportCard, Snapshot, Upset, WinProbSample,
 };
 
 use arc_swap::ArcSwap;
@@ -44,7 +44,7 @@ use oracle_model::{
     live_score_grid, reliability, score, BradleyTerry, CalibrationReport, Ensemble, GoalModel,
     LiveConfig, LiveState,
 };
-use oracle_ratings::{EloConfig, RatingStore, StateSpaceRatings};
+use oracle_ratings::{EloConfig, MasseyRatings, RatingStore, StateSpaceRatings};
 use oracle_sim::{simulate_with_live, InProgress, LiveInputs, SimConfig, VenueAdj};
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -1311,6 +1311,7 @@ impl EngineState {
             bt_champions: self.bt_champions(),
             consensus: self.consensus(),
             reliability: self.reliability_curve(),
+            power_ranking: self.power_ranking(),
         }
     }
 
@@ -1423,6 +1424,36 @@ impl EngineState {
             })
             .collect();
         reliability(&pairs, 10)
+    }
+
+    /// A prior-free Massey power ranking over only this tournament's finished matches: a least-
+    /// squares fit that explains every goal margin at once, so it is strength-of-schedule adjusted
+    /// and says who has actually been strongest here (with the offense/defense split), independent
+    /// of the pre-tournament priors the other models lean on.
+    fn power_ranking(&self) -> PowerRanking {
+        let results: Vec<(TeamId, TeamId, Scoreline)> = self
+            .tournament
+            .matches
+            .iter()
+            .filter(|m| m.is_finished())
+            .map(|m| (m.home, m.away, m.score))
+            .collect();
+        let fit = MasseyRatings::fit(&results);
+        let teams = fit
+            .ranked()
+            .iter()
+            .map(|r| PowerTeam {
+                team: self.name_of(r.team),
+                rating: r.rating,
+                offense: r.offense,
+                defense: r.defense,
+                games: r.games,
+            })
+            .collect();
+        PowerRanking {
+            matches: results.len(),
+            teams,
+        }
     }
 
     /// Score one forecaster's pre-match calls against the finished matches (accuracy, Brier,
@@ -1817,6 +1848,82 @@ mod tests {
                 b.mean_pred
             );
         }
+    }
+
+    #[test]
+    fn power_ranking_fits_within_tournament_massey_over_results() {
+        let mut state = fresh_state();
+        let metrics = Metrics::default();
+
+        // No results yet: nothing to fit.
+        let pre = state.power_ranking();
+        assert_eq!(pre.matches, 0);
+        assert!(pre.teams.is_empty());
+
+        // Finish a batch of group matches, the lower id winning 2-0 each time.
+        let ids: Vec<(MatchId, TeamId, TeamId)> = state
+            .tournament
+            .matches
+            .iter()
+            .filter(|m| matches!(m.stage, Stage::Group(_)))
+            .take(32)
+            .map(|m| (m.id, m.home, m.away))
+            .collect();
+        let mut winners: std::collections::HashSet<TeamId> = std::collections::HashSet::new();
+        let mut losers: std::collections::HashSet<TeamId> = std::collections::HashSet::new();
+        for (id, home, away) in &ids {
+            let (score, winner, loser) = if home.0 < away.0 {
+                (Scoreline::new(2, 0), *home, *away)
+            } else {
+                (Scoreline::new(0, 2), *away, *home)
+            };
+            winners.insert(winner);
+            losers.insert(loser);
+            state.apply_event(
+                &MatchEvent::new(*id, 90, EventKind::FullTime { score }),
+                &metrics,
+            );
+        }
+
+        let p = state.power_ranking();
+        assert_eq!(p.matches, ids.len());
+        assert!(!p.teams.is_empty());
+        // Centered ratings sum to (about) zero, and the offense/defense split reconstructs each.
+        let sum: f64 = p.teams.iter().map(|t| t.rating).sum();
+        assert!(sum.abs() < 1e-6, "centered ratings sum to zero, got {sum}");
+        for t in &p.teams {
+            assert!((t.rating - (t.offense + t.defense)).abs() < 1e-9);
+        }
+        // Ranked strongest first.
+        assert!(p.teams.windows(2).all(|w| w[0].rating >= w[1].rating));
+        // A team that only ever won should out-rate a team that only ever lost (ignoring the few
+        // teams that appear on both sides of different fixtures).
+        let clean_winner = p.teams.iter().find(|t| {
+            winners.contains(&team_by_name(&state, &t.team))
+                && !losers.contains(&team_by_name(&state, &t.team))
+        });
+        let clean_loser = p.teams.iter().find(|t| {
+            losers.contains(&team_by_name(&state, &t.team))
+                && !winners.contains(&team_by_name(&state, &t.team))
+        });
+        if let (Some(w), Some(l)) = (clean_winner, clean_loser) {
+            assert!(
+                w.rating > l.rating,
+                "a clean winner ({}) should out-rate a clean loser ({})",
+                w.rating,
+                l.rating
+            );
+        }
+    }
+
+    fn team_by_name(state: &EngineState, name: &str) -> TeamId {
+        state
+            .tournament
+            .teams
+            .iter()
+            .find(|t| t.name == name)
+            .map(|t| t.id)
+            .unwrap()
     }
 
     fn state_with_threshold(threshold: u8) -> EngineState {

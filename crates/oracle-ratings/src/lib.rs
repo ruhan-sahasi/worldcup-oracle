@@ -18,7 +18,9 @@
 //!    `E = P(home) + ½·P(draw)`.
 #![forbid(unsafe_code)]
 
+pub mod massey;
 pub mod state_space;
+pub use massey::{MasseyConfig, MasseyRating, MasseyRatings};
 pub use state_space::{StateSpaceConfig, StateSpaceRatings};
 
 use oracle_domain::{Probabilities, Scoreline, TeamId};

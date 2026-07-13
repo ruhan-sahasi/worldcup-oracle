@@ -124,6 +124,12 @@
       <div id="calibration"><div class="empty">Loading…</div></div>
     </section>
 
+    <section class="panel">
+      <h2>Power ranking · strongest in this tournament</h2>
+      <div id="power"><div class="empty">Loading…</div></div>
+      <div class="legend"><span>Massey least-squares fit over this tournament's results only, strength-of-schedule adjusted</span></div>
+    </section>
+
     <section class="panel full">
       <h2>Championship probability over time</h2>
       <canvas id="chart" width="1120" height="220"></canvas>
@@ -382,6 +388,25 @@
       `<div class="legend"><span>diagonal = perfect calibration · dot size = calls in that bin</span></div>`;
   }
 
+  async function refreshPower() {
+    let p; try { p = await (await fetch("/power")).json(); } catch { return; }
+    const box = el("power");
+    const teams = p.teams || [];
+    if (teams.length === 0) { box.innerHTML = '<div class="empty">No results yet.</div>'; return; }
+    const top = teams.slice(0, 12);
+    // Ratings are goal-difference units centered at zero; scale the bar by the strongest absolute.
+    const max = Math.max(...top.map(t => Math.abs(t.rating)), 1e-6);
+    const sign = (v) => (v >= 0 ? "+" : "") + v.toFixed(2);
+    box.innerHTML =
+      `<div class="rcstat"><span class="meta">over ${p.matches} matches played · rating in goals, off / def split</span></div>` +
+      top.map((t) => `
+        <div class="odds-row">
+          <span class="name">${esc(t.team)}</span>
+          <span class="odds-bar"><span style="width:${100 * Math.abs(t.rating) / max}%"></span></span>
+          <span class="pct">${sign(t.rating)} <span class="meta">o ${sign(t.offense)} / d ${sign(t.defense)}</span></span>
+        </div>`).join("");
+  }
+
   function connect() {
     const proto = location.protocol === "https:" ? "wss" : "ws";
     const ws = new WebSocket(`${proto}://${location.host}/live`);
@@ -402,7 +427,8 @@
   refreshBtChampions();
   refreshConsensus();
   refreshCalibration();
-  setInterval(() => { refreshUpsets(); refreshReport(); refreshBtChampions(); refreshConsensus(); refreshCalibration(); }, 20000);
+  refreshPower();
+  setInterval(() => { refreshUpsets(); refreshReport(); refreshBtChampions(); refreshConsensus(); refreshCalibration(); refreshPower(); }, 20000);
 })();
 </script>
 </body>

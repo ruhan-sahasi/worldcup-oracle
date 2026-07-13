@@ -132,6 +132,25 @@ per-team gap `bradley_terry - ensemble` then shows exactly *which* contenders th
 differently. This is deliberately honest: rather than hide the second model inside a blend, it keeps
 both reads visible and quantifies their disagreement as a live uncertainty signal.
 
+## A within-tournament power ranking: Massey least squares
+
+Elo, the state-space filter, and Bradley-Terry all update a belief game by game and all lean on a
+pre-tournament prior. **Massey's method** takes the opposite approach: it treats the whole set of
+results as one **linear system** and solves it in closed form. With `T` the diagonal matrix of games
+played and `P` the matrix of pairwise game counts, the Massey matrix is `M = T - P`, and the ratings
+`r` solve `M r = p` where `p` is each team's cumulative goal margin. The least-squares fit that best
+explains every margin at once is, by construction, **strength-of-schedule adjusted**: the same margin
+counts for more against a higher-rated opponent. Because `M` is singular (its rows sum to zero), a
+small **ridge** is added to the diagonal, which both makes the fit well-posed when the results graph
+is thin or disconnected early on and shrinks sparsely-observed teams toward the mean.
+
+The rating also splits into **offense** and **defense** (`r = offense + defense`): the defensive
+ratings solve `(T + P) d = T r - f` for the goals-scored vector `f`, and offense is the remainder, so
+the same fit says both how strong a team is and whether that strength comes from scoring or from
+stopping goals. Fed only the matches actually played, this is a deliberately *prior-free,
+within-tournament* read on who has been strongest here, published live and offered alongside the
+prior-anchored models rather than folded into them.
+
 ## Evaluation philosophy
 
 Skill is the point, so it is measured carefully:

@@ -180,6 +180,17 @@ to log-rate units and feeds the Monte-Carlo as a dynamic `rating_sigma` (below),
 static fit-based uncertainty. A single latent strength is modelled, not separate attack/defense
 states.
 
+### Massey least-squares rating (`oracle-ratings::massey`)
+A structurally different rater: rather than update a belief game by game, it solves the whole set of
+results as one **linear system**. The Massey matrix `M = T - P` (games played on the diagonal, minus
+pairwise game counts off it) times the ratings equals each team's cumulative goal margin, `M r = p`;
+a small ridge on the diagonal makes the singular system well-posed and shrinks sparsely-observed
+teams toward the mean. The fit is inherently **strength-of-schedule adjusted**, and splits into
+offense and defense via `(T + P) d = T r - f`. The engine fits it live over *only this tournament's*
+finished matches (`power_ranking`), so it is a prior-free power ranking that sits alongside the
+prior-anchored raters rather than feeding the ensemble. Solved by a small dense Gauss-Jordan routine
+(the systems are at most one row/column per team).
+
 ### Bayesian in-match updating (`oracle-model::live`)
 Live, we condition on the current scoreline, minute, and red cards. Remaining goals
 for each side are Poisson over the time left, scaled by the fraction of the match
