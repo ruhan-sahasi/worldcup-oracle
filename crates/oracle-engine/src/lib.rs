@@ -29,9 +29,9 @@ pub use event_log::EventLog;
 pub use oracle_model::ReliabilityReport;
 pub use query::{signal_sensitivity, Explorer, SignalContribution};
 pub use snapshot::{
-    AdaptiveState, BtChampion, Call, Consensus, ConsensusTeam, FormLine, MatchPrediction, Metrics,
-    ModelScore, PowerRanking, PowerTeam, RatingEntry, ReportCard, RoadBoard, RoadRound, RoadTeam,
-    Snapshot, TournamentForm, Upset, WinProbSample,
+    AdaptiveState, BracketRound, BracketTie, BtChampion, Call, Consensus, ConsensusTeam, FormLine,
+    MatchPrediction, Metrics, ModelScore, PowerRanking, PowerTeam, PredictedBracket, RatingEntry,
+    ReportCard, RoadBoard, RoadRound, RoadTeam, Snapshot, TournamentForm, Upset, WinProbSample,
 };
 
 use arc_swap::ArcSwap;
@@ -982,6 +982,113 @@ impl EngineState {
         RoadBoard { teams }
     }
 
+    /// The model's single most likely completion of the knockout bracket: from the deepest
+    /// materialized round forward, each tie resolves to its Bradley-Terry favourite and the
+    /// favourites are paired up the bracket to a projected champion. Each tie carries the favourite's
+    /// win probability, and `probability` is their product: the chance this exact bracket occurs,
+    /// an honest reminder of how unpredictable a knockout is. Empty until the bracket is set.
+    fn predicted_bracket(&self) -> PredictedBracket {
+        let Some(idx) = Self::KO_PATH
+            .iter()
+            .rposition(|s| self.tournament.matches.iter().any(|m| m.stage == *s))
+        else {
+            return PredictedBracket::default();
+        };
+        let stage = Self::KO_PATH[idx];
+        // Current-round fixtures in bracket order, with the winner if the tie is already decided.
+        let fixtures: Vec<(TeamId, TeamId, Option<TeamId>)> = self
+            .tournament
+            .matches
+            .iter()
+            .filter(|m| m.stage == stage)
+            .map(|m| {
+                let winner = m.is_finished().then_some(if m.score.away > m.score.home {
+                    m.away
+                } else {
+                    m.home
+                });
+                (m.home, m.away, winner)
+            })
+            .collect();
+        if fixtures.is_empty() {
+            return PredictedBracket::default();
+        }
+
+        // Resolve one tie to its favourite: a decided tie to its winner (probability 1), else the
+        // Bradley-Terry favourite with its advance probability.
+        let resolve = |home: TeamId, away: TeamId, winner: Option<TeamId>| -> (TeamId, f64) {
+            if let Some(w) = winner {
+                return (w, 1.0);
+            }
+            let ph = self.bradley_terry.advance_probability(home, away);
+            if ph >= 0.5 {
+                (home, ph)
+            } else {
+                (away, 1.0 - ph)
+            }
+        };
+
+        let mut rounds: Vec<BracketRound> = Vec::new();
+        let mut probability = 1.0f64;
+
+        // The frontier round (may hold decided ties).
+        let mut advancers: Vec<TeamId> = Vec::with_capacity(fixtures.len());
+        let mut ties: Vec<BracketTie> = Vec::with_capacity(fixtures.len());
+        for &(home, away, winner) in &fixtures {
+            let (favorite, favorite_prob) = resolve(home, away, winner);
+            probability *= favorite_prob;
+            advancers.push(favorite);
+            ties.push(BracketTie {
+                home: self.name_of(home),
+                away: self.name_of(away),
+                favorite: self.name_of(favorite),
+                favorite_prob,
+                decided: winner.is_some(),
+            });
+        }
+        rounds.push(BracketRound {
+            stage: stage.to_string(),
+            ties,
+        });
+
+        // Each subsequent round pairs adjacent favourites and projects the winner.
+        let mut next_idx = idx + 1;
+        while advancers.len() > 1 {
+            let mut next: Vec<TeamId> = Vec::with_capacity(advancers.len() / 2);
+            let mut ties: Vec<BracketTie> = Vec::with_capacity(advancers.len() / 2);
+            for pair in advancers.chunks(2) {
+                if pair.len() < 2 {
+                    break;
+                }
+                let (favorite, favorite_prob) = resolve(pair[0], pair[1], None);
+                probability *= favorite_prob;
+                next.push(favorite);
+                ties.push(BracketTie {
+                    home: self.name_of(pair[0]),
+                    away: self.name_of(pair[1]),
+                    favorite: self.name_of(favorite),
+                    favorite_prob,
+                    decided: false,
+                });
+            }
+            rounds.push(BracketRound {
+                stage: Self::KO_PATH[next_idx].to_string(),
+                ties,
+            });
+            advancers = next;
+            next_idx += 1;
+        }
+
+        PredictedBracket {
+            champion: advancers
+                .first()
+                .map(|&t| self.name_of(t))
+                .unwrap_or_default(),
+            probability,
+            rounds,
+        }
+    }
+
     /// A consensus title forecast from the two independent models: the goal-model Monte-Carlo
     /// forecast and the Bradley-Terry bracket dynamic program. The consensus is a plain 50/50 average
     /// of the two champion distributions (both already condition on the live bracket), and `jsd` is
@@ -1395,6 +1502,7 @@ impl EngineState {
             power_ranking: self.power_ranking(),
             form: self.tournament_form(),
             road: self.road_to_final(),
+            predicted_bracket: self.predicted_bracket(),
         }
     }
 
@@ -2188,6 +2296,72 @@ mod tests {
                 .sum::<f64>()
                 / 4.0;
             assert!((t.difficulty - mean).abs() < 1e-9);
+        }
+    }
+
+    #[test]
+    fn predicted_bracket_projects_a_full_chalk_bracket() {
+        let mut state = fresh_state_bt();
+        let metrics = Metrics::default();
+
+        // No bracket yet.
+        assert!(state.predicted_bracket().rounds.is_empty());
+
+        // Finish the group stage so the Round of 32 materializes.
+        let groups: Vec<(MatchId, TeamId, TeamId)> = state
+            .tournament
+            .matches
+            .iter()
+            .filter(|m| matches!(m.stage, Stage::Group(_)))
+            .map(|m| (m.id, m.home, m.away))
+            .collect();
+        for (id, home, away) in groups {
+            let score = if home.0 < away.0 {
+                Scoreline::new(2, 0)
+            } else {
+                Scoreline::new(0, 2)
+            };
+            state.apply_event(
+                &MatchEvent::new(id, 90, EventKind::FullTime { score }),
+                &metrics,
+            );
+        }
+
+        let bracket = state.predicted_bracket();
+        // Five rounds from the Round of 32, halving each time down to the final.
+        let sizes: Vec<usize> = bracket.rounds.iter().map(|r| r.ties.len()).collect();
+        assert_eq!(sizes, vec![16, 8, 4, 2, 1]);
+        assert!(!bracket.champion.is_empty());
+
+        // Every tie's favourite is one of its two sides and is the more likely one, and the joint
+        // probability is exactly the product of the per-tie favourite probabilities.
+        let mut product = 1.0;
+        for round in &bracket.rounds {
+            for tie in &round.ties {
+                assert!(tie.favorite == tie.home || tie.favorite == tie.away);
+                assert!(tie.favorite_prob >= 0.5 && tie.favorite_prob <= 1.0);
+                product *= tie.favorite_prob;
+            }
+        }
+        assert!(
+            (bracket.probability - product).abs() < 1e-12,
+            "joint probability is the product of favourite probabilities"
+        );
+        // The projected champion is the favourite of the final.
+        assert_eq!(
+            bracket.champion,
+            bracket.rounds.last().unwrap().ties[0].favorite
+        );
+
+        // Each round is built from the previous round's favourites: every side in a round appears as
+        // a favourite in the round before it.
+        for pair in bracket.rounds.windows(2) {
+            let prev: std::collections::HashSet<&str> =
+                pair[0].ties.iter().map(|t| t.favorite.as_str()).collect();
+            for tie in &pair[1].ties {
+                assert!(prev.contains(tie.home.as_str()));
+                assert!(prev.contains(tie.away.as_str()));
+            }
         }
     }
 

@@ -164,6 +164,9 @@ pub struct Snapshot {
     /// Each surviving contender's road to the final: the expected strength of the opponents it still
     /// has to get through. Empty until the knockout bracket is materialized.
     pub road: RoadBoard,
+    /// The model's single most likely completion of the knockout bracket, with the chance that exact
+    /// bracket occurs. Empty until the knockout bracket is materialized.
+    pub predicted_bracket: PredictedBracket,
 }
 
 /// One team's live champion probability from the second model (Bradley-Terry) over the current
@@ -260,6 +263,34 @@ pub struct RoadTeam {
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct RoadBoard {
     pub teams: Vec<RoadTeam>,
+}
+
+/// One tie in the model's predicted bracket: the two sides, the favoured winner, and the favourite's
+/// win probability. `decided` marks a tie whose result is already in.
+#[derive(Debug, Clone, Serialize)]
+pub struct BracketTie {
+    pub home: String,
+    pub away: String,
+    pub favorite: String,
+    pub favorite_prob: f64,
+    pub decided: bool,
+}
+
+/// One round of the predicted bracket.
+#[derive(Debug, Clone, Serialize)]
+pub struct BracketRound {
+    pub stage: String,
+    pub ties: Vec<BracketTie>,
+}
+
+/// The model's single most likely completion of the knockout bracket: every remaining tie resolved
+/// to its favourite, up to a projected `champion`. `probability` is the product of the favourites'
+/// win probabilities, i.e. the chance this exact bracket occurs. Empty until the bracket is set.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct PredictedBracket {
+    pub champion: String,
+    pub probability: f64,
+    pub rounds: Vec<BracketRound>,
 }
 
 impl Snapshot {

@@ -142,6 +142,11 @@
     </section>
 
     <section class="panel full">
+      <h2>Predicted bracket · the model's most likely path</h2>
+      <div id="bracket"><div class="empty">Materializes once the knockout bracket is set.</div></div>
+    </section>
+
+    <section class="panel full">
       <h2>Championship probability over time</h2>
       <canvas id="chart" width="1120" height="220"></canvas>
     </section>
@@ -452,6 +457,32 @@
     }).join("");
   }
 
+  async function refreshBracket() {
+    let b; try { b = await (await fetch("/bracket")).json(); } catch { return; }
+    const box = el("bracket");
+    const rounds = b.rounds || [];
+    if (rounds.length === 0) {
+      box.innerHTML = '<div class="empty">Materializes once the knockout bracket is set.</div>';
+      return;
+    }
+    const line = (name, fav) =>
+      `<div style="padding:2px 6px;border-radius:4px;${fav ? 'background:rgba(88,166,255,.18);font-weight:600' : 'opacity:.55'}">${esc(name)}</div>`;
+    const cols = rounds.map((rd) => {
+      const ties = rd.ties.map((t) => {
+        const homeFav = t.favorite === t.home;
+        const tag = t.decided ? "done" : (t.favorite_prob * 100).toFixed(0) + "%";
+        return `<div style="margin:4px 0;border:1px solid var(--line);border-radius:6px;padding:4px">
+          ${line(t.home, homeFav)}${line(t.away, !homeFav)}
+          <div class="meta" style="text-align:right">${tag}</div></div>`;
+      }).join("");
+      return `<div style="min-width:150px;flex:0 0 auto">
+        <div class="meta" style="text-transform:uppercase;letter-spacing:.06em;margin-bottom:4px">${esc(rd.stage)}</div>${ties}</div>`;
+    }).join("");
+    box.innerHTML =
+      `<div class="rcstat">predicted champion: <b>${esc(b.champion)}</b> <span class="meta">this exact bracket: ${(b.probability * 100).toFixed(2)}%</span></div>` +
+      `<div style="display:flex;gap:12px;overflow-x:auto;padding-bottom:6px">${cols}</div>`;
+  }
+
   function connect() {
     const proto = location.protocol === "https:" ? "wss" : "ws";
     const ws = new WebSocket(`${proto}://${location.host}/live`);
@@ -475,7 +506,8 @@
   refreshPower();
   refreshForm();
   refreshRoad();
-  setInterval(() => { refreshUpsets(); refreshReport(); refreshBtChampions(); refreshConsensus(); refreshCalibration(); refreshPower(); refreshForm(); refreshRoad(); }, 20000);
+  refreshBracket();
+  setInterval(() => { refreshUpsets(); refreshReport(); refreshBtChampions(); refreshConsensus(); refreshCalibration(); refreshPower(); refreshForm(); refreshRoad(); refreshBracket(); }, 20000);
 })();
 </script>
 </body>

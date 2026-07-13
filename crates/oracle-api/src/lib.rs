@@ -27,6 +27,7 @@
 //! | GET | `/power` | prior-free Massey power ranking over this tournament's results (offense/defense) |
 //! | GET | `/form` | biggest over- and under-performers versus their pre-tournament seeding |
 //! | GET | `/road` | each contender's road to the final: expected strength of remaining opponents |
+//! | GET | `/bracket` | the model's single most likely completion of the knockout bracket |
 //! | GET | `/api/predict?home=&away=` | on-demand matchup forecast (any two teams) |
 //! | GET | `/api/explain?home=&away=` | factor attribution: why the model favours a side |
 //! | GET | `/api/bt?home=&away=` | second model (Bradley-Terry-Davidson) win/draw/loss |
@@ -125,6 +126,7 @@ pub fn router(engine: Arc<Engine>, explorer: ExplorerSlot) -> Router {
         .route("/power", get(power))
         .route("/form", get(form))
         .route("/road", get(road))
+        .route("/bracket", get(bracket))
         .route("/api/team", get(team_hub))
         // On-demand model queries (any matchup, posterior, custom simulation, ratings).
         .route("/api/predict", get(api_predict))
@@ -212,7 +214,7 @@ async fn api_info(
             "/ (live dashboard)", "/explore (model explorer)", "/team (fan team hub)",
             "/card (shareable prediction card)", "/health", "/teams", "/matches",
             "/predict/match/{id}", "/predict/tournament", "/upsets", "/report", "/bt/champions",
-            "/consensus", "/calibration", "/power", "/form", "/road", "/api/team?q=",
+            "/consensus", "/calibration", "/power", "/form", "/road", "/bracket", "/api/team?q=",
             "/api/predict?home=&away=", "/api/explain?home=&away=", "/api/posterior?home=&away=",
             "/api/bt?home=&away=", "/api/bt/champions",
             "/api/simulate?iters=&seed=", "/api/sensitivity?iters=&seed=",
@@ -571,6 +573,12 @@ async fn form(State(engine): State<Arc<Engine>>) -> Json<oracle_engine::Tourname
 /// to get through, round by round. Empty until the knockout bracket is materialized.
 async fn road(State(engine): State<Arc<Engine>>) -> Json<oracle_engine::RoadBoard> {
     Json(engine.snapshot().road.clone())
+}
+
+/// The model's single most likely completion of the knockout bracket, round by round to a projected
+/// champion, with the chance this exact bracket occurs. Empty until the bracket is materialized.
+async fn bracket(State(engine): State<Arc<Engine>>) -> Json<oracle_engine::PredictedBracket> {
+    Json(engine.snapshot().predicted_bracket.clone())
 }
 
 #[derive(Deserialize)]
@@ -1142,6 +1150,14 @@ mod tests {
         let (status, body) = get(&state, "/road").await;
         assert_eq!(status, StatusCode::OK);
         assert!(json(&body)["teams"].is_array());
+
+        // The predicted bracket carries a champion, a probability, and a rounds array.
+        let (status, body) = get(&state, "/bracket").await;
+        assert_eq!(status, StatusCode::OK);
+        let br = json(&body);
+        assert!(
+            br["champion"].is_string() && br["probability"].is_number() && br["rounds"].is_array()
+        );
 
         let (status, body) = get(&state, "/api/team?q=Brazil").await;
         assert_eq!(status, StatusCode::OK);

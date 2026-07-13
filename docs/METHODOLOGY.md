@@ -165,6 +165,13 @@ gives the expected strength of the opponent each remaining round, and their mean
 `difficulty` for the whole path. Because every surviving team faces the same number of rounds, those
 difficulties are directly comparable: an exact, not sampled, read on who has the easier road left.
 
+Resolving every remaining tie to its favourite instead gives the **predicted bracket**: from the
+current round forward, each tie goes to its Bradley-Terry favourite, the favourites are paired up the
+bracket, and the projection runs to a single champion. Multiplying the favourites' win probabilities
+gives the probability that this *exact* bracket occurs, which is deliberately reported: it is
+typically a fraction of a percent, an honest reminder that a single most-likely bracket is still an
+unlikely one, and that the champion-odds distribution, not the modal bracket, is the real forecast.
+
 ## Evaluation philosophy
 
 Skill is the point, so it is measured carefully:
