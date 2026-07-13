@@ -29,8 +29,9 @@ pub use event_log::EventLog;
 pub use oracle_model::ReliabilityReport;
 pub use query::{signal_sensitivity, Explorer, SignalContribution};
 pub use snapshot::{
-    AdaptiveState, BtChampion, Call, Consensus, ConsensusTeam, MatchPrediction, Metrics,
-    ModelScore, PowerRanking, PowerTeam, RatingEntry, ReportCard, Snapshot, Upset, WinProbSample,
+    AdaptiveState, BtChampion, Call, Consensus, ConsensusTeam, FormLine, MatchPrediction, Metrics,
+    ModelScore, PowerRanking, PowerTeam, RatingEntry, ReportCard, Snapshot, TournamentForm, Upset,
+    WinProbSample,
 };
 
 use arc_swap::ArcSwap;
@@ -1312,6 +1313,7 @@ impl EngineState {
             consensus: self.consensus(),
             reliability: self.reliability_curve(),
             power_ranking: self.power_ranking(),
+            form: self.tournament_form(),
         }
     }
 
@@ -1431,13 +1433,7 @@ impl EngineState {
     /// and says who has actually been strongest here (with the offense/defense split), independent
     /// of the pre-tournament priors the other models lean on.
     fn power_ranking(&self) -> PowerRanking {
-        let results: Vec<(TeamId, TeamId, Scoreline)> = self
-            .tournament
-            .matches
-            .iter()
-            .filter(|m| m.is_finished())
-            .map(|m| (m.home, m.away, m.score))
-            .collect();
+        let results = self.finished_results();
         let fit = MasseyRatings::fit(&results);
         let teams = fit
             .ranked()
@@ -1454,6 +1450,72 @@ impl EngineState {
             matches: results.len(),
             teams,
         }
+    }
+
+    /// This tournament's finished matches as `(home, away, score)`, the input to the Massey fit.
+    fn finished_results(&self) -> Vec<(TeamId, TeamId, Scoreline)> {
+        self.tournament
+            .matches
+            .iter()
+            .filter(|m| m.is_finished())
+            .map(|m| (m.home, m.away, m.score))
+            .collect()
+    }
+
+    /// Which teams have most over- and under-performed their pre-tournament seeding: each team's
+    /// rank in the prior-free Massey power ranking (this tournament only) against its rank by the
+    /// pre-tournament strength prior, over the same set of teams so the ranks are comparable. A team
+    /// that has climbed many places has beaten expectations. Empty until matches finish.
+    fn tournament_form(&self) -> TournamentForm {
+        let fit = MasseyRatings::fit(&self.finished_results());
+        let ranked = fit.ranked();
+        if ranked.is_empty() {
+            return TournamentForm::default();
+        }
+        // Power rank (1-based) over the teams that have played.
+        let power_rank: HashMap<TeamId, usize> = ranked
+            .iter()
+            .enumerate()
+            .map(|(i, r)| (r.team, i + 1))
+            .collect();
+        // Pre-tournament rank over that same set of teams, by the strength prior.
+        let mut prior: Vec<(TeamId, f64)> = oracle_ingest::data::team_strengths()
+            .into_iter()
+            .filter(|(t, _)| power_rank.contains_key(t))
+            .collect();
+        prior.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        let pre_rank: HashMap<TeamId, usize> = prior
+            .iter()
+            .enumerate()
+            .map(|(i, (t, _))| (*t, i + 1))
+            .collect();
+
+        let mut lines: Vec<FormLine> = ranked
+            .iter()
+            .filter_map(|r| {
+                let pre = *pre_rank.get(&r.team)?;
+                let power = power_rank[&r.team];
+                Some(FormLine {
+                    team: self.name_of(r.team),
+                    pre_rank: pre,
+                    power_rank: power,
+                    // Positive means a climb: seeded lower (larger rank number) than it now sits.
+                    delta: pre as i32 - power as i32,
+                    rating: r.rating,
+                })
+            })
+            .collect();
+        lines.sort_by_key(|l| std::cmp::Reverse(l.delta));
+        let risers: Vec<FormLine> = lines
+            .iter()
+            .filter(|l| l.delta > 0)
+            .take(5)
+            .cloned()
+            .collect();
+        let mut fallers: Vec<FormLine> = lines.iter().filter(|l| l.delta < 0).cloned().collect();
+        fallers.reverse();
+        fallers.truncate(5);
+        TournamentForm { risers, fallers }
     }
 
     /// Score one forecaster's pre-match calls against the finished matches (accuracy, Brier,
@@ -1924,6 +1986,53 @@ mod tests {
             .find(|t| t.name == name)
             .map(|t| t.id)
             .unwrap()
+    }
+
+    #[test]
+    fn tournament_form_flags_over_and_under_performers() {
+        let mut state = fresh_state();
+        let metrics = Metrics::default();
+
+        // Nothing played: no risers or fallers.
+        let pre = state.tournament_form();
+        assert!(pre.risers.is_empty() && pre.fallers.is_empty());
+
+        // Finish every group match with the lower id winning. The Massey ranking then tracks id
+        // order, which is unrelated to the strength prior, so some teams climb and others fall.
+        let ids: Vec<(MatchId, TeamId, TeamId)> = state
+            .tournament
+            .matches
+            .iter()
+            .filter(|m| matches!(m.stage, Stage::Group(_)))
+            .map(|m| (m.id, m.home, m.away))
+            .collect();
+        for (id, home, away) in &ids {
+            let score = if home.0 < away.0 {
+                Scoreline::new(2, 0)
+            } else {
+                Scoreline::new(0, 2)
+            };
+            state.apply_event(
+                &MatchEvent::new(*id, 90, EventKind::FullTime { score }),
+                &metrics,
+            );
+        }
+
+        let form = state.tournament_form();
+        assert!(
+            !form.risers.is_empty() && !form.fallers.is_empty(),
+            "id-order results diverge from the strength prior, so both lists populate"
+        );
+        // Risers really climbed, fallers really dropped, and each delta is the rank gap.
+        for l in &form.risers {
+            assert!(l.delta > 0 && l.delta == l.pre_rank as i32 - l.power_rank as i32);
+        }
+        for l in &form.fallers {
+            assert!(l.delta < 0 && l.delta == l.pre_rank as i32 - l.power_rank as i32);
+        }
+        // Risers are ordered by the biggest climb first; fallers by the biggest drop first.
+        assert!(form.risers.windows(2).all(|w| w[0].delta >= w[1].delta));
+        assert!(form.fallers.windows(2).all(|w| w[0].delta <= w[1].delta));
     }
 
     fn state_with_threshold(threshold: u8) -> EngineState {

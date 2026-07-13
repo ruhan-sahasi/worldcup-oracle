@@ -55,6 +55,7 @@ fully offline with **zero keys and zero network**.
 | **Consensus + live divergence** - a 50/50 blend of the two independent title forecasts, plus the **Jensen-Shannon divergence** between them and the per-team gap | one reconciled read, with an honest live measure of how far the two models disagree and on which contenders |
 | **Live reliability curve + ECE** - the model's leak-free pre-match calls binned by predicted probability against how often they came true, with the **expected calibration error** | honest, visible accountability: is a 70% call right about 70% of the time, right now, as the tournament plays |
 | **Massey power ranking** - a **least-squares** rating solved from every goal margin at once over *this tournament's results only*, with an offense/defense split | a prior-free, strength-of-schedule-adjusted read on who has actually been strongest here, a different method (linear algebra) than the game-by-game raters |
+| **Risers and fallers** - each team's live power-ranking place against its pre-tournament seeding | who has most over- or under-performed expectations, straight from the gap between the prior and the prior-free ranking |
 | **Bayesian live updater** with **score effects** | conditions on score, minute, and red cards; a trailing team chases and a leading team defends |
 | **Lineup adjustment** | a confirmed XI shifts each team's attack and defense |
 | **Suspension tracking** | yellow-card accumulation drops a suspended starter from the next match before its lineup is known |

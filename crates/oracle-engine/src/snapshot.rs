@@ -158,6 +158,9 @@ pub struct Snapshot {
     /// A prior-free Massey power ranking over only this tournament's results: who has been strongest
     /// here, strength-of-schedule adjusted. Empty until matches finish.
     pub power_ranking: PowerRanking,
+    /// The biggest over- and under-performers versus their pre-tournament seeding (the gap between
+    /// the strength prior's ranking and the live power ranking). Empty until matches finish.
+    pub form: TournamentForm,
 }
 
 /// One team's live champion probability from the second model (Bradley-Terry) over the current
@@ -206,6 +209,27 @@ pub struct PowerTeam {
 pub struct PowerRanking {
     pub matches: usize,
     pub teams: Vec<PowerTeam>,
+}
+
+/// One team's over/under-performance versus its pre-tournament seeding: where the prior ranked it
+/// against where the prior-free power ranking now places it. `delta = pre_rank - power_rank`, so a
+/// positive delta is a climb (it has beaten expectations).
+#[derive(Debug, Clone, Serialize)]
+pub struct FormLine {
+    pub team: String,
+    pub pre_rank: usize,
+    pub power_rank: usize,
+    pub delta: i32,
+    pub rating: f64,
+}
+
+/// The tournament's biggest over- and under-performers versus their pre-tournament seeding, by the
+/// gap between the strength prior's ranking and the live Massey power ranking. Empty until matches
+/// finish.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct TournamentForm {
+    pub risers: Vec<FormLine>,
+    pub fallers: Vec<FormLine>,
 }
 
 impl Snapshot {

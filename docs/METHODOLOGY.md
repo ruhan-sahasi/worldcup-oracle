@@ -151,6 +151,12 @@ stopping goals. Fed only the matches actually played, this is a deliberately *pr
 within-tournament* read on who has been strongest here, published live and offered alongside the
 prior-anchored models rather than folded into them.
 
+Because that ranking is prior-free, comparing it to the pre-tournament strength prior gives a clean
+read on **who has over- or under-performed**: rank the teams both by the prior and by the live Massey
+fit over the same set, and the gap `pre_rank - power_rank` is how many places a team has climbed or
+slid. The biggest movers each way are the tournament's risers and fallers, straight from the
+difference between what was expected and what the results alone now say.
+
 ## Evaluation philosophy
 
 Skill is the point, so it is measured carefully:

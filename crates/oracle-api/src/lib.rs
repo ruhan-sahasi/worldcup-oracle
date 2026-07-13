@@ -25,6 +25,7 @@
 //! | GET | `/consensus` | consensus title forecast blending both models + their live divergence (JSD) |
 //! | GET | `/calibration` | the model's live reliability curve + expected calibration error |
 //! | GET | `/power` | prior-free Massey power ranking over this tournament's results (offense/defense) |
+//! | GET | `/form` | biggest over- and under-performers versus their pre-tournament seeding |
 //! | GET | `/api/predict?home=&away=` | on-demand matchup forecast (any two teams) |
 //! | GET | `/api/explain?home=&away=` | factor attribution: why the model favours a side |
 //! | GET | `/api/bt?home=&away=` | second model (Bradley-Terry-Davidson) win/draw/loss |
@@ -121,6 +122,7 @@ pub fn router(engine: Arc<Engine>, explorer: ExplorerSlot) -> Router {
         .route("/consensus", get(consensus))
         .route("/calibration", get(calibration))
         .route("/power", get(power))
+        .route("/form", get(form))
         .route("/api/team", get(team_hub))
         // On-demand model queries (any matchup, posterior, custom simulation, ratings).
         .route("/api/predict", get(api_predict))
@@ -208,7 +210,7 @@ async fn api_info(
             "/ (live dashboard)", "/explore (model explorer)", "/team (fan team hub)",
             "/card (shareable prediction card)", "/health", "/teams", "/matches",
             "/predict/match/{id}", "/predict/tournament", "/upsets", "/report", "/bt/champions",
-            "/consensus", "/calibration", "/power", "/api/team?q=",
+            "/consensus", "/calibration", "/power", "/form", "/api/team?q=",
             "/api/predict?home=&away=", "/api/explain?home=&away=", "/api/posterior?home=&away=",
             "/api/bt?home=&away=", "/api/bt/champions",
             "/api/simulate?iters=&seed=", "/api/sensitivity?iters=&seed=",
@@ -555,6 +557,12 @@ async fn calibration(State(engine): State<Arc<Engine>>) -> Json<oracle_engine::R
 /// here, strength-of-schedule adjusted, with the offense/defense split. Empty until matches finish.
 async fn power(State(engine): State<Arc<Engine>>) -> Json<oracle_engine::PowerRanking> {
     Json(engine.snapshot().power_ranking.clone())
+}
+
+/// The tournament's biggest over- and under-performers versus their pre-tournament seeding (the gap
+/// between the strength prior's ranking and the live power ranking). Empty until matches finish.
+async fn form(State(engine): State<Arc<Engine>>) -> Json<oracle_engine::TournamentForm> {
+    Json(engine.snapshot().form.clone())
 }
 
 #[derive(Deserialize)]
@@ -1115,6 +1123,12 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         let pow = json(&body);
         assert!(pow["matches"].is_number() && pow["teams"].is_array());
+
+        // The form board carries riser and faller arrays.
+        let (status, body) = get(&state, "/form").await;
+        assert_eq!(status, StatusCode::OK);
+        let form = json(&body);
+        assert!(form["risers"].is_array() && form["fallers"].is_array());
 
         let (status, body) = get(&state, "/api/team?q=Brazil").await;
         assert_eq!(status, StatusCode::OK);
