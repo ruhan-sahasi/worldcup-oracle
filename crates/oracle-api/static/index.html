@@ -119,6 +119,11 @@
       <div id="consensus"><div class="empty">Materializes once the knockout bracket is set.</div></div>
     </section>
 
+    <section class="panel">
+      <h2>Calibration · is a 70% call right 70% of the time?</h2>
+      <div id="calibration"><div class="empty">Loading…</div></div>
+    </section>
+
     <section class="panel full">
       <h2>Championship probability over time</h2>
       <canvas id="chart" width="1120" height="220"></canvas>
@@ -351,6 +356,32 @@
       `<div class="rcstat">divergence <b>${jsd.toFixed(3)}</b> <span class="meta">JSD in bits · ${mood}</span></div>` + rows;
   }
 
+  async function refreshCalibration() {
+    let r; try { r = await (await fetch("/calibration")).json(); } catch { return; }
+    const box = el("calibration");
+    const bins = (r.bins || []).filter(b => b.count > 0);
+    const total = bins.reduce((s, b) => s + b.count, 0);
+    if (total === 0) { box.innerHTML = '<div class="empty">No results scored yet.</div>'; return; }
+    // Reliability diagram: a unit square, the y=x line of perfect calibration, and the model's
+    // (mean predicted, empirical frequency) points joined into a curve. Dots scale with bin count.
+    const S = 200, pad = 6;
+    const x = (v) => pad + v * (S - 2 * pad);
+    const y = (v) => (S - pad) - v * (S - 2 * pad);
+    const maxc = Math.max(...bins.map(b => b.count), 1);
+    const pts = bins.map(b => `${x(b.mean_pred).toFixed(1)},${y(b.empirical).toFixed(1)}`).join(" ");
+    const dots = bins.map(b =>
+      `<circle cx="${x(b.mean_pred).toFixed(1)}" cy="${y(b.empirical).toFixed(1)}" r="${(2 + 4 * b.count / maxc).toFixed(1)}" fill="var(--away)" fill-opacity="0.85"/>`).join("");
+    box.innerHTML =
+      `<div class="rcstat">expected calibration error <b>${r.ece.toFixed(3)}</b> <span class="meta">over ${total} scored calls · lower is better</span></div>` +
+      `<svg viewBox="0 0 ${S} ${S}" width="${S}" height="${S}" style="max-width:100%">
+        <rect x="${pad}" y="${pad}" width="${S - 2 * pad}" height="${S - 2 * pad}" fill="none" stroke="var(--line)"/>
+        <line x1="${x(0)}" y1="${y(0)}" x2="${x(1)}" y2="${y(1)}" stroke="var(--muted)" stroke-dasharray="4 3"/>
+        <polyline points="${pts}" fill="none" stroke="var(--away)" stroke-width="1.5"/>
+        ${dots}
+      </svg>` +
+      `<div class="legend"><span>diagonal = perfect calibration · dot size = calls in that bin</span></div>`;
+  }
+
   function connect() {
     const proto = location.protocol === "https:" ? "wss" : "ws";
     const ws = new WebSocket(`${proto}://${location.host}/live`);
@@ -370,7 +401,8 @@
   refreshReport();
   refreshBtChampions();
   refreshConsensus();
-  setInterval(() => { refreshUpsets(); refreshReport(); refreshBtChampions(); refreshConsensus(); }, 20000);
+  refreshCalibration();
+  setInterval(() => { refreshUpsets(); refreshReport(); refreshBtChampions(); refreshConsensus(); refreshCalibration(); }, 20000);
 })();
 </script>
 </body>

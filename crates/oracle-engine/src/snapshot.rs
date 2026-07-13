@@ -10,6 +10,7 @@ use chrono::{DateTime, Utc};
 use oracle_domain::{
     MatchId, MatchStatus, Probabilities, ScoreGrid, Scoreline, Stage, TeamId, TournamentForecast,
 };
+use oracle_model::ReliabilityReport;
 use serde::Serialize;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -151,6 +152,9 @@ pub struct Snapshot {
     /// A consensus title forecast blending the two models, with a live Jensen-Shannon divergence
     /// measuring how far they disagree. Empty until the bracket is materialized.
     pub consensus: Consensus,
+    /// The headline forecaster's live reliability curve over its own leak-free pre-match calls, with
+    /// the expected calibration error: is a 70% call right about 70% of the time?
+    pub reliability: ReliabilityReport,
 }
 
 /// One team's live champion probability from the second model (Bradley-Terry) over the current

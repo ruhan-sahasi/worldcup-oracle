@@ -137,6 +137,10 @@ both reads visible and quantifies their disagreement as a live uncertainty signa
 Skill is the point, so it is measured carefully:
 
 - **Proper scoring rules** (Brier, log-loss) plus a **reliability curve + ECE**, never just accuracy.
+  Once a tournament is under way the engine publishes that reliability curve **live** (`/calibration`):
+  it bins the model's own leak-free pre-match calls by predicted probability and compares each bin to
+  the frequency the outcome actually occurred, so a viewer can watch whether a 70% call really lands
+  about 70% of the time, with the expected calibration error as the one-number summary.
 - The **bookmaker's vig-free implied odds** are the baseline, because beating the market is the
   honest bar - and a hard one.
 - **Rolling-origin cross-validation** with **bootstrap confidence intervals** (`backtest --cv N`):

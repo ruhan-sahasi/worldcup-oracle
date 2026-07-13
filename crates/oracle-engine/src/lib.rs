@@ -26,6 +26,7 @@ pub mod query;
 mod snapshot;
 
 pub use event_log::EventLog;
+pub use oracle_model::ReliabilityReport;
 pub use query::{signal_sensitivity, Explorer, SignalContribution};
 pub use snapshot::{
     AdaptiveState, BtChampion, Call, Consensus, ConsensusTeam, MatchPrediction, Metrics,
@@ -40,8 +41,8 @@ use oracle_domain::{
 use oracle_ingest::DataProvider;
 use oracle_model::{
     apply_temperature, fit_gain_toward_one, fit_temperature, implied_probabilities,
-    live_score_grid, score, BradleyTerry, CalibrationReport, Ensemble, GoalModel, LiveConfig,
-    LiveState,
+    live_score_grid, reliability, score, BradleyTerry, CalibrationReport, Ensemble, GoalModel,
+    LiveConfig, LiveState,
 };
 use oracle_ratings::{EloConfig, RatingStore, StateSpaceRatings};
 use oracle_sim::{simulate_with_live, InProgress, LiveInputs, SimConfig, VenueAdj};
@@ -1309,6 +1310,7 @@ impl EngineState {
             report_card: self.report_card(),
             bt_champions: self.bt_champions(),
             consensus: self.consensus(),
+            reliability: self.reliability_curve(),
         }
     }
 
@@ -1403,6 +1405,24 @@ impl EngineState {
             worst_calls: worst,
             head_to_head,
         }
+    }
+
+    /// The headline forecaster's reliability curve over its own leak-free pre-match calls: bin every
+    /// class probability by predicted value and compare it to the frequency the outcome actually
+    /// occurred, with the expected calibration error. Ten equal-width bins.
+    fn reliability_curve(&self) -> ReliabilityReport {
+        let pairs: Vec<(Probabilities, Outcome)> = self
+            .tournament
+            .matches
+            .iter()
+            .filter(|m| m.is_finished())
+            .filter_map(|m| {
+                self.pre_match_forecast
+                    .get(&m.id)
+                    .map(|&p| (p, m.score.outcome()))
+            })
+            .collect();
+        reliability(&pairs, 10)
     }
 
     /// Score one forecaster's pre-match calls against the finished matches (accuracy, Brier,
@@ -1746,6 +1766,57 @@ mod tests {
         assert!((total - 1.0).abs() < 1e-6, "consensus mass = {total}");
         // Ranked by consensus, descending.
         assert!(c.teams.windows(2).all(|w| w[0].consensus >= w[1].consensus));
+    }
+
+    #[test]
+    fn reliability_curve_scores_the_models_pre_match_calls() {
+        let mut state = fresh_state();
+        let metrics = Metrics::default();
+
+        // No results yet: the curve exists but is empty (ten bins, all unpopulated, zero error).
+        let pre = state.reliability_curve();
+        assert_eq!(pre.bins.len(), 10);
+        assert!(pre.bins.iter().all(|b| b.count == 0));
+        assert_eq!(pre.ece, 0.0);
+
+        // Finish a batch of group matches; each stores a leak-free pre-match forecast that the
+        // curve then scores.
+        let ids: Vec<(MatchId, TeamId, TeamId)> = state
+            .tournament
+            .matches
+            .iter()
+            .filter(|m| matches!(m.stage, Stage::Group(_)))
+            .take(24)
+            .map(|m| (m.id, m.home, m.away))
+            .collect();
+        for (id, home, away) in &ids {
+            let score = if home.0 < away.0 {
+                Scoreline::new(2, 0)
+            } else {
+                Scoreline::new(0, 2)
+            };
+            state.apply_event(
+                &MatchEvent::new(*id, 90, EventKind::FullTime { score }),
+                &metrics,
+            );
+        }
+
+        let r = state.reliability_curve();
+        assert_eq!(r.bins.len(), 10);
+        // Every match contributes its three class probabilities to exactly one bin each.
+        let total: usize = r.bins.iter().map(|b| b.count).sum();
+        assert_eq!(total, 3 * ids.len());
+        assert!((0.0..=1.0).contains(&r.ece), "ece in [0,1], got {}", r.ece);
+        // Each populated bin's mean prediction sits inside its own probability band.
+        for b in r.bins.iter().filter(|b| b.count > 0) {
+            assert!(
+                b.mean_pred >= b.lo - 1e-9 && b.mean_pred <= b.hi + 1e-9,
+                "bin [{}, {}] mean_pred {}",
+                b.lo,
+                b.hi,
+                b.mean_pred
+            );
+        }
     }
 
     fn state_with_threshold(threshold: u8) -> EngineState {

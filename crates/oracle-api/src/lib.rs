@@ -23,6 +23,7 @@
 //! | GET | `/report` | the model's self-scored report card on its own pre-match calls |
 //! | GET | `/bt/champions` | second model's live champion odds over the current knockout bracket |
 //! | GET | `/consensus` | consensus title forecast blending both models + their live divergence (JSD) |
+//! | GET | `/calibration` | the model's live reliability curve + expected calibration error |
 //! | GET | `/api/predict?home=&away=` | on-demand matchup forecast (any two teams) |
 //! | GET | `/api/explain?home=&away=` | factor attribution: why the model favours a side |
 //! | GET | `/api/bt?home=&away=` | second model (Bradley-Terry-Davidson) win/draw/loss |
@@ -117,6 +118,7 @@ pub fn router(engine: Arc<Engine>, explorer: ExplorerSlot) -> Router {
         .route("/report", get(report))
         .route("/bt/champions", get(bt_champions))
         .route("/consensus", get(consensus))
+        .route("/calibration", get(calibration))
         .route("/api/team", get(team_hub))
         // On-demand model queries (any matchup, posterior, custom simulation, ratings).
         .route("/api/predict", get(api_predict))
@@ -204,7 +206,7 @@ async fn api_info(
             "/ (live dashboard)", "/explore (model explorer)", "/team (fan team hub)",
             "/card (shareable prediction card)", "/health", "/teams", "/matches",
             "/predict/match/{id}", "/predict/tournament", "/upsets", "/report", "/bt/champions",
-            "/consensus", "/api/team?q=",
+            "/consensus", "/calibration", "/api/team?q=",
             "/api/predict?home=&away=", "/api/explain?home=&away=", "/api/posterior?home=&away=",
             "/api/bt?home=&away=", "/api/bt/champions",
             "/api/simulate?iters=&seed=", "/api/sensitivity?iters=&seed=",
@@ -539,6 +541,12 @@ async fn bt_champions(State(engine): State<Arc<Engine>>) -> Json<Vec<oracle_engi
 /// measuring how far they disagree. Empty until the knockout bracket is materialized.
 async fn consensus(State(engine): State<Arc<Engine>>) -> Json<oracle_engine::Consensus> {
     Json(engine.snapshot().consensus.clone())
+}
+
+/// The headline forecaster's live reliability curve + expected calibration error over its own
+/// leak-free pre-match calls (empty bins until matches finish).
+async fn calibration(State(engine): State<Arc<Engine>>) -> Json<oracle_engine::ReliabilityReport> {
+    Json(engine.snapshot().reliability.clone())
 }
 
 #[derive(Deserialize)]
@@ -1086,6 +1094,13 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         let cons = json(&body);
         assert!(cons["jsd"].is_number() && cons["teams"].is_array());
+
+        // The calibration report carries an expected calibration error and ten reliability bins.
+        let (status, body) = get(&state, "/calibration").await;
+        assert_eq!(status, StatusCode::OK);
+        let cal = json(&body);
+        assert!(cal["ece"].is_number());
+        assert_eq!(cal["bins"].as_array().unwrap().len(), 10);
 
         let (status, body) = get(&state, "/api/team?q=Brazil").await;
         assert_eq!(status, StatusCode::OK);
