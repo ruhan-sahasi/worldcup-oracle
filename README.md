@@ -58,6 +58,7 @@ fully offline with **zero keys and zero network**.
 | **Risers and fallers** - each team's live power-ranking place against its pre-tournament seeding | who has most over- or under-performed expectations, straight from the gap between the prior and the prior-free ranking |
 | **Road to the final** - each contender's remaining path, with the probability-weighted strength of the opponent it would face each round (from the same bracket DP) | who has the easiest or hardest road left, computed exactly rather than sampled |
 | **Predicted bracket** - the single most likely completion of the knockout bracket, every remaining tie resolved to its favourite up to a projected champion, with the joint probability of that exact bracket | a concrete "here is what the model expects", plus an honest number for how unlikely any exact bracket is |
+| **Match leverage** - each current-round tie scored by the total swing in champion odds between its two results (re-running the bracket DP under each) | which game matters most to the title race, accounting for who sits where in the bracket, not just how close the tie is |
 | **Bayesian live updater** with **score effects** | conditions on score, minute, and red cards; a trailing team chases and a leading team defends |
 | **Lineup adjustment** | a confirmed XI shifts each team's attack and defense |
 | **Suspension tracking** | yellow-card accumulation drops a suspended starter from the next match before its lineup is known |

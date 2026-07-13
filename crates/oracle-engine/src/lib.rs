@@ -30,8 +30,9 @@ pub use oracle_model::ReliabilityReport;
 pub use query::{signal_sensitivity, Explorer, SignalContribution};
 pub use snapshot::{
     AdaptiveState, BracketRound, BracketTie, BtChampion, Call, Consensus, ConsensusTeam, FormLine,
-    MatchPrediction, Metrics, ModelScore, PowerRanking, PowerTeam, PredictedBracket, RatingEntry,
-    ReportCard, RoadBoard, RoadRound, RoadTeam, Snapshot, TournamentForm, Upset, WinProbSample,
+    LeverageTie, MatchLeverage, MatchPrediction, Metrics, ModelScore, PowerRanking, PowerTeam,
+    PredictedBracket, RatingEntry, ReportCard, RoadBoard, RoadRound, RoadTeam, Snapshot,
+    TournamentForm, Upset, WinProbSample,
 };
 
 use arc_swap::ArcSwap;
@@ -1089,6 +1090,68 @@ impl EngineState {
         }
     }
 
+    /// How much each undecided tie in the current knockout round would reshape the whole title race.
+    /// For a tie, the champion DP is re-run twice, once with each side forced through, and `swing` is
+    /// the total-variation distance between the two resulting champion distributions (in `[0, 1]`):
+    /// a tie between two genuine contenders deep in the bracket has high leverage, one between two
+    /// long shots little, however close the tie itself. Ranked by leverage. Empty until the bracket
+    /// is materialized.
+    fn match_leverage(&self) -> MatchLeverage {
+        let Some((idx, layer)) = self.bt_frontier() else {
+            return MatchLeverage::default();
+        };
+        let stage = Self::KO_PATH[idx];
+        // Fixtures in the same bracket order as the frontier layer.
+        let fixtures: Vec<(TeamId, TeamId, bool)> = self
+            .tournament
+            .matches
+            .iter()
+            .filter(|m| m.stage == stage)
+            .map(|m| (m.home, m.away, m.is_finished()))
+            .collect();
+        let advance = |a: TeamId, b: TeamId| self.bradley_terry.advance_probability(a, b);
+
+        let champ_if = |node: usize, team: TeamId| -> HashMap<TeamId, f64> {
+            let mut forced = layer.clone();
+            forced[node] = HashMap::from([(team, 1.0)]);
+            crate::query::champion_odds_from_layer(forced, advance)
+                .into_iter()
+                .collect()
+        };
+
+        let mut ties: Vec<LeverageTie> = fixtures
+            .iter()
+            .enumerate()
+            .filter(|(_, (_, _, finished))| !finished)
+            .map(|(node, &(home, away, _))| {
+                let ch = champ_if(node, home);
+                let ca = champ_if(node, away);
+                let swing = 0.5
+                    * ch.keys()
+                        .chain(ca.keys())
+                        .collect::<std::collections::HashSet<_>>()
+                        .into_iter()
+                        .map(|k| {
+                            (ch.get(k).copied().unwrap_or(0.0) - ca.get(k).copied().unwrap_or(0.0))
+                                .abs()
+                        })
+                        .sum::<f64>();
+                LeverageTie {
+                    home: self.name_of(home),
+                    away: self.name_of(away),
+                    home_advance: advance(home, away),
+                    swing,
+                }
+            })
+            .collect();
+        ties.sort_by(|a, b| {
+            b.swing
+                .partial_cmp(&a.swing)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        MatchLeverage { ties }
+    }
+
     /// A consensus title forecast from the two independent models: the goal-model Monte-Carlo
     /// forecast and the Bradley-Terry bracket dynamic program. The consensus is a plain 50/50 average
     /// of the two champion distributions (both already condition on the live bracket), and `jsd` is
@@ -1503,6 +1566,7 @@ impl EngineState {
             form: self.tournament_form(),
             road: self.road_to_final(),
             predicted_bracket: self.predicted_bracket(),
+            leverage: self.match_leverage(),
         }
     }
 
@@ -2363,6 +2427,88 @@ mod tests {
                 assert!(prev.contains(tie.away.as_str()));
             }
         }
+    }
+
+    #[test]
+    fn match_leverage_ranks_ties_by_title_race_swing() {
+        let mut state = fresh_state_bt();
+        let metrics = Metrics::default();
+
+        // No bracket yet.
+        assert!(state.match_leverage().ties.is_empty());
+
+        // Finish the group stage so the Round of 32 materializes (all 16 ties undecided).
+        let groups: Vec<(MatchId, TeamId, TeamId)> = state
+            .tournament
+            .matches
+            .iter()
+            .filter(|m| matches!(m.stage, Stage::Group(_)))
+            .map(|m| (m.id, m.home, m.away))
+            .collect();
+        for (id, home, away) in groups {
+            let score = if home.0 < away.0 {
+                Scoreline::new(2, 0)
+            } else {
+                Scoreline::new(0, 2)
+            };
+            state.apply_event(
+                &MatchEvent::new(id, 90, EventKind::FullTime { score }),
+                &metrics,
+            );
+        }
+
+        let lev = state.match_leverage();
+        // Every one of the 16 undecided Round-of-32 ties is scored.
+        assert_eq!(lev.ties.len(), 16);
+        // Swings are total-variation distances, so bounded, and each side's advance prob is a
+        // probability. The leverage of a single tie four rounds from the title is small but real.
+        for t in &lev.ties {
+            assert!(
+                (0.0..=1.0).contains(&t.swing),
+                "swing in [0,1], got {}",
+                t.swing
+            );
+            assert!(
+                t.swing > 0.0,
+                "an undecided tie moves the title race a little"
+            );
+            assert!((0.0..=1.0).contains(&t.home_advance));
+        }
+        // Ranked most consequential first.
+        assert!(lev.ties.windows(2).all(|w| w[0].swing >= w[1].swing));
+
+        // Sanity check the metric against a decisive round: finish the Round of 32, and the
+        // semi-finals (once materialized) must carry more title-race leverage than a Round-of-32
+        // tie did, since they are one step from the final.
+        let r32: Vec<(MatchId, TeamId, TeamId)> = state
+            .tournament
+            .matches
+            .iter()
+            .filter(|m| m.stage == Stage::RoundOf32)
+            .map(|m| (m.id, m.home, m.away))
+            .collect();
+        let r32_max = lev.ties.first().map(|t| t.swing).unwrap();
+        for (id, home, away) in r32 {
+            let score = if home.0 < away.0 {
+                Scoreline::new(2, 0)
+            } else {
+                Scoreline::new(0, 2)
+            };
+            state.apply_event(
+                &MatchEvent::new(id, 90, EventKind::FullTime { score }),
+                &metrics,
+            );
+        }
+        // Now the deepest round is the Round of 16; the most consequential tie there swings the
+        // title race more than the most consequential Round-of-32 tie did, being a round closer to
+        // the final.
+        let r16 = state.match_leverage();
+        assert_eq!(r16.ties.len(), 8);
+        let r16_max = r16.ties.first().map(|t| t.swing).unwrap();
+        assert!(
+            r16_max > r32_max,
+            "a round closer to the final carries more leverage: {r16_max} vs {r32_max}"
+        );
     }
 
     fn state_with_threshold(threshold: u8) -> EngineState {

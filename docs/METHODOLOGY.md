@@ -172,6 +172,15 @@ gives the probability that this *exact* bracket occurs, which is deliberately re
 typically a fraction of a percent, an honest reminder that a single most-likely bracket is still an
 unlikely one, and that the champion-odds distribution, not the modal bracket, is the real forecast.
 
+The same DP measures **match leverage**: how much a single tie's result reshapes the whole title
+race. For each undecided tie in the current round the champion DP is re-run twice, forcing each side
+through, and the leverage is the total-variation distance between the two resulting champion
+distributions. This captures something a scoreline-closeness heuristic cannot: a coin-flip between
+two long shots barely moves the title picture, while a tie between two contenders deep in the bracket
+moves it a great deal, so the ranking reflects who sits where in the bracket, not just how even the
+tie is. By construction leverage grows as the final nears, since each result is diluted by fewer
+remaining rounds.
+
 ## Evaluation philosophy
 
 Skill is the point, so it is measured carefully:

@@ -167,6 +167,9 @@ pub struct Snapshot {
     /// The model's single most likely completion of the knockout bracket, with the chance that exact
     /// bracket occurs. Empty until the knockout bracket is materialized.
     pub predicted_bracket: PredictedBracket,
+    /// The current knockout round's ties ranked by how much each would reshape the title race. Empty
+    /// until the knockout bracket is materialized.
+    pub leverage: MatchLeverage,
 }
 
 /// One team's live champion probability from the second model (Bradley-Terry) over the current
@@ -291,6 +294,24 @@ pub struct PredictedBracket {
     pub champion: String,
     pub probability: f64,
     pub rounds: Vec<BracketRound>,
+}
+
+/// One undecided current-round tie and how much its result reshapes the title race. `swing` is the
+/// total-variation distance (in `[0, 1]`) between the champion distributions that follow from each
+/// side advancing; `home_advance` is the home side's win probability, for context.
+#[derive(Debug, Clone, Serialize)]
+pub struct LeverageTie {
+    pub home: String,
+    pub away: String,
+    pub home_advance: f64,
+    pub swing: f64,
+}
+
+/// The current knockout round's ties ranked by how much each would reshape the title race. Empty
+/// until the bracket is materialized (and once every tie in the round is decided).
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct MatchLeverage {
+    pub ties: Vec<LeverageTie>,
 }
 
 impl Snapshot {

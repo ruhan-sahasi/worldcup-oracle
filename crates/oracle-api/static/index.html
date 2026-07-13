@@ -141,6 +141,12 @@
       <div class="legend"><span>expected opponent Elo each remaining round, from the bracket DP · lower average = easier road</span></div>
     </section>
 
+    <section class="panel">
+      <h2>Match leverage · which tie reshapes the race</h2>
+      <div id="leverage"><div class="empty">Materializes once the knockout bracket is set.</div></div>
+      <div class="legend"><span>total swing in champion odds between the two results · higher = more consequential</span></div>
+    </section>
+
     <section class="panel full">
       <h2>Predicted bracket · the model's most likely path</h2>
       <div id="bracket"><div class="empty">Materializes once the knockout bracket is set.</div></div>
@@ -483,6 +489,24 @@
       `<div style="display:flex;gap:12px;overflow-x:auto;padding-bottom:6px">${cols}</div>`;
   }
 
+  async function refreshLeverage() {
+    let l; try { l = await (await fetch("/leverage")).json(); } catch { return; }
+    const box = el("leverage");
+    const ties = l.ties || [];
+    if (ties.length === 0) {
+      box.innerHTML = '<div class="empty">Materializes once the knockout bracket is set.</div>';
+      return;
+    }
+    const top = ties.slice(0, 10);
+    const max = Math.max(...top.map(t => t.swing), 1e-6);
+    box.innerHTML = top.map((t) => `
+      <div class="odds-row">
+        <span class="name">${esc(t.home)} v ${esc(t.away)}</span>
+        <span class="odds-bar"><span style="width:${100 * t.swing / max}%"></span></span>
+        <span class="pct">${(t.swing * 100).toFixed(1)} <span class="meta">${(t.home_advance * 100).toFixed(0)}% ${esc(t.home)}</span></span>
+      </div>`).join("");
+  }
+
   function connect() {
     const proto = location.protocol === "https:" ? "wss" : "ws";
     const ws = new WebSocket(`${proto}://${location.host}/live`);
@@ -507,7 +531,8 @@
   refreshForm();
   refreshRoad();
   refreshBracket();
-  setInterval(() => { refreshUpsets(); refreshReport(); refreshBtChampions(); refreshConsensus(); refreshCalibration(); refreshPower(); refreshForm(); refreshRoad(); refreshBracket(); }, 20000);
+  refreshLeverage();
+  setInterval(() => { refreshUpsets(); refreshReport(); refreshBtChampions(); refreshConsensus(); refreshCalibration(); refreshPower(); refreshForm(); refreshRoad(); refreshBracket(); refreshLeverage(); }, 20000);
 })();
 </script>
 </body>
