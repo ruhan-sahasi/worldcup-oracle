@@ -176,6 +176,8 @@ pub struct Snapshot {
     pub timeline: ChampionTimeline,
     /// The biggest recent movers in the title race (rising and falling championship odds).
     pub momentum: Momentum,
+    /// When the title favourite changed hands over the tournament, with the current leader.
+    pub lead_changes: LeadChanges,
 }
 
 /// One team's live champion probability from the second model (Bradley-Terry) over the current
@@ -372,6 +374,24 @@ pub struct Momentum {
     pub window: usize,
     pub risers: Vec<MomentumTeam>,
     pub fallers: Vec<MomentumTeam>,
+}
+
+/// One handover of the title favourite: when it happened, who lost the lead (`from`, empty for the
+/// first favourite of the tournament), who took it, and the new leader's championship odds.
+#[derive(Debug, Clone, Serialize)]
+pub struct LeadChange {
+    pub at: DateTime<Utc>,
+    pub from: String,
+    pub to: String,
+    pub to_odds: f64,
+}
+
+/// The title favourite's handovers over the tournament, in order, with the current leader. Empty
+/// until a forecast has been recorded.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct LeadChanges {
+    pub current_leader: String,
+    pub changes: Vec<LeadChange>,
 }
 
 /// The information-theoretic shape of a probability distribution: its Shannon entropy in bits, the

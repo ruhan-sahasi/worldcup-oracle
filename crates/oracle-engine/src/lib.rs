@@ -30,10 +30,10 @@ pub use oracle_model::ReliabilityReport;
 pub use query::{signal_sensitivity, Explorer, SignalContribution};
 pub use snapshot::{
     AdaptiveState, BracketRound, BracketTie, BtChampion, Call, ChampionTimeline, Consensus,
-    ConsensusTeam, FormLine, LeverageTie, MatchLeverage, MatchPrediction, Metrics, ModelScore,
-    Momentum, MomentumTeam, Openness, PowerRanking, PowerTeam, PredictedBracket, RatingEntry,
-    ReportCard, RoadBoard, RoadRound, RoadTeam, Snapshot, TeamTrajectory, TournamentForm, Upset,
-    WinProbSample,
+    ConsensusTeam, FormLine, LeadChange, LeadChanges, LeverageTie, MatchLeverage, MatchPrediction,
+    Metrics, ModelScore, Momentum, MomentumTeam, Openness, PowerRanking, PowerTeam,
+    PredictedBracket, RatingEntry, ReportCard, RoadBoard, RoadRound, RoadTeam, Snapshot,
+    TeamTrajectory, TournamentForm, Upset, WinProbSample,
 };
 
 use arc_swap::ArcSwap;
@@ -479,6 +479,10 @@ const CHAMPION_HISTORY_CAP: usize = 512;
 
 /// How many forecast recomputes back the title-odds momentum looks (clamped to the history length).
 const MOMENTUM_WINDOW: usize = 10;
+
+/// Minimum lead (in championship probability) a new favourite must hold over the old one before a
+/// lead change is recorded, so Monte-Carlo jitter between near-tied favourites is not counted.
+const LEAD_MARGIN: f64 = 0.005;
 
 /// Finished matches needed before the context gain moves off 1.0.
 const CONTEXT_CALIB_MIN: usize = 20;
@@ -1493,6 +1497,63 @@ impl EngineState {
         }
     }
 
+    /// When the title favourite changed hands over the tournament, read off the recorded history. A
+    /// flip is only counted once the new leader is ahead of the old by more than [`LEAD_MARGIN`], so
+    /// Monte-Carlo jitter between two near-tied favourites does not manufacture spurious changes. The
+    /// first entry marks who took the lead initially (its `from` is empty). Empty until history
+    /// exists; the timeline is capped to the most recent changes.
+    fn lead_changes(&self) -> LeadChanges {
+        const MAX_CHANGES: usize = 20;
+        let mut changes: Vec<LeadChange> = Vec::new();
+        let mut leader: Option<TeamId> = None;
+        for sample in &self.champion_history {
+            let Some(&(top, top_odds)) = sample
+                .odds
+                .iter()
+                .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
+            else {
+                continue;
+            };
+            match leader {
+                Some(current) if current == top => {}
+                Some(current) => {
+                    let current_odds = sample
+                        .odds
+                        .iter()
+                        .find(|(t, _)| *t == current)
+                        .map(|(_, p)| *p)
+                        .unwrap_or(0.0);
+                    if top_odds - current_odds > LEAD_MARGIN {
+                        changes.push(LeadChange {
+                            at: sample.at,
+                            from: self.name_of(current),
+                            to: self.name_of(top),
+                            to_odds: top_odds,
+                        });
+                        leader = Some(top);
+                    }
+                }
+                None => {
+                    changes.push(LeadChange {
+                        at: sample.at,
+                        from: String::new(),
+                        to: self.name_of(top),
+                        to_odds: top_odds,
+                    });
+                    leader = Some(top);
+                }
+            }
+        }
+        let current_leader = leader.map(|t| self.name_of(t)).unwrap_or_default();
+        if changes.len() > MAX_CHANGES {
+            changes.drain(0..changes.len() - MAX_CHANGES);
+        }
+        LeadChanges {
+            current_leader,
+            changes,
+        }
+    }
+
     fn name_of(&self, id: TeamId) -> String {
         self.names
             .get(&id)
@@ -1735,6 +1796,7 @@ impl EngineState {
             openness: self.openness(),
             timeline: self.champion_timeline(8),
             momentum: self.title_momentum(),
+            lead_changes: self.lead_changes(),
         }
     }
 
@@ -2799,6 +2861,44 @@ mod tests {
         assert_eq!(m.fallers.len(), 1);
         assert_eq!(m.fallers[0].team, state.name_of(b));
         assert!((m.fallers[0].delta + 0.2).abs() < 1e-9);
+    }
+
+    #[test]
+    fn lead_changes_track_the_favourite_handovers_with_hysteresis() {
+        let mut state = fresh_state();
+        // No history: no leader, no changes.
+        assert!(state.lead_changes().changes.is_empty());
+        assert!(state.lead_changes().current_leader.is_empty());
+
+        let at = state.last_update;
+        let (a, b) = (TeamId(1), TeamId(2));
+        let push = |state: &mut EngineState, pa: f64, pb: f64| {
+            state.champion_history.push(ForecastSample {
+                at,
+                odds: vec![(a, pa), (b, pb)],
+            });
+        };
+        // A leads, then B clearly overtakes, then a near-tie that must NOT flip (inside the margin),
+        // then A retakes decisively.
+        push(&mut state, 0.40, 0.30); // initial leader A
+        push(&mut state, 0.35, 0.36); // B ahead by 0.01 > margin -> change A -> B
+        push(&mut state, 0.361, 0.360); // A ahead by 0.001 < margin -> no change, stays B
+        push(&mut state, 0.50, 0.20); // A ahead by 0.30 -> change B -> A
+
+        let lc = state.lead_changes();
+        assert_eq!(lc.current_leader, state.name_of(a));
+        assert_eq!(
+            lc.changes.len(),
+            3,
+            "initial + two real flips, the near-tie ignored"
+        );
+        assert_eq!(lc.changes[0].from, "");
+        assert_eq!(lc.changes[0].to, state.name_of(a));
+        assert_eq!(lc.changes[1].from, state.name_of(a));
+        assert_eq!(lc.changes[1].to, state.name_of(b));
+        assert_eq!(lc.changes[2].from, state.name_of(b));
+        assert_eq!(lc.changes[2].to, state.name_of(a));
+        assert!((lc.changes[2].to_odds - 0.50).abs() < 1e-9);
     }
 
     fn state_with_threshold(threshold: u8) -> EngineState {

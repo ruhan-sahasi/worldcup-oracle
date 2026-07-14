@@ -189,6 +189,16 @@ Dividing by the ceiling `log2(k)` over the `k` teams with any chance gives a nor
 `[0, 1]`. Unlike the bracket views this is meaningful from the group stage onward, and it falls
 monotonically in spirit as results eliminate teams and concentrate the mass on the survivors.
 
+The engine also keeps the title race's **trajectory**, not only its current state: one sample of the
+champion odds per forecast recompute, in a bounded ring buffer that covers a whole tournament. Two
+readings fall out of that series. **Momentum** compares the latest odds with a sample a fixed window
+of recomputes back and reports the biggest risers and fallers, so a team surging or fading reads
+immediately (a fresh contender counts up from zero, a just-eliminated one down to it). **Lead
+changes** walk the series and record each time the favourite changed hands, with a small hysteresis
+margin so Monte-Carlo jitter between two near-tied favourites never manufactures a spurious flip. It
+is persisted server-side, so the story survives a browser reload rather than living only in the
+dashboard's in-memory chart.
+
 ## Evaluation philosophy
 
 Skill is the point, so it is measured carefully:

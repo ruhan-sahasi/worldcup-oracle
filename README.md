@@ -62,6 +62,7 @@ fully offline with **zero keys and zero network**.
 | **Title-race openness** - the Shannon **entropy** of the champion odds, its **effective number of contenders** (`2^entropy`), and a normalized openness | one honest number for how decided the tournament is, live from the group stage on and falling as the field narrows |
 | **Champion-odds history** - a bounded server-side time series of the title odds, one sample per forecast recompute, exposed as the top contenders' aligned trajectories | the title race's whole trajectory persisted on the server (not just the browser), the foundation for momentum and lead-change tracking |
 | **Title momentum** - the biggest risers and fallers in championship odds over the last several recomputes, read off the recorded history | who is surging or fading right now, a moving-picture complement to the static odds table |
+| **Lead changes** - when the title favourite changed hands over the tournament, with hysteresis so Monte-Carlo jitter between near-tied favourites is not counted | the story of the race in one timeline: who has worn the favourite tag and when it flipped |
 | **Bayesian live updater** with **score effects** | conditions on score, minute, and red cards; a trailing team chases and a leading team defends |
 | **Lineup adjustment** | a confirmed XI shifts each team's attack and defense |
 | **Suspension tracking** | yellow-card accumulation drops a suspended starter from the next match before its lineup is known |

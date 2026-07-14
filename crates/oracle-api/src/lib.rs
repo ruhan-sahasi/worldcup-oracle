@@ -32,6 +32,7 @@
 //! | GET | `/openness` | how open the title race is: champion-odds entropy + effective contenders |
 //! | GET | `/history` | championship-odds time series for the current top contenders |
 //! | GET | `/momentum` | biggest recent movers in the title race (rising and falling odds) |
+//! | GET | `/lead-changes` | when the title favourite changed hands over the tournament |
 //! | GET | `/api/predict?home=&away=` | on-demand matchup forecast (any two teams) |
 //! | GET | `/api/explain?home=&away=` | factor attribution: why the model favours a side |
 //! | GET | `/api/bt?home=&away=` | second model (Bradley-Terry-Davidson) win/draw/loss |
@@ -135,6 +136,7 @@ pub fn router(engine: Arc<Engine>, explorer: ExplorerSlot) -> Router {
         .route("/openness", get(openness))
         .route("/history", get(history))
         .route("/momentum", get(momentum))
+        .route("/lead-changes", get(lead_changes))
         .route("/api/team", get(team_hub))
         // On-demand model queries (any matchup, posterior, custom simulation, ratings).
         .route("/api/predict", get(api_predict))
@@ -223,7 +225,7 @@ async fn api_info(
             "/card (shareable prediction card)", "/health", "/teams", "/matches",
             "/predict/match/{id}", "/predict/tournament", "/upsets", "/report", "/bt/champions",
             "/consensus", "/calibration", "/power", "/form", "/road", "/bracket", "/leverage",
-            "/openness", "/history", "/momentum", "/api/team?q=",
+            "/openness", "/history", "/momentum", "/lead-changes", "/api/team?q=",
             "/api/predict?home=&away=", "/api/explain?home=&away=", "/api/posterior?home=&away=",
             "/api/bt?home=&away=", "/api/bt/champions",
             "/api/simulate?iters=&seed=", "/api/sensitivity?iters=&seed=",
@@ -612,6 +614,12 @@ async fn history(State(engine): State<Arc<Engine>>) -> Json<oracle_engine::Champ
 /// most over the last several forecast recomputes. Empty until enough history has accumulated.
 async fn momentum(State(engine): State<Arc<Engine>>) -> Json<oracle_engine::Momentum> {
     Json(engine.snapshot().momentum.clone())
+}
+
+/// When the title favourite changed hands over the tournament, with the current leader. Empty until
+/// a forecast has been recorded.
+async fn lead_changes(State(engine): State<Arc<Engine>>) -> Json<oracle_engine::LeadChanges> {
+    Json(engine.snapshot().lead_changes.clone())
 }
 
 #[derive(Deserialize)]
@@ -1214,6 +1222,12 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         let mom = json(&body);
         assert!(mom["risers"].is_array() && mom["fallers"].is_array());
+
+        // The lead-changes board carries a current leader and a changes array.
+        let (status, body) = get(&state, "/lead-changes").await;
+        assert_eq!(status, StatusCode::OK);
+        let lc = json(&body);
+        assert!(lc["current_leader"].is_string() && lc["changes"].is_array());
 
         let (status, body) = get(&state, "/api/team?q=Brazil").await;
         assert_eq!(status, StatusCode::OK);

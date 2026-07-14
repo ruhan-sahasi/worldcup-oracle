@@ -109,6 +109,11 @@
     </section>
 
     <section class="panel">
+      <h2>Lead changes · who has held the favourite tag</h2>
+      <div id="leadchanges"><div class="empty">Building history…</div></div>
+    </section>
+
+    <section class="panel">
       <h2>Upset radar</h2>
       <div id="upsets"><div class="empty">Loading…</div></div>
     </section>
@@ -552,6 +557,23 @@
       (fallers.length ? `<h3>Falling</h3>${fallers.map(t => row(t, false)).join("")}` : "");
   }
 
+  async function refreshLeadChanges() {
+    let lc; try { lc = await (await fetch("/lead-changes")).json(); } catch { return; }
+    const box = el("leadchanges");
+    const changes = lc.changes || [];
+    if (changes.length === 0) { box.innerHTML = '<div class="empty">Building history…</div>'; return; }
+    const rows = changes.slice().reverse().map((c) => {
+      const when = c.at ? new Date(c.at) : null;
+      const t = when && !isNaN(when) ? when.toLocaleString() : "";
+      const desc = c.from ? `${esc(c.to)} overtook ${esc(c.from)}` : `${esc(c.to)} took the lead`;
+      return `<div class="upset"><span class="chance">${(c.to_odds * 100).toFixed(1)}%</span>
+        <span>${desc} <span class="meta">${t}</span></span></div>`;
+    }).join("");
+    box.innerHTML =
+      `<div class="rcstat">current favourite: <b>${esc(lc.current_leader)}</b>
+        <span class="meta">${changes.length} lead change${changes.length === 1 ? "" : "s"} so far</span></div>` + rows;
+  }
+
   function connect() {
     const proto = location.protocol === "https:" ? "wss" : "ws";
     const ws = new WebSocket(`${proto}://${location.host}/live`);
@@ -579,7 +601,8 @@
   refreshLeverage();
   refreshOpenness();
   refreshMomentum();
-  setInterval(() => { refreshUpsets(); refreshReport(); refreshBtChampions(); refreshConsensus(); refreshCalibration(); refreshPower(); refreshForm(); refreshRoad(); refreshBracket(); refreshLeverage(); refreshOpenness(); refreshMomentum(); }, 20000);
+  refreshLeadChanges();
+  setInterval(() => { refreshUpsets(); refreshReport(); refreshBtChampions(); refreshConsensus(); refreshCalibration(); refreshPower(); refreshForm(); refreshRoad(); refreshBracket(); refreshLeverage(); refreshOpenness(); refreshMomentum(); refreshLeadChanges(); }, 20000);
 })();
 </script>
 </body>
