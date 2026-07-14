@@ -29,10 +29,10 @@ pub use event_log::EventLog;
 pub use oracle_model::ReliabilityReport;
 pub use query::{signal_sensitivity, Explorer, SignalContribution};
 pub use snapshot::{
-    AdaptiveState, BracketRound, BracketTie, BtChampion, Call, Consensus, ConsensusTeam, FormLine,
-    LeverageTie, MatchLeverage, MatchPrediction, Metrics, ModelScore, Openness, PowerRanking,
-    PowerTeam, PredictedBracket, RatingEntry, ReportCard, RoadBoard, RoadRound, RoadTeam, Snapshot,
-    TournamentForm, Upset, WinProbSample,
+    AdaptiveState, BracketRound, BracketTie, BtChampion, Call, ChampionTimeline, Consensus,
+    ConsensusTeam, FormLine, LeverageTie, MatchLeverage, MatchPrediction, Metrics, ModelScore,
+    Openness, PowerRanking, PowerTeam, PredictedBracket, RatingEntry, ReportCard, RoadBoard,
+    RoadRound, RoadTeam, Snapshot, TeamTrajectory, TournamentForm, Upset, WinProbSample,
 };
 
 use arc_swap::ArcSwap;
@@ -454,11 +454,27 @@ struct EngineState {
     /// post-hoc **temperature scaling**, recalibrating the model against the tournament as it
     /// plays. `1.0` (the identity) until enough matches have finished.
     calib_temperature: f64,
+    /// A bounded time series of the championship odds, one sample per forecast recompute, so the
+    /// engine can serve the title race's trajectory (momentum, lead changes) rather than only its
+    /// current state. Oldest samples are dropped past [`CHAMPION_HISTORY_CAP`].
+    champion_history: Vec<ForecastSample>,
+}
+
+/// One recorded point on the championship-odds time series: the odds of every team with a title
+/// chance at that moment, stamped with the feed time.
+#[derive(Debug, Clone)]
+struct ForecastSample {
+    at: chrono::DateTime<chrono::Utc>,
+    odds: Vec<(TeamId, f64)>,
 }
 
 /// Finished matches needed before the live temperature recalibration kicks in (below this it stays
 /// at the identity, since a handful of results cannot pin down a calibration correction).
 const MIN_CALIB_SAMPLES: usize = 12;
+
+/// Cap on the recorded championship-odds time series (oldest samples drop off). A tournament sees a
+/// few hundred forecast recomputes, so this comfortably covers the whole event.
+const CHAMPION_HISTORY_CAP: usize = 512;
 
 /// Finished matches needed before the context gain moves off 1.0.
 const CONTEXT_CALIB_MIN: usize = 20;
@@ -531,6 +547,7 @@ impl EngineState {
             last_update: chrono::Utc::now(),
             calib_pairs: Vec::new(),
             calib_temperature: 1.0,
+            champion_history: Vec::new(),
         }
     }
 
@@ -1358,6 +1375,63 @@ impl EngineState {
             &inputs,
             self.live_config,
         );
+        self.record_history();
+    }
+
+    /// Append the current championship odds to the bounded time series (oldest dropped past the
+    /// cap), so the engine can serve the title race's trajectory and not only its current state.
+    fn record_history(&mut self) {
+        let odds: Vec<(TeamId, f64)> = self
+            .last_forecast
+            .teams
+            .iter()
+            .filter(|t| t.p_champion > 0.0)
+            .map(|t| (t.team, t.p_champion))
+            .collect();
+        self.champion_history.push(ForecastSample {
+            at: self.last_update,
+            odds,
+        });
+        if self.champion_history.len() > CHAMPION_HISTORY_CAP {
+            let excess = self.champion_history.len() - CHAMPION_HISTORY_CAP;
+            self.champion_history.drain(0..excess);
+        }
+    }
+
+    /// The championship-odds time series for the current top `top_n` contenders: each one's title
+    /// probability at every recorded sample (aligned to a shared axis, zero where it had no chance),
+    /// with the sample timestamps. Empty until a forecast has been recorded.
+    fn champion_timeline(&self, top_n: usize) -> ChampionTimeline {
+        let Some(latest) = self.champion_history.last() else {
+            return ChampionTimeline::default();
+        };
+        let mut ranked = latest.odds.clone();
+        ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        let at: Vec<chrono::DateTime<chrono::Utc>> =
+            self.champion_history.iter().map(|s| s.at).collect();
+        let series = ranked
+            .iter()
+            .take(top_n)
+            .map(|&(team, _)| TeamTrajectory {
+                team: self.name_of(team),
+                points: self
+                    .champion_history
+                    .iter()
+                    .map(|s| {
+                        s.odds
+                            .iter()
+                            .find(|(t, _)| *t == team)
+                            .map(|(_, p)| *p)
+                            .unwrap_or(0.0)
+                    })
+                    .collect(),
+            })
+            .collect();
+        ChampionTimeline {
+            samples: self.champion_history.len(),
+            at,
+            series,
+        }
     }
 
     fn name_of(&self, id: TeamId) -> String {
@@ -1600,6 +1674,7 @@ impl EngineState {
             predicted_bracket: self.predicted_bracket(),
             leverage: self.match_leverage(),
             openness: self.openness(),
+            timeline: self.champion_timeline(8),
         }
     }
 
@@ -2598,6 +2673,42 @@ mod tests {
             o.contenders_alive,
             narrowed.contenders_alive
         );
+    }
+
+    #[test]
+    fn champion_history_records_a_bounded_aligned_time_series() {
+        let mut state = fresh_state();
+        // Nothing recorded yet.
+        assert_eq!(state.champion_timeline(8).samples, 0);
+
+        // Each forecast recompute appends one sample.
+        for _ in 0..3 {
+            state.recompute_forecast();
+        }
+        let tl = state.champion_timeline(8);
+        assert_eq!(tl.samples, 3);
+        assert_eq!(tl.at.len(), 3);
+        assert!(!tl.series.is_empty() && tl.series.len() <= 8);
+        // Every trajectory is aligned to the shared sample axis and holds valid probabilities.
+        for s in &tl.series {
+            assert_eq!(s.points.len(), 3);
+            assert!(s.points.iter().all(|p| (0.0..=1.0).contains(p)));
+        }
+        // The series are the current top contenders, strongest latest odds first.
+        let latest: Vec<f64> = tl
+            .series
+            .iter()
+            .map(|s| *s.points.last().unwrap())
+            .collect();
+        assert!(latest.windows(2).all(|w| w[0] >= w[1]));
+
+        // The buffer is bounded: recording past the cap drops the oldest (cheap direct calls, no
+        // simulation, since record_history just snapshots the last forecast).
+        for _ in 0..CHAMPION_HISTORY_CAP + 50 {
+            state.record_history();
+        }
+        assert_eq!(state.champion_history.len(), CHAMPION_HISTORY_CAP);
+        assert_eq!(state.champion_timeline(8).samples, CHAMPION_HISTORY_CAP);
     }
 
     fn state_with_threshold(threshold: u8) -> EngineState {

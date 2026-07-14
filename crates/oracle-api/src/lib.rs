@@ -30,6 +30,7 @@
 //! | GET | `/bracket` | the model's single most likely completion of the knockout bracket |
 //! | GET | `/leverage` | current-round ties ranked by how much each would reshape the title race |
 //! | GET | `/openness` | how open the title race is: champion-odds entropy + effective contenders |
+//! | GET | `/history` | championship-odds time series for the current top contenders |
 //! | GET | `/api/predict?home=&away=` | on-demand matchup forecast (any two teams) |
 //! | GET | `/api/explain?home=&away=` | factor attribution: why the model favours a side |
 //! | GET | `/api/bt?home=&away=` | second model (Bradley-Terry-Davidson) win/draw/loss |
@@ -131,6 +132,7 @@ pub fn router(engine: Arc<Engine>, explorer: ExplorerSlot) -> Router {
         .route("/bracket", get(bracket))
         .route("/leverage", get(leverage))
         .route("/openness", get(openness))
+        .route("/history", get(history))
         .route("/api/team", get(team_hub))
         // On-demand model queries (any matchup, posterior, custom simulation, ratings).
         .route("/api/predict", get(api_predict))
@@ -219,7 +221,7 @@ async fn api_info(
             "/card (shareable prediction card)", "/health", "/teams", "/matches",
             "/predict/match/{id}", "/predict/tournament", "/upsets", "/report", "/bt/champions",
             "/consensus", "/calibration", "/power", "/form", "/road", "/bracket", "/leverage",
-            "/openness", "/api/team?q=",
+            "/openness", "/history", "/api/team?q=",
             "/api/predict?home=&away=", "/api/explain?home=&away=", "/api/posterior?home=&away=",
             "/api/bt?home=&away=", "/api/bt/champions",
             "/api/simulate?iters=&seed=", "/api/sensitivity?iters=&seed=",
@@ -596,6 +598,12 @@ async fn leverage(State(engine): State<Arc<Engine>>) -> Json<oracle_engine::Matc
 /// and a normalized openness in [0, 1]. Meaningful from the group stage onward.
 async fn openness(State(engine): State<Arc<Engine>>) -> Json<oracle_engine::Openness> {
     Json(engine.snapshot().openness.clone())
+}
+
+/// The championship-odds time series for the current top contenders over the tournament so far (the
+/// title race's trajectory, persisted server-side rather than only in the browser).
+async fn history(State(engine): State<Arc<Engine>>) -> Json<oracle_engine::ChampionTimeline> {
+    Json(engine.snapshot().timeline.clone())
 }
 
 #[derive(Deserialize)]
@@ -1186,6 +1194,12 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         let op = json(&body);
         assert!(op["entropy_bits"].is_number() && op["effective_contenders"].is_number());
+
+        // The champion timeline carries a sample count and a series array.
+        let (status, body) = get(&state, "/history").await;
+        assert_eq!(status, StatusCode::OK);
+        let hist = json(&body);
+        assert!(hist["samples"].is_number() && hist["series"].is_array());
 
         let (status, body) = get(&state, "/api/team?q=Brazil").await;
         assert_eq!(status, StatusCode::OK);

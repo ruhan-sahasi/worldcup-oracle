@@ -172,6 +172,8 @@ pub struct Snapshot {
     pub leverage: MatchLeverage,
     /// How open the title race is (entropy of the champion odds, effective number of contenders).
     pub openness: Openness,
+    /// The championship-odds time series for the current top contenders over the tournament so far.
+    pub timeline: ChampionTimeline,
 }
 
 /// One team's live champion probability from the second model (Bradley-Terry) over the current
@@ -333,6 +335,23 @@ pub struct Openness {
     pub favorite_prob: f64,
     /// Combined championship probability of the top four contenders (a concentration measure).
     pub top4_share: f64,
+}
+
+/// One team's championship-probability trajectory over the recorded history, aligned to the shared
+/// sample axis (zero where the team had no title chance at that point).
+#[derive(Debug, Clone, Serialize)]
+pub struct TeamTrajectory {
+    pub team: String,
+    pub points: Vec<f64>,
+}
+
+/// The championship-odds time series: the current top contenders' trajectories over the tournament
+/// so far, with the timestamp of each recorded sample. Empty until a forecast has been recorded.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct ChampionTimeline {
+    pub samples: usize,
+    pub at: Vec<DateTime<Utc>>,
+    pub series: Vec<TeamTrajectory>,
 }
 
 /// The information-theoretic shape of a probability distribution: its Shannon entropy in bits, the
