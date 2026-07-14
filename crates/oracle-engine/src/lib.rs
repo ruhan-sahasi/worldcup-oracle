@@ -31,8 +31,9 @@ pub use query::{signal_sensitivity, Explorer, SignalContribution};
 pub use snapshot::{
     AdaptiveState, BracketRound, BracketTie, BtChampion, Call, ChampionTimeline, Consensus,
     ConsensusTeam, FormLine, LeverageTie, MatchLeverage, MatchPrediction, Metrics, ModelScore,
-    Openness, PowerRanking, PowerTeam, PredictedBracket, RatingEntry, ReportCard, RoadBoard,
-    RoadRound, RoadTeam, Snapshot, TeamTrajectory, TournamentForm, Upset, WinProbSample,
+    Momentum, MomentumTeam, Openness, PowerRanking, PowerTeam, PredictedBracket, RatingEntry,
+    ReportCard, RoadBoard, RoadRound, RoadTeam, Snapshot, TeamTrajectory, TournamentForm, Upset,
+    WinProbSample,
 };
 
 use arc_swap::ArcSwap;
@@ -475,6 +476,9 @@ const MIN_CALIB_SAMPLES: usize = 12;
 /// Cap on the recorded championship-odds time series (oldest samples drop off). A tournament sees a
 /// few hundred forecast recomputes, so this comfortably covers the whole event.
 const CHAMPION_HISTORY_CAP: usize = 512;
+
+/// How many forecast recomputes back the title-odds momentum looks (clamped to the history length).
+const MOMENTUM_WINDOW: usize = 10;
 
 /// Finished matches needed before the context gain moves off 1.0.
 const CONTEXT_CALIB_MIN: usize = 20;
@@ -1434,6 +1438,61 @@ impl EngineState {
         }
     }
 
+    /// The biggest recent movers in the title race: comparing the latest championship odds with a
+    /// sample up to [`MOMENTUM_WINDOW`] recomputes back, the teams whose odds have risen or fallen
+    /// most. A team absent from one end counts as zero there, so a fresh contender reads as a riser
+    /// and a just-eliminated one as a faller. Empty until at least two samples exist.
+    fn title_momentum(&self) -> Momentum {
+        let n = self.champion_history.len();
+        if n < 2 {
+            return Momentum::default();
+        }
+        let window = MOMENTUM_WINDOW.min(n - 1);
+        let now: HashMap<TeamId, f64> = self.champion_history[n - 1].odds.iter().copied().collect();
+        let past: HashMap<TeamId, f64> = self.champion_history[n - 1 - window]
+            .odds
+            .iter()
+            .copied()
+            .collect();
+        let teams: std::collections::HashSet<TeamId> =
+            now.keys().chain(past.keys()).copied().collect();
+        let mut movers: Vec<MomentumTeam> = teams
+            .into_iter()
+            .map(|team| {
+                let current = now.get(&team).copied().unwrap_or(0.0);
+                let before = past.get(&team).copied().unwrap_or(0.0);
+                MomentumTeam {
+                    team: self.name_of(team),
+                    now: current,
+                    delta: current - before,
+                }
+            })
+            .collect();
+        movers.sort_by(|a, b| {
+            b.delta
+                .partial_cmp(&a.delta)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        let risers: Vec<MomentumTeam> = movers
+            .iter()
+            .filter(|m| m.delta > 1e-9)
+            .take(5)
+            .cloned()
+            .collect();
+        let fallers: Vec<MomentumTeam> = movers
+            .iter()
+            .rev()
+            .filter(|m| m.delta < -1e-9)
+            .take(5)
+            .cloned()
+            .collect();
+        Momentum {
+            window,
+            risers,
+            fallers,
+        }
+    }
+
     fn name_of(&self, id: TeamId) -> String {
         self.names
             .get(&id)
@@ -1675,6 +1734,7 @@ impl EngineState {
             leverage: self.match_leverage(),
             openness: self.openness(),
             timeline: self.champion_timeline(8),
+            momentum: self.title_momentum(),
         }
     }
 
@@ -2709,6 +2769,36 @@ mod tests {
         }
         assert_eq!(state.champion_history.len(), CHAMPION_HISTORY_CAP);
         assert_eq!(state.champion_timeline(8).samples, CHAMPION_HISTORY_CAP);
+    }
+
+    #[test]
+    fn title_momentum_flags_the_biggest_recent_movers() {
+        let mut state = fresh_state();
+        // Fewer than two samples: nothing to compare.
+        assert!(state.title_momentum().risers.is_empty());
+        assert!(state.title_momentum().fallers.is_empty());
+
+        // Two hand-built samples: team A climbs, team B slides, C is unchanged.
+        let at = state.last_update;
+        let (a, b, c) = (TeamId(1), TeamId(2), TeamId(3));
+        state.champion_history.push(ForecastSample {
+            at,
+            odds: vec![(a, 0.2), (b, 0.3), (c, 0.2)],
+        });
+        state.champion_history.push(ForecastSample {
+            at,
+            odds: vec![(a, 0.5), (b, 0.1), (c, 0.2)],
+        });
+
+        let m = state.title_momentum();
+        assert_eq!(m.window, 1, "only one recompute back is available");
+        assert_eq!(m.risers.len(), 1);
+        assert_eq!(m.risers[0].team, state.name_of(a));
+        assert!((m.risers[0].delta - 0.3).abs() < 1e-9);
+        assert!((m.risers[0].now - 0.5).abs() < 1e-9);
+        assert_eq!(m.fallers.len(), 1);
+        assert_eq!(m.fallers[0].team, state.name_of(b));
+        assert!((m.fallers[0].delta + 0.2).abs() < 1e-9);
     }
 
     fn state_with_threshold(threshold: u8) -> EngineState {

@@ -174,6 +174,8 @@ pub struct Snapshot {
     pub openness: Openness,
     /// The championship-odds time series for the current top contenders over the tournament so far.
     pub timeline: ChampionTimeline,
+    /// The biggest recent movers in the title race (rising and falling championship odds).
+    pub momentum: Momentum,
 }
 
 /// One team's live champion probability from the second model (Bradley-Terry) over the current
@@ -352,6 +354,24 @@ pub struct ChampionTimeline {
     pub samples: usize,
     pub at: Vec<DateTime<Utc>>,
     pub series: Vec<TeamTrajectory>,
+}
+
+/// One team's recent title-race movement: its current championship probability and the change over
+/// the momentum window (`now - then`).
+#[derive(Debug, Clone, Serialize)]
+pub struct MomentumTeam {
+    pub team: String,
+    pub now: f64,
+    pub delta: f64,
+}
+
+/// The biggest recent movers in the title race, over the last `window` forecast recomputes. Empty
+/// until enough history has accumulated.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct Momentum {
+    pub window: usize,
+    pub risers: Vec<MomentumTeam>,
+    pub fallers: Vec<MomentumTeam>,
 }
 
 /// The information-theoretic shape of a probability distribution: its Shannon entropy in bits, the

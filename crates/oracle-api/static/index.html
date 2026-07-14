@@ -104,6 +104,11 @@
     </section>
 
     <section class="panel">
+      <h2>Title momentum · recent movers</h2>
+      <div id="momentum"><div class="empty">Building history…</div></div>
+    </section>
+
+    <section class="panel">
       <h2>Upset radar</h2>
       <div id="upsets"><div class="empty">Loading…</div></div>
     </section>
@@ -531,6 +536,22 @@
         top 4 hold ${(o.top4_share * 100).toFixed(0)}% · entropy ${o.entropy_bits.toFixed(2)} of ${o.max_entropy_bits.toFixed(2)} bits</span></div>`;
   }
 
+  async function refreshMomentum() {
+    let m; try { m = await (await fetch("/momentum")).json(); } catch { return; }
+    const box = el("momentum");
+    const risers = m.risers || [], fallers = m.fallers || [];
+    if (risers.length === 0 && fallers.length === 0) {
+      box.innerHTML = '<div class="empty">Building history…</div>';
+      return;
+    }
+    const row = (t, up) => `<div class="upset">
+      <span class="${up ? 'chance' : 'shock'}">${up ? "+" : ""}${(t.delta * 100).toFixed(1)}</span>
+      <span>${esc(t.team)} <span class="meta">now ${(t.now * 100).toFixed(1)}%</span></span></div>`;
+    box.innerHTML =
+      (risers.length ? `<h3>Rising</h3>${risers.map(t => row(t, true)).join("")}` : "") +
+      (fallers.length ? `<h3>Falling</h3>${fallers.map(t => row(t, false)).join("")}` : "");
+  }
+
   function connect() {
     const proto = location.protocol === "https:" ? "wss" : "ws";
     const ws = new WebSocket(`${proto}://${location.host}/live`);
@@ -557,7 +578,8 @@
   refreshBracket();
   refreshLeverage();
   refreshOpenness();
-  setInterval(() => { refreshUpsets(); refreshReport(); refreshBtChampions(); refreshConsensus(); refreshCalibration(); refreshPower(); refreshForm(); refreshRoad(); refreshBracket(); refreshLeverage(); refreshOpenness(); }, 20000);
+  refreshMomentum();
+  setInterval(() => { refreshUpsets(); refreshReport(); refreshBtChampions(); refreshConsensus(); refreshCalibration(); refreshPower(); refreshForm(); refreshRoad(); refreshBracket(); refreshLeverage(); refreshOpenness(); refreshMomentum(); }, 20000);
 })();
 </script>
 </body>
