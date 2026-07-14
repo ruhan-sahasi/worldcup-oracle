@@ -181,6 +181,14 @@ moves it a great deal, so the ranking reflects who sits where in the bracket, no
 tie is. By construction leverage grows as the final nears, since each result is diluted by fewer
 remaining rounds.
 
+Stepping back from any single team or tie, the shape of the champion-odds distribution itself says
+how decided the tournament is. Its **Shannon entropy** `H = -Sigma p log2 p` (in bits) is summarized
+as an **effective number of contenders** `2^H`: the race is as open as if that many teams were
+equally likely, so a lone runaway favourite reads near one while a wide-open field reads high.
+Dividing by the ceiling `log2(k)` over the `k` teams with any chance gives a normalized openness in
+`[0, 1]`. Unlike the bracket views this is meaningful from the group stage onward, and it falls
+monotonically in spirit as results eliminate teams and concentrate the mass on the survivors.
+
 ## Evaluation philosophy
 
 Skill is the point, so it is measured carefully:

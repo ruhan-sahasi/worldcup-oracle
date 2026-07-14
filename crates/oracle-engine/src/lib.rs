@@ -30,8 +30,8 @@ pub use oracle_model::ReliabilityReport;
 pub use query::{signal_sensitivity, Explorer, SignalContribution};
 pub use snapshot::{
     AdaptiveState, BracketRound, BracketTie, BtChampion, Call, Consensus, ConsensusTeam, FormLine,
-    LeverageTie, MatchLeverage, MatchPrediction, Metrics, ModelScore, PowerRanking, PowerTeam,
-    PredictedBracket, RatingEntry, ReportCard, RoadBoard, RoadRound, RoadTeam, Snapshot,
+    LeverageTie, MatchLeverage, MatchPrediction, Metrics, ModelScore, Openness, PowerRanking,
+    PowerTeam, PredictedBracket, RatingEntry, ReportCard, RoadBoard, RoadRound, RoadTeam, Snapshot,
     TournamentForm, Upset, WinProbSample,
 };
 
@@ -1152,6 +1152,38 @@ impl EngineState {
         MatchLeverage { ties }
     }
 
+    /// How open the title race is, read off the shape of the champion-odds distribution: its Shannon
+    /// entropy, the effective number of contenders (`2^entropy`, the count of equal favourites the
+    /// race is as open as), and a normalized openness in `[0, 1]`. Unlike the bracket views this is
+    /// meaningful from the group stage on, and it falls as the field narrows.
+    fn openness(&self) -> Openness {
+        let mut odds: Vec<(TeamId, f64)> = self
+            .last_forecast
+            .teams
+            .iter()
+            .filter(|t| t.p_champion > 0.0)
+            .map(|t| (t.team, t.p_champion))
+            .collect();
+        if odds.is_empty() {
+            return Openness::default();
+        }
+        odds.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        let probs: Vec<f64> = odds.iter().map(|(_, p)| *p).collect();
+        let (entropy_bits, max_entropy_bits, effective_contenders, openness) =
+            crate::snapshot::entropy_stats(&probs);
+        let (favorite, favorite_prob) = odds[0];
+        Openness {
+            entropy_bits,
+            max_entropy_bits,
+            effective_contenders,
+            openness,
+            contenders_alive: odds.len(),
+            favorite: self.name_of(favorite),
+            favorite_prob,
+            top4_share: odds.iter().take(4).map(|(_, p)| p).sum(),
+        }
+    }
+
     /// A consensus title forecast from the two independent models: the goal-model Monte-Carlo
     /// forecast and the Bradley-Terry bracket dynamic program. The consensus is a plain 50/50 average
     /// of the two champion distributions (both already condition on the live bracket), and `jsd` is
@@ -1567,6 +1599,7 @@ impl EngineState {
             road: self.road_to_final(),
             predicted_bracket: self.predicted_bracket(),
             leverage: self.match_leverage(),
+            openness: self.openness(),
         }
     }
 
@@ -2508,6 +2541,62 @@ mod tests {
         assert!(
             r16_max > r32_max,
             "a round closer to the final carries more leverage: {r16_max} vs {r32_max}"
+        );
+    }
+
+    #[test]
+    fn openness_reads_the_shape_of_the_champion_odds() {
+        let mut state = fresh_state();
+        let metrics = Metrics::default();
+        state.recompute_forecast();
+        let o = state.openness();
+
+        // A full field is alive, and the readout is internally consistent.
+        assert!(o.contenders_alive > 1);
+        assert!(o.entropy_bits > 0.0 && o.entropy_bits <= o.max_entropy_bits + 1e-9);
+        // Effective contenders is 2^entropy, and never exceeds the number of teams alive.
+        assert!((o.effective_contenders - o.entropy_bits.exp2()).abs() < 1e-9);
+        assert!(o.effective_contenders <= o.contenders_alive as f64 + 1e-9);
+        // Openness is the normalized entropy.
+        assert!((0.0..=1.0).contains(&o.openness));
+        assert!((o.openness - o.entropy_bits / o.max_entropy_bits).abs() < 1e-9);
+        // The favourite is a real team holding the largest single share, and the top-four share is a
+        // probability that is at least the favourite's.
+        assert!(!o.favorite.is_empty());
+        assert!(o.favorite_prob > 0.0 && o.favorite_prob <= 1.0);
+        assert!(o.top4_share >= o.favorite_prob - 1e-9 && o.top4_share <= 1.0 + 1e-9);
+
+        // As the tournament resolves, the race narrows. Finish the whole group stage decisively:
+        // only the 32 bracket teams can be champion now, so the alive field cannot have grown.
+        let groups: Vec<(MatchId, TeamId, TeamId)> = state
+            .tournament
+            .matches
+            .iter()
+            .filter(|m| matches!(m.stage, Stage::Group(_)))
+            .map(|m| (m.id, m.home, m.away))
+            .collect();
+        for (id, home, away) in groups {
+            let score = if home.0 < away.0 {
+                Scoreline::new(3, 0)
+            } else {
+                Scoreline::new(0, 3)
+            };
+            state.apply_event(
+                &MatchEvent::new(id, 90, EventKind::FullTime { score }),
+                &metrics,
+            );
+        }
+        state.recompute_forecast();
+        let narrowed = state.openness();
+        assert!(
+            narrowed.contenders_alive <= 32,
+            "only bracket teams can win"
+        );
+        assert!(
+            narrowed.contenders_alive <= o.contenders_alive,
+            "the alive field should not widen as groups finish: {} -> {}",
+            o.contenders_alive,
+            narrowed.contenders_alive
         );
     }
 

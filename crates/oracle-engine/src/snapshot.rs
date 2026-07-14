@@ -170,6 +170,8 @@ pub struct Snapshot {
     /// The current knockout round's ties ranked by how much each would reshape the title race. Empty
     /// until the knockout bracket is materialized.
     pub leverage: MatchLeverage,
+    /// How open the title race is (entropy of the champion odds, effective number of contenders).
+    pub openness: Openness,
 }
 
 /// One team's live champion probability from the second model (Bradley-Terry) over the current
@@ -314,6 +316,51 @@ pub struct MatchLeverage {
     pub ties: Vec<LeverageTie>,
 }
 
+/// How open the title race is, read off the shape of the champion-odds distribution itself.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct Openness {
+    /// Shannon entropy of the champion odds, in bits.
+    pub entropy_bits: f64,
+    /// The entropy ceiling `log2(k)` over the `k` teams with any title chance (all equally likely).
+    pub max_entropy_bits: f64,
+    /// Effective number of contenders, `2^entropy`: the race is as open as this many equal favourites.
+    pub effective_contenders: f64,
+    /// Normalized openness `entropy / max_entropy` in `[0, 1]`: 0 = decided, 1 = wide open.
+    pub openness: f64,
+    /// How many teams still have any championship probability.
+    pub contenders_alive: usize,
+    pub favorite: String,
+    pub favorite_prob: f64,
+    /// Combined championship probability of the top four contenders (a concentration measure).
+    pub top4_share: f64,
+}
+
+/// The information-theoretic shape of a probability distribution: its Shannon entropy in bits, the
+/// ceiling `log2(k)` over the `k` nonzero outcomes, the effective number of outcomes `2^entropy`,
+/// and the normalized openness `entropy / max_entropy` in `[0, 1]`. Assumes `probs` sum to one.
+pub(crate) fn entropy_stats(probs: &[f64]) -> (f64, f64, f64, f64) {
+    let mut entropy = 0.0;
+    let mut nonzero = 0usize;
+    for &p in probs {
+        if p > 0.0 {
+            entropy -= p * p.log2();
+            nonzero += 1;
+        }
+    }
+    let max_entropy = if nonzero > 1 {
+        (nonzero as f64).log2()
+    } else {
+        0.0
+    };
+    let effective = entropy.exp2();
+    let openness = if max_entropy > 0.0 {
+        (entropy / max_entropy).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    (entropy, max_entropy, effective, openness)
+}
+
 impl Snapshot {
     /// Look up the prediction for a specific match.
     pub fn match_prediction(&self, id: MatchId) -> Option<&MatchPrediction> {
@@ -374,5 +421,38 @@ impl Metrics {
         );
         out.push_str(&format!("oracle_subscribers {subscribers}\n"));
         out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::entropy_stats;
+
+    #[test]
+    fn entropy_of_a_uniform_distribution_is_log2_of_its_size() {
+        let (h, max, eff, open) = entropy_stats(&[0.25, 0.25, 0.25, 0.25]);
+        assert!((h - 2.0).abs() < 1e-12);
+        assert!((max - 2.0).abs() < 1e-12);
+        assert!((eff - 4.0).abs() < 1e-9);
+        assert!((open - 1.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn entropy_of_a_point_mass_is_zero() {
+        let (h, max, eff, open) = entropy_stats(&[1.0, 0.0, 0.0]);
+        assert_eq!(h, 0.0);
+        assert_eq!(max, 0.0);
+        assert!((eff - 1.0).abs() < 1e-12);
+        assert_eq!(open, 0.0);
+    }
+
+    #[test]
+    fn entropy_matches_a_hand_computed_skewed_distribution() {
+        // H = -(0.5 log2 0.5 + 2 * 0.25 log2 0.25) = 0.5 + 1.0 = 1.5 bits.
+        let (h, max, eff, open) = entropy_stats(&[0.5, 0.25, 0.25]);
+        assert!((h - 1.5).abs() < 1e-12);
+        assert!((max - 3.0_f64.log2()).abs() < 1e-12);
+        assert!((eff - 1.5_f64.exp2()).abs() < 1e-9); // 2^1.5 ~= 2.828
+        assert!((open - 1.5 / 3.0_f64.log2()).abs() < 1e-12);
     }
 }

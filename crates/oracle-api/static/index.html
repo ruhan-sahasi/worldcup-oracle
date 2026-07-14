@@ -99,6 +99,11 @@
     </section>
 
     <section class="panel">
+      <h2>How open is the race?</h2>
+      <div id="openness"><div class="empty">No forecast yet…</div></div>
+    </section>
+
+    <section class="panel">
       <h2>Upset radar</h2>
       <div id="upsets"><div class="empty">Loading…</div></div>
     </section>
@@ -507,6 +512,25 @@
       </div>`).join("");
   }
 
+  async function refreshOpenness() {
+    let o; try { o = await (await fetch("/openness")).json(); } catch { return; }
+    const box = el("openness");
+    if (!o.contenders_alive) { box.innerHTML = '<div class="empty">No forecast yet…</div>'; return; }
+    const mood = o.openness < 0.3 ? "the field has narrowed sharply"
+               : o.openness < 0.6 ? "a clear group of contenders"
+               : o.openness < 0.85 ? "still fairly open"
+               : "wide open";
+    box.innerHTML =
+      `<div class="rcstat"><b>${o.effective_contenders.toFixed(1)}</b> effective contenders
+        <span class="meta">of ${o.contenders_alive} alive · ${mood}</span></div>` +
+      `<div class="odds-row">
+        <span class="name">openness</span>
+        <span class="odds-bar"><span style="width:${100 * o.openness}%"></span></span>
+        <span class="pct">${(o.openness * 100).toFixed(0)}%</span></div>` +
+      `<div class="legend"><span>${esc(o.favorite)} favourite ${(o.favorite_prob * 100).toFixed(1)}% ·
+        top 4 hold ${(o.top4_share * 100).toFixed(0)}% · entropy ${o.entropy_bits.toFixed(2)} of ${o.max_entropy_bits.toFixed(2)} bits</span></div>`;
+  }
+
   function connect() {
     const proto = location.protocol === "https:" ? "wss" : "ws";
     const ws = new WebSocket(`${proto}://${location.host}/live`);
@@ -532,7 +556,8 @@
   refreshRoad();
   refreshBracket();
   refreshLeverage();
-  setInterval(() => { refreshUpsets(); refreshReport(); refreshBtChampions(); refreshConsensus(); refreshCalibration(); refreshPower(); refreshForm(); refreshRoad(); refreshBracket(); refreshLeverage(); }, 20000);
+  refreshOpenness();
+  setInterval(() => { refreshUpsets(); refreshReport(); refreshBtChampions(); refreshConsensus(); refreshCalibration(); refreshPower(); refreshForm(); refreshRoad(); refreshBracket(); refreshLeverage(); refreshOpenness(); }, 20000);
 })();
 </script>
 </body>
