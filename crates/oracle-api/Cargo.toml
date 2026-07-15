@@ -11,6 +11,7 @@ description = "axum REST + WebSocket server exposing the worldcup-oracle engine"
 [dependencies]
 oracle-domain.workspace = true
 oracle-engine.workspace = true
+oracle-market.workspace = true
 axum.workspace = true
 tokio.workspace = true
 tower-http.workspace = true

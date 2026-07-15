@@ -1189,6 +1189,7 @@ dependencies = [
  "futures-util",
  "oracle-domain",
  "oracle-engine",
+ "oracle-market",
  "serde",
  "serde_json",
  "tokio",

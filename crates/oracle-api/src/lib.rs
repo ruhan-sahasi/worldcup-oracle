@@ -39,6 +39,7 @@
 //! | GET | `/api/bt/champions` | second model's champion odds (bracket DP) |
 //! | GET | `/api/posterior?home=&away=` | HMC posterior credible intervals for a matchup |
 //! | GET | `/api/simulate?iters=&seed=` | custom Monte-Carlo champion-odds run |
+//! | GET | `/api/backtest?seed=&matches=` | paper-trade the model against a synthetic book (bankroll, ROI, skill) |
 //! | GET | `/api/sensitivity?iters=&seed=` | per-signal ablation: how much each signal moves the title |
 //! | GET | `/api/kingmaker?q=` | rooting interest: which group results swing a team's title odds |
 //! | GET | `/api/collision?home=&away=` | probability two teams meet in the knockouts, by round |
@@ -60,10 +61,11 @@ use axum::{
 use futures_util::{SinkExt, StreamExt};
 use oracle_domain::{MatchId, MatchStatus, Probabilities, Scoreline, Stage, TeamId};
 use oracle_engine::query::{
-    BtChampions, BtMatchup, CollisionForecast, Explanation, KingmakerReport, MatchupForecast,
-    PosteriorForecast, RatingsView, SensitivityForecast, SimForecast,
+    BacktestReport, BtChampions, BtMatchup, CollisionForecast, Explanation, KingmakerReport,
+    MatchupForecast, PosteriorForecast, RatingsView, SensitivityForecast, SimForecast,
 };
 use oracle_engine::{AdaptiveState, Engine, Explorer, ReportCard, Snapshot, Upset, WinProbSample};
+use oracle_market::BetPolicy;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::future::Future;
@@ -145,6 +147,7 @@ pub fn router(engine: Arc<Engine>, explorer: ExplorerSlot) -> Router {
         .route("/api/bt/champions", get(api_bt_champions))
         .route("/api/posterior", get(api_posterior))
         .route("/api/simulate", get(api_simulate))
+        .route("/api/backtest", get(api_backtest))
         .route("/api/sensitivity", get(api_sensitivity))
         .route("/api/kingmaker", get(api_kingmaker))
         .route("/api/collision", get(api_collision))
@@ -228,7 +231,8 @@ async fn api_info(
             "/openness", "/history", "/momentum", "/lead-changes", "/api/team?q=",
             "/api/predict?home=&away=", "/api/explain?home=&away=", "/api/posterior?home=&away=",
             "/api/bt?home=&away=", "/api/bt/champions",
-            "/api/simulate?iters=&seed=", "/api/sensitivity?iters=&seed=",
+            "/api/simulate?iters=&seed=", "/api/backtest?seed=&matches=",
+            "/api/sensitivity?iters=&seed=",
             "/api/kingmaker?q=", "/api/collision?home=&away=", "/api/ratings",
             "/metrics", "/live (websocket)"
         ],
@@ -365,6 +369,50 @@ async fn api_simulate(
         .await
         .map(Json)
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+}
+
+#[derive(Deserialize)]
+struct BacktestParams {
+    seed: Option<u64>,
+    matches: Option<usize>,
+    bankroll: Option<f64>,
+    /// Minimum edge to back a side.
+    edge: Option<f64>,
+    /// Fraction of full Kelly to stake.
+    kelly: Option<f64>,
+    /// Cap on any single bet as a fraction of bankroll.
+    cap: Option<f64>,
+    /// Bookmaker margin (overround) applied to the fair line.
+    margin: Option<f64>,
+}
+
+/// Paper-trade the model against a synthetic bookmaker over a held-out season. Generating and
+/// settling thousands of matches is compute-heavy, so it runs off the async runtime.
+async fn api_backtest(
+    State(explorer): State<ExplorerSlot>,
+    Query(p): Query<BacktestParams>,
+) -> Result<Json<BacktestReport>, StatusCode> {
+    if explorer.get().is_none() {
+        return Err(StatusCode::SERVICE_UNAVAILABLE);
+    }
+    let seed = p.seed.unwrap_or(101);
+    let matches = p.matches.unwrap_or(2000);
+    let bankroll = p.bankroll.unwrap_or(100.0);
+    let margin = p.margin.unwrap_or(0.06);
+    let policy = BetPolicy {
+        min_edge: p.edge.unwrap_or(0.02),
+        kelly_fraction: p.kelly.unwrap_or(0.25),
+        max_fraction: p.cap.unwrap_or(0.05),
+    };
+    tokio::task::spawn_blocking(move || {
+        explorer
+            .get()
+            .unwrap()
+            .market_backtest(seed, matches, bankroll, policy, margin)
+    })
+    .await
+    .map(Json)
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
 }
 
 async fn api_ratings(
@@ -1355,6 +1403,14 @@ mod tests {
             .map(|t| t["p_champion"].as_f64().unwrap())
             .sum();
         assert!((mass - 1.0).abs() < 0.05, "champion mass ~1: {mass}");
+
+        // Backtest: a settled bankroll run plus a model-vs-market skill comparison.
+        let (status, body) = get(&state, "/api/backtest?seed=101&matches=300").await;
+        assert_eq!(status, StatusCode::OK);
+        let bt = json(&body);
+        assert!(bt["run"]["summary"]["final_bankroll"].is_number());
+        assert!(bt["run"]["curve"].is_array());
+        assert!(bt["skill"]["model_brier"].is_number() && bt["skill"]["market_brier"].is_number());
 
         // Ratings: all teams + six confederations.
         let (status, body) = get(&state, "/api/ratings").await;
