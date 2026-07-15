@@ -62,6 +62,55 @@ impl Odds {
         let price = |p: f64| 1.0 / (m * p.clamp(1e-9, 1.0));
         Self::new(price(fair.home_win), price(fair.draw), price(fair.away_win))
     }
+
+    /// De-vig by **proportional (multiplicative) normalization**: divide the raw implied
+    /// probabilities by their sum. The simplest and most common method; it assumes the margin is
+    /// spread across outcomes in proportion to their prices, so it leaves the favourite/longshot
+    /// balance untouched.
+    pub fn devig_multiplicative(&self) -> Probabilities {
+        let [h, d, a] = self.implied();
+        Probabilities::new(h, d, a)
+    }
+
+    /// De-vig by **Shin's method**, which models the margin as protection against better-informed
+    /// bettors: it removes proportionally more of the margin from longshots than from favourites,
+    /// correcting the favourite/longshot bias that plain normalization leaves in. The insider
+    /// proportion `z` is solved so the recovered probabilities sum to one. On a marginless book it
+    /// coincides with the raw probabilities.
+    pub fn devig_shin(&self) -> Probabilities {
+        let [h, d, a] = shin_probs(self.implied());
+        Probabilities::new(h, d, a)
+    }
+}
+
+/// Shin's recovered (fair) probabilities from raw implied probabilities. Solves for the insider
+/// proportion `z in [0, 1)` such that the recovered probabilities sum to one, by bisection (the
+/// recovered sum falls monotonically from `sqrt(booksum) > 1` at `z = 0` toward `< 1`). Returns raw
+/// values that sum to (about) one; a marginless book (`booksum <= 1`) returns the inputs unchanged.
+fn shin_probs(implied: [f64; 3]) -> [f64; 3] {
+    let booksum: f64 = implied.iter().sum();
+    let recovered = |z: f64| -> [f64; 3] {
+        let mut out = [0.0; 3];
+        for (k, &pi) in implied.iter().enumerate() {
+            let num = (z * z + 4.0 * (1.0 - z) * pi * pi / booksum).sqrt() - z;
+            out[k] = num / (2.0 * (1.0 - z));
+        }
+        out
+    };
+    let sum = |z: f64| recovered(z).iter().sum::<f64>();
+    if booksum <= 1.0 || sum(0.0) <= 1.0 {
+        return recovered(0.0);
+    }
+    let (mut lo, mut hi) = (0.0f64, 0.999f64);
+    for _ in 0..100 {
+        let mid = 0.5 * (lo + hi);
+        if sum(mid) > 1.0 {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    recovered(0.5 * (lo + hi))
 }
 
 #[cfg(test)]
@@ -105,5 +154,43 @@ mod tests {
         approx(imp[0], 0.55);
         approx(imp[1], 0.25);
         approx(imp[2], 0.20);
+    }
+
+    #[test]
+    fn multiplicative_devig_exactly_inverts_a_proportional_book() {
+        // A book priced proportionally with any margin de-vigs (multiplicatively) back to its
+        // fair probabilities exactly.
+        let fair = Probabilities::new(0.55, 0.25, 0.20);
+        let recovered = Odds::from_fair(fair, 0.08).devig_multiplicative();
+        approx(recovered.home_win, 0.55);
+        approx(recovered.draw, 0.25);
+        approx(recovered.away_win, 0.20);
+    }
+
+    #[test]
+    fn shin_recovers_a_normalized_distribution_and_matches_a_marginless_book() {
+        // Raw Shin solve sums to one on a vigged book.
+        let vigged = Odds::from_fair(Probabilities::new(0.55, 0.25, 0.20), 0.08);
+        let raw = shin_probs(vigged.implied());
+        approx(raw.iter().sum::<f64>(), 1.0);
+        // On a marginless book Shin returns the true probabilities.
+        let fair = Probabilities::new(0.5, 0.3, 0.2);
+        let s = Odds::from_fair(fair, 0.0).devig_shin();
+        approx(s.home_win, 0.5);
+        approx(s.draw, 0.3);
+        approx(s.away_win, 0.2);
+    }
+
+    #[test]
+    fn shin_and_multiplicative_agree_on_order_but_differ_on_a_vigged_book() {
+        let vigged = Odds::from_fair(Probabilities::new(0.55, 0.25, 0.20), 0.08);
+        let m = vigged.devig_multiplicative();
+        let s = vigged.devig_shin();
+        // Both are proper distributions and keep the home team the favourite.
+        approx(m.home_win + m.draw + m.away_win, 1.0);
+        approx(s.home_win + s.draw + s.away_win, 1.0);
+        assert!(s.home_win > s.draw && s.home_win > s.away_win);
+        // Shin is not a no-op: it shifts mass relative to plain normalization.
+        assert!((s.home_win - m.home_win).abs() > 1e-6);
     }
 }
