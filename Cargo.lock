@@ -1236,6 +1236,7 @@ dependencies = [
  "chrono",
  "oracle-domain",
  "oracle-ingest",
+ "oracle-market",
  "oracle-model",
  "oracle-ratings",
  "oracle-sim",

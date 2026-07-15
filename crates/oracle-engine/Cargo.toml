@@ -14,6 +14,7 @@ oracle-ratings.workspace = true
 oracle-model.workspace = true
 oracle-sim.workspace = true
 oracle-ingest.workspace = true
+oracle-market.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
 arc-swap.workspace = true

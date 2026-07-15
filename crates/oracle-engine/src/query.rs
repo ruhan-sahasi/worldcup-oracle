@@ -13,6 +13,9 @@ use oracle_domain::{
     Confederation, MatchId, MatchStatus, Probabilities, ScoreGrid, Scoreline, TeamId, Tournament,
 };
 use oracle_ingest::data::{self, SignalMask, VenueAdj};
+use oracle_market::{
+    paper_trade, skill_comparison, BacktestRun, BetPolicy, Odds, Opportunity, SkillComparison,
+};
 use oracle_model::hmc::HmcConfig;
 use oracle_model::{
     implied_probabilities, BradleyTerry, DixonColesConfig, Ensemble, GoalModel, LiveConfig,
@@ -22,6 +25,21 @@ use oracle_ratings::{RatingStore, StateSpaceRatings};
 use oracle_sim::{meeting_probabilities, simulate_with_live, LiveInputs, SimConfig};
 use serde::Serialize;
 use std::collections::HashMap;
+
+/// Cap on the paper-trading backtest universe, so one request cannot tie up the server.
+const BACKTEST_MAX_MATCHES: usize = 5000;
+
+/// A completed market backtest: the parameters it ran under, the settled bankroll run, and the
+/// model-versus-market skill comparison over the same matches.
+#[derive(Debug, Clone, Serialize)]
+pub struct BacktestReport {
+    pub seed: u64,
+    pub matches: usize,
+    pub margin: f64,
+    pub policy: BetPolicy,
+    pub run: BacktestRun,
+    pub skill: SkillComparison,
+}
 
 /// Hard ceilings so a single request cannot tie the server up indefinitely.
 const SIM_MAX_ITERS: u64 = 100_000;
@@ -83,6 +101,48 @@ impl Explorer {
             shootout_rating: data::shootout_ratings(),
             knockout_pedigree: data::knockout_pedigree(),
             bradley_terry: data::fit_bradley_terry(7),
+        }
+    }
+
+    /// Paper-trade the goal model against a synthetic bookmaker over a held-out season, and report
+    /// the settled bankroll alongside an honest model-versus-market skill comparison.
+    ///
+    /// Each historical match carries a noisy fair line; that line is priced with `margin` of vig to
+    /// give the odds a bettor would face, and the model bets its own Dixon-Coles probabilities. It
+    /// deliberately does **not** bet the market-anchored ensemble, which would be circular. Pass a
+    /// `seed` other than the training seed (`7`) so the bets are genuinely out of sample.
+    pub fn market_backtest(
+        &self,
+        seed: u64,
+        matches: usize,
+        bankroll: f64,
+        policy: BetPolicy,
+        margin: f64,
+    ) -> BacktestReport {
+        let n = matches.clamp(1, BACKTEST_MAX_MATCHES);
+        let opps: Vec<Opportunity> = data::synthetic_history_with_market(n, seed)
+            .into_iter()
+            .filter_map(|rec| {
+                let market = rec.market?;
+                let model = self
+                    .model
+                    .outcome_probabilities(rec.obs.home, rec.obs.away, true);
+                Some(Opportunity {
+                    model,
+                    odds: Odds::from_fair(market, margin),
+                    result: rec.obs.score.outcome(),
+                })
+            })
+            .collect();
+        let run = paper_trade(&opps, bankroll.max(1.0), &policy);
+        let skill = skill_comparison(&opps);
+        BacktestReport {
+            seed,
+            matches: opps.len(),
+            margin,
+            policy,
+            run,
+            skill,
         }
     }
 
@@ -1099,6 +1159,26 @@ pub struct SensitivityForecast {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn market_backtest_produces_a_coherent_report() {
+        let ex = Explorer::new();
+        // A seed other than the training seed (7): the bets are out of sample.
+        let report = ex.market_backtest(101, 800, 100.0, BetPolicy::default(), 0.06);
+
+        assert!(report.matches > 0);
+        assert_eq!(report.skill.matches, report.matches);
+        // At most one bet per match, and the settled bankroll is non-negative.
+        assert!(report.run.summary.bets <= report.matches);
+        assert!(report.run.summary.final_bankroll >= 0.0);
+        assert!(report.run.summary.wins <= report.run.summary.bets);
+        assert_eq!(report.run.curve.len(), report.run.summary.bets);
+        // Skill scores are finite and non-negative (Brier in particular).
+        assert!(report.skill.model_brier >= 0.0 && report.skill.market_brier >= 0.0);
+        assert!(report.skill.model_log_loss.is_finite());
+        // Drawdown is a fraction in [0, 1].
+        assert!((0.0..=1.0).contains(&report.run.summary.max_drawdown));
+    }
 
     #[test]
     fn predict_simulate_and_ratings_are_coherent() {
