@@ -302,6 +302,55 @@ pub fn paper_trade(opps: &[Opportunity], start_bankroll: f64, policy: &BetPolicy
     BacktestRun { summary, curve }
 }
 
+/// The Brier score of a forecast against the realized outcome: the summed squared error versus the
+/// one-hot truth, in `[0, 2]`, lower is better.
+fn brier(p: Probabilities, actual: Outcome) -> f64 {
+    let pr = probs_array(p);
+    let y = match actual {
+        Outcome::HomeWin => [1.0, 0.0, 0.0],
+        Outcome::Draw => [0.0, 1.0, 0.0],
+        Outcome::AwayWin => [0.0, 0.0, 1.0],
+    };
+    (0..3).map(|k| (pr[k] - y[k]).powi(2)).sum()
+}
+
+/// The log loss of a forecast: `-ln P(actual)`, lower is better (clamped away from zero).
+fn log_loss(p: Probabilities, actual: Outcome) -> f64 {
+    -p.of(actual).max(1e-12).ln()
+}
+
+/// Model-versus-market **skill** over the bet universe: the mean Brier and log loss of the model and
+/// of the market's own (de-vigged) probabilities on the same results. Betting profit is noisy, so
+/// this sits next to it as the honest accuracy comparison; the market is de-vigged multiplicatively.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct SkillComparison {
+    pub matches: usize,
+    pub model_brier: f64,
+    pub model_log_loss: f64,
+    pub market_brier: f64,
+    pub market_log_loss: f64,
+}
+
+/// Score the model and the market on the same settled opportunities.
+pub fn skill_comparison(opps: &[Opportunity]) -> SkillComparison {
+    let (mut mb, mut mll, mut kb, mut kll) = (0.0, 0.0, 0.0, 0.0);
+    for opp in opps {
+        let market = opp.odds.devig_multiplicative();
+        mb += brier(opp.model, opp.result);
+        mll += log_loss(opp.model, opp.result);
+        kb += brier(market, opp.result);
+        kll += log_loss(market, opp.result);
+    }
+    let n = opps.len().max(1) as f64;
+    SkillComparison {
+        matches: opps.len(),
+        model_brier: mb / n,
+        model_log_loss: mll / n,
+        market_brier: kb / n,
+        market_log_loss: kll / n,
+    }
+}
+
 /// Shin's recovered (fair) probabilities from raw implied probabilities. Solves for the insider
 /// proportion `z in [0, 1)` such that the recovered probabilities sum to one, by bisection (the
 /// recovered sum falls monotonically from `sqrt(booksum) > 1` at `z = 0` toward `< 1`). Returns raw
@@ -497,6 +546,36 @@ mod tests {
         assert_eq!(down.summary.wins, 0);
         assert!(down.summary.final_bankroll < 100.0 && down.summary.roi < 0.0);
         assert!(down.summary.max_drawdown > 0.0);
+    }
+
+    #[test]
+    fn skill_comparison_rewards_the_sharper_forecaster() {
+        // The model is almost certain (correctly) that home wins; the market is only mildly on it.
+        let opp = Opportunity {
+            model: Probabilities::new(0.97, 0.02, 0.01),
+            odds: Odds::from_fair(Probabilities::new(0.5, 0.3, 0.2), 0.05),
+            result: Outcome::HomeWin,
+        };
+        let s = skill_comparison(&[opp]);
+        assert_eq!(s.matches, 1);
+        assert!(s.model_brier < s.market_brier);
+        assert!(s.model_log_loss < s.market_log_loss);
+        assert!(s.model_brier >= 0.0 && s.market_brier >= 0.0);
+    }
+
+    #[test]
+    fn skill_comparison_is_equal_when_the_model_is_the_market() {
+        let fair = Probabilities::new(0.5, 0.3, 0.2);
+        // Model equals the market's de-vigged probabilities, so their scores match.
+        let odds = Odds::from_fair(fair, 0.06);
+        let opp = Opportunity {
+            model: odds.devig_multiplicative(),
+            odds,
+            result: Outcome::Draw,
+        };
+        let s = skill_comparison(&[opp]);
+        approx(s.model_brier, s.market_brier);
+        approx(s.model_log_loss, s.market_log_loss);
     }
 
     #[test]
