@@ -1211,6 +1211,7 @@ dependencies = [
  "oracle-domain",
  "oracle-engine",
  "oracle-ingest",
+ "oracle-market",
  "oracle-model",
  "oracle-ratings",
  "oracle-sim",

@@ -6,6 +6,7 @@
 //! wc-oracle simulate   # Monte-Carlo champion odds for the 2026 World Cup
 //! wc-oracle predict    # one-off matchup prediction (ensemble + score grid)
 //! wc-oracle backtest   # calibration + bookmaker benchmark (real or synthetic data)
+//! wc-oracle market-backtest # paper-trade the model against the market (bankroll, ROI, edge)
 //! wc-oracle tune       # search goal-model hyperparameters by held-out log-loss
 //! wc-oracle serve      # run the REST + WebSocket server
 //! wc-oracle watch      # live terminal dashboard (TUI)
@@ -17,7 +18,9 @@ mod watch;
 
 use clap::{Parser, Subcommand};
 use oracle_domain::{Outcome, Probabilities, ScoreGrid, Team, TeamId};
+use oracle_engine::Explorer;
 use oracle_ingest::data;
+use oracle_market::BetPolicy;
 use oracle_model::{Ensemble, GoalModel, LiveConfig};
 use oracle_ratings::RatingStore;
 use oracle_sim::{simulate_with_live, LiveInputs, SimConfig};
@@ -98,6 +101,30 @@ enum Command {
         #[arg(long)]
         data: Option<std::path::PathBuf>,
     },
+    /// Paper-trade the model against a synthetic bookmaker over a held-out season.
+    MarketBacktest {
+        /// Held-out season seed. Use a value other than the training seed (7) so bets are out of sample.
+        #[arg(long, default_value_t = 101)]
+        seed: u64,
+        /// Number of matches in the held-out season.
+        #[arg(long, default_value_t = 2000)]
+        matches: usize,
+        /// Starting bankroll.
+        #[arg(long, default_value_t = 100.0)]
+        bankroll: f64,
+        /// Minimum edge required to back a side.
+        #[arg(long, default_value_t = 0.02)]
+        edge: f64,
+        /// Fraction of full Kelly to stake.
+        #[arg(long, default_value_t = 0.25)]
+        kelly: f64,
+        /// Cap on any single bet as a fraction of bankroll.
+        #[arg(long, default_value_t = 0.05)]
+        cap: f64,
+        /// Bookmaker margin (overround) applied to the fair line.
+        #[arg(long, default_value_t = 0.06)]
+        margin: f64,
+    },
     /// Run the REST + WebSocket server.
     Serve {
         /// Listen address.
@@ -155,6 +182,15 @@ async fn main() -> anyhow::Result<()> {
             seed,
             data,
         } => cmd_tune(matches, seed, data),
+        Command::MarketBacktest {
+            seed,
+            matches,
+            bankroll,
+            edge,
+            kelly,
+            cap,
+            margin,
+        } => cmd_market_backtest(seed, matches, bankroll, edge, kelly, cap, margin),
         Command::Serve { addr, event_log } => cmd_serve(addr, event_log).await,
         Command::Watch { speed } => watch::run(speed).await,
         Command::Sensitivity { iters, seed, top } => cmd_sensitivity(iters, seed, top),
@@ -178,6 +214,71 @@ fn resolve_team(query: &str, teams: &[Team]) -> Option<TeamId> {
         .find(|t| t.code.to_lowercase() == q || t.name.to_lowercase() == q)
         .or_else(|| teams.iter().find(|t| t.name.to_lowercase().contains(&q)))
         .map(|t| t.id)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn cmd_market_backtest(
+    seed: u64,
+    matches: usize,
+    bankroll: f64,
+    edge: f64,
+    kelly: f64,
+    cap: f64,
+    margin: f64,
+) -> anyhow::Result<()> {
+    println!("Fitting the model, then paper-trading a {matches}-match held-out season (seed {seed})...\n");
+    let explorer = Explorer::new();
+    let policy = BetPolicy {
+        min_edge: edge,
+        kelly_fraction: kelly,
+        max_fraction: cap,
+    };
+    let report = explorer.market_backtest(seed, matches, bankroll, policy, margin);
+    let s = &report.run.summary;
+    let signed = |v: f64| {
+        if v >= 0.0 {
+            format!("+{:.1}%", v * 100.0)
+        } else {
+            format!("{:.1}%", v * 100.0)
+        }
+    };
+
+    println!(
+        "Bankroll:     ${:.2} -> ${:.2}   (ROI {})",
+        s.start_bankroll,
+        s.final_bankroll,
+        signed(s.roi)
+    );
+    println!(
+        "Bets:         {} of {} matches   hit rate {:.1}%",
+        s.bets,
+        report.matches,
+        s.hit_rate * 100.0
+    );
+    println!(
+        "Turnover:     ${:.2}   yield {}",
+        s.turnover,
+        signed(s.yield_pct)
+    );
+    println!("Max drawdown: {:.1}%\n", s.max_drawdown * 100.0);
+
+    println!("Is the edge real? Accuracy on the same matches (lower is better):");
+    println!(
+        "  {:<22} Brier {:.4}   log-loss {:.4}",
+        "Model (Dixon-Coles)", report.skill.model_brier, report.skill.model_log_loss
+    );
+    println!(
+        "  {:<22} Brier {:.4}   log-loss {:.4}",
+        "Market (de-vigged)", report.skill.market_brier, report.skill.market_log_loss
+    );
+
+    let verdict = if s.yield_pct > 0.0 {
+        "cleared the vig on this season"
+    } else {
+        "did not clear the vig"
+    };
+    println!("\nVerdict: the model {verdict} over {} bets.", s.bets);
+    Ok(())
 }
 
 fn cmd_simulate(iters: u64, seed: u64, top: usize) -> anyhow::Result<()> {
