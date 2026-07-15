@@ -207,6 +207,101 @@ pub fn select_bet(model: Probabilities, odds: Odds, policy: &BetPolicy) -> Optio
     })
 }
 
+/// One settled betting opportunity: the model's probabilities, the price on offer, and the result
+/// that actually happened. The unit the paper-trading simulator walks over.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct Opportunity {
+    pub model: Probabilities,
+    pub odds: Odds,
+    pub result: Outcome,
+}
+
+/// Headline numbers from a paper-trading run.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct BacktestSummary {
+    pub start_bankroll: f64,
+    pub final_bankroll: f64,
+    /// Return on the starting bankroll, `(final - start) / start`.
+    pub roi: f64,
+    pub bets: usize,
+    pub wins: usize,
+    pub hit_rate: f64,
+    /// Total staked across all bets (compounded stakes, so it can exceed the bankroll).
+    pub turnover: f64,
+    /// Profit per unit staked, `profit / turnover`, the metric a bettor lives on.
+    pub yield_pct: f64,
+    /// Largest peak-to-trough fractional fall in bankroll along the run.
+    pub max_drawdown: f64,
+}
+
+/// A completed paper-trading run: the settled summary plus the bankroll after each placed bet.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BacktestRun {
+    pub summary: BacktestSummary,
+    pub curve: Vec<f64>,
+}
+
+/// Walk a sequence of settled opportunities, staking each policy-selected bet as a fraction of the
+/// *current* bankroll (so wins and losses compound, the Kelly setting), settling it against the
+/// actual result, and recording the bankroll after every placed bet. Opportunities that draw no bet
+/// pass through untouched; the walk stops early if the bankroll is exhausted.
+pub fn paper_trade(opps: &[Opportunity], start_bankroll: f64, policy: &BetPolicy) -> BacktestRun {
+    let mut bankroll = start_bankroll.max(0.0);
+    let mut curve = Vec::new();
+    let (mut bets, mut wins, mut turnover) = (0usize, 0usize, 0.0f64);
+    let mut peak = bankroll;
+    let mut max_drawdown = 0.0f64;
+
+    for opp in opps {
+        if bankroll <= 0.0 {
+            break;
+        }
+        let Some(sel) = select_bet(opp.model, opp.odds, policy) else {
+            continue;
+        };
+        let stake = sel.stake_fraction * bankroll;
+        turnover += stake;
+        bets += 1;
+        if sel.outcome == opp.result {
+            bankroll += stake * (sel.decimal - 1.0);
+            wins += 1;
+        } else {
+            bankroll -= stake;
+        }
+        curve.push(bankroll);
+        peak = peak.max(bankroll);
+        if peak > 0.0 {
+            max_drawdown = max_drawdown.max((peak - bankroll) / peak);
+        }
+    }
+
+    let profit = bankroll - start_bankroll;
+    let summary = BacktestSummary {
+        start_bankroll,
+        final_bankroll: bankroll,
+        roi: if start_bankroll > 0.0 {
+            profit / start_bankroll
+        } else {
+            0.0
+        },
+        bets,
+        wins,
+        hit_rate: if bets > 0 {
+            wins as f64 / bets as f64
+        } else {
+            0.0
+        },
+        turnover,
+        yield_pct: if turnover > 0.0 {
+            profit / turnover
+        } else {
+            0.0
+        },
+        max_drawdown,
+    };
+    BacktestRun { summary, curve }
+}
+
 /// Shin's recovered (fair) probabilities from raw implied probabilities. Solves for the insider
 /// proportion `z in [0, 1)` such that the recovered probabilities sum to one, by bisection (the
 /// recovered sum falls monotonically from `sqrt(booksum) > 1` at `z = 0` toward `< 1`). Returns raw
@@ -370,6 +465,55 @@ mod tests {
         assert!(sel.edge > 0.0 && sel.ev > 0.0);
         // Full Kelly here would exceed 5%, so the cap binds.
         approx(sel.stake_fraction, 0.05);
+    }
+
+    // A matchup where the model has a clear value edge on the home side, priced by a 5% book.
+    fn value_home_opp(result: Outcome) -> Opportunity {
+        Opportunity {
+            model: Probabilities::new(0.70, 0.20, 0.10),
+            odds: Odds::from_fair(Probabilities::new(0.5, 0.3, 0.2), 0.05),
+            result,
+        }
+    }
+
+    #[test]
+    fn paper_trading_compounds_wins_and_bleeds_losses() {
+        let policy = BetPolicy::default();
+
+        // Twenty winning bets: the bankroll compounds upward, every bet is a win, no drawdown.
+        let winners = vec![value_home_opp(Outcome::HomeWin); 20];
+        let up = paper_trade(&winners, 100.0, &policy);
+        assert_eq!(up.summary.bets, 20);
+        assert_eq!(up.summary.wins, 20);
+        approx(up.summary.hit_rate, 1.0);
+        assert!(up.summary.final_bankroll > 100.0 && up.summary.roi > 0.0);
+        assert!(up.summary.yield_pct > 0.0);
+        approx(up.summary.max_drawdown, 0.0);
+        assert_eq!(up.curve.len(), 20);
+
+        // Twenty losing bets: the bankroll bleeds down and the drawdown is real.
+        let losers = vec![value_home_opp(Outcome::AwayWin); 20];
+        let down = paper_trade(&losers, 100.0, &policy);
+        assert_eq!(down.summary.wins, 0);
+        assert!(down.summary.final_bankroll < 100.0 && down.summary.roi < 0.0);
+        assert!(down.summary.max_drawdown > 0.0);
+    }
+
+    #[test]
+    fn paper_trading_places_no_bets_on_a_fair_book() {
+        let fair = Probabilities::new(0.5, 0.3, 0.2);
+        let opps = vec![
+            Opportunity {
+                model: fair,
+                odds: Odds::from_fair(fair, 0.0),
+                result: Outcome::HomeWin,
+            };
+            10
+        ];
+        let run = paper_trade(&opps, 100.0, &BetPolicy::default());
+        assert_eq!(run.summary.bets, 0);
+        approx(run.summary.final_bankroll, 100.0);
+        assert!(run.curve.is_empty());
     }
 
     #[test]
