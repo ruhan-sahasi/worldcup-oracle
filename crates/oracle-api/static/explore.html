@@ -85,6 +85,7 @@
       <div class="tab active" data-tab="matchup">Matchup</div>
       <div class="tab" data-tab="simulate">Simulate</div>
       <div class="tab" data-tab="sensitivity">Sensitivity</div>
+      <div class="tab" data-tab="backtest">Backtest</div>
       <div class="tab" data-tab="ratings">Ratings</div>
     </div>
 
@@ -162,6 +163,26 @@
     </section>
 
     <!-- ===== Ratings ===== -->
+    <!-- ===== Backtest ===== -->
+    <section id="tab-backtest" class="hidden">
+      <div class="panel">
+        <h2>Betting backtest: model vs the market</h2>
+        <div class="note">Paper-trades the goal model against a synthetic bookmaker over a held-out season (a seed other than the training seed 7). The model bets its own probabilities, never the market-anchored ensemble. Whether it clears the vig is reported honestly.</div>
+        <div class="row">
+          <label>seed</label><input class="num" id="bt-seed" value="101" />
+          <label>matches</label><input class="num" id="bt-matches" value="2000" />
+          <label>bankroll</label><input class="num" id="bt-bankroll" value="100" />
+          <label>min edge</label><input class="num" id="bt-edge" value="0.02" />
+          <label>Kelly</label><input class="num" id="bt-kelly" value="0.25" />
+          <label>cap</label><input class="num" id="bt-cap" value="0.05" />
+          <label>vig</label><input class="num" id="bt-margin" value="0.06" />
+          <button id="run-backtest">Run backtest</button>
+          <span id="backtest-status" class="muted"></span>
+        </div>
+        <div id="backtest-out"></div>
+      </div>
+    </section>
+
     <section id="tab-ratings" class="hidden">
       <div class="panel">
         <h2>Confederation strength</h2>
@@ -192,7 +213,7 @@
   let ratingsLoaded = false;
   document.querySelectorAll(".tab").forEach(t => t.onclick = () => {
     document.querySelectorAll(".tab").forEach(x => x.classList.toggle("active", x === t));
-    for (const name of ["matchup", "simulate", "ratings"]) {
+    for (const name of ["matchup", "simulate", "sensitivity", "backtest", "ratings"]) {
       $("tab-" + name).classList.toggle("hidden", name !== t.dataset.tab);
     }
     if (t.dataset.tab === "ratings" && !ratingsLoaded) loadRatings();
@@ -422,6 +443,62 @@
     finally { $("run-sens").disabled = false; }
   }
 
+  // ----- backtest -----
+  function bankrollCurve(start, curve) {
+    if (!curve.length) return "";
+    const W = 640, H = 160, pad = 6;
+    const ys = [start, ...curve];
+    const lo = Math.min(...ys), hi = Math.max(...ys);
+    const span = hi - lo || 1;
+    const x = i => pad + (ys.length === 1 ? 0 : i / (ys.length - 1)) * (W - 2 * pad);
+    const y = v => (H - pad) - (v - lo) / span * (H - 2 * pad);
+    const pts = ys.map((v, i) => `${x(i).toFixed(1)},${y(v).toFixed(1)}`).join(" ");
+    const base = y(start).toFixed(1);
+    return `<svg viewBox="0 0 ${W} ${H}" width="100%" height="${H}" style="margin-top:10px">
+      <line x1="${pad}" y1="${base}" x2="${W - pad}" y2="${base}" stroke="var(--line)" stroke-dasharray="4 3"/>
+      <polyline points="${pts}" fill="none" stroke="var(--away)" stroke-width="1.5"/>
+    </svg>`;
+  }
+
+  async function runBacktest() {
+    $("run-backtest").disabled = true; $("backtest-status").textContent = "paper-trading a season…"; $("backtest-out").innerHTML = "";
+    const p = ["seed", "matches", "bankroll", "edge", "kelly", "cap", "margin"]
+      .map(k => `${k}=${encodeURIComponent($("bt-" + k).value)}`).join("&");
+    localStorage.setItem("backtest", p);
+    const t0 = performance.now();
+    try {
+      const r = await api(`/api/backtest?${p}`);
+      const secs = ((performance.now() - t0) / 1000).toFixed(1);
+      const s = r.run.summary, k = r.skill;
+      $("backtest-status").textContent = `${r.matches.toLocaleString()} matches (seed ${r.seed}, ${(r.margin * 100).toFixed(0)}% vig) · ${secs}s`;
+      const money = v => (v >= 0 ? "" : "-") + "$" + Math.abs(v).toFixed(2);
+      const signed = v => (v >= 0 ? "+" : "") + (v * 100).toFixed(1) + "%";
+      const col = v => v >= 0 ? "#3fb950" : "#f85149";
+      $("backtest-out").innerHTML =
+        `<table>
+          <tr><th>Bets</th><th>Hit rate</th><th>Turnover</th><th>Yield</th><th>ROI</th><th>Max drawdown</th><th>Final bankroll</th></tr>
+          <tr>
+            <td>${s.bets.toLocaleString()}</td>
+            <td>${pct(s.hit_rate)}</td>
+            <td>${money(s.turnover)}</td>
+            <td style="color:${col(s.yield_pct)}">${signed(s.yield_pct)}</td>
+            <td style="color:${col(s.roi)}">${signed(s.roi)}</td>
+            <td>${(s.max_drawdown * 100).toFixed(1)}%</td>
+            <td class="accent">${money(s.final_bankroll)} <span class="muted">from ${money(s.start_bankroll)}</span></td>
+          </tr>
+        </table>` +
+        bankrollCurve(s.start_bankroll, r.run.curve) +
+        `<h2 style="margin-top:14px">Is the edge real? Model vs market accuracy</h2>
+        <table>
+          <tr><th>Forecaster</th><th>Brier (lower better)</th><th>Log-loss</th></tr>
+          <tr><td>Model (Dixon-Coles)</td><td>${k.model_brier.toFixed(4)}</td><td>${k.model_log_loss.toFixed(4)}</td></tr>
+          <tr><td>Market (de-vigged)</td><td>${k.market_brier.toFixed(4)}</td><td>${k.market_log_loss.toFixed(4)}</td></tr>
+        </table>
+        <div class="note">A profit over a few hundred bets can be variance; the accuracy comparison is the honest tell.</div>`;
+    } catch (err) { $("backtest-status").textContent = err.message; }
+    finally { $("run-backtest").disabled = false; }
+  }
+
   // ----- ratings -----
   let sortKey = "elo", sortDesc = true;
   function renderRatings() {
@@ -465,6 +542,7 @@
   $("share").onclick = copyLink;
   $("run-sim").onclick = runSim;
   $("run-sens").onclick = runSensitivity;
+  $("run-backtest").onclick = runBacktest;
   $("rfilter").oninput = renderRatings;
   document.querySelectorAll(".preset").forEach(b => b.onclick = () => { $("iters").value = b.dataset.iters; runSim(); });
   // Enter anywhere in the matchup panel triggers a prediction.
