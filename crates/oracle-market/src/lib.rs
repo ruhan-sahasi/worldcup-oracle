@@ -83,6 +83,47 @@ impl Odds {
     }
 }
 
+/// The three outcome probabilities as `[home, draw, away]`, the order used throughout this crate.
+fn probs_array(p: Probabilities) -> [f64; 3] {
+    [p.home_win, p.draw, p.away_win]
+}
+
+/// Expected profit per unit staked on a decimal price `decimal` when the true win probability is
+/// `prob`: `prob * decimal - 1`. Positive exactly when `prob` beats the price's break-even
+/// probability `1 / decimal`, zero at a fair price, and never below `-1` (you cannot lose more than
+/// the stake).
+pub fn expected_value(prob: f64, decimal: f64) -> f64 {
+    prob * decimal - 1.0
+}
+
+impl Odds {
+    /// The break-even probabilities `1 / d` for `[home, draw, away]`: the win rate each price needs
+    /// just to return the stake. (Same values as [`Odds::implied`], named for the betting reading.)
+    pub fn break_even(&self) -> [f64; 3] {
+        self.implied()
+    }
+
+    /// Per-outcome **edge**: the model's probability minus the price's break-even probability. A
+    /// positive edge means the model thinks the outcome is likelier than the price requires, i.e. a
+    /// value bet.
+    pub fn edges(&self, model: Probabilities) -> [f64; 3] {
+        let p = probs_array(model);
+        let be = self.break_even();
+        [p[0] - be[0], p[1] - be[1], p[2] - be[2]]
+    }
+
+    /// Per-outcome **expected value** per unit stake, `p * d - 1`. Equivalently `d * edge`, so it
+    /// shares the edge's sign but scales a longshot's edge up by its longer price.
+    pub fn expected_values(&self, model: Probabilities) -> [f64; 3] {
+        let p = probs_array(model);
+        [
+            expected_value(p[0], self.home),
+            expected_value(p[1], self.draw),
+            expected_value(p[2], self.away),
+        ]
+    }
+}
+
 /// Shin's recovered (fair) probabilities from raw implied probabilities. Solves for the insider
 /// proportion `z in [0, 1)` such that the recovered probabilities sum to one, by bisection (the
 /// recovered sum falls monotonically from `sqrt(booksum) > 1` at `z = 0` toward `< 1`). Returns raw
@@ -179,6 +220,36 @@ mod tests {
         approx(s.home_win, 0.5);
         approx(s.draw, 0.3);
         approx(s.away_win, 0.2);
+    }
+
+    #[test]
+    fn expected_value_is_positive_exactly_when_the_probability_beats_the_price() {
+        approx(expected_value(0.5, 2.0), 0.0); // fair price
+        assert!(expected_value(0.5, 2.1) > 0.0); // priced too long -> value
+        assert!(expected_value(0.5, 1.9) < 0.0); // priced too short -> no value
+    }
+
+    #[test]
+    fn edge_and_expected_value_share_a_sign_and_scale_by_the_price() {
+        // Model likes the home side more than a 6% book prices it.
+        let odds = Odds::from_fair(Probabilities::new(0.5, 0.3, 0.2), 0.06);
+        let model = Probabilities::new(0.6, 0.25, 0.15);
+        let edges = odds.edges(model);
+        let evs = odds.expected_values(model);
+        // The home edge is real and positive; EV equals decimal * edge.
+        assert!(edges[0] > 0.0);
+        approx(evs[0], odds.home * edges[0]);
+        approx(evs[1], odds.draw * edges[1]);
+        approx(evs[2], odds.away * edges[2]);
+    }
+
+    #[test]
+    fn a_model_equal_to_a_fair_line_has_no_edge() {
+        let fair = Probabilities::new(0.5, 0.3, 0.2);
+        let edges = Odds::from_fair(fair, 0.0).edges(fair);
+        for e in edges {
+            approx(e, 0.0);
+        }
     }
 
     #[test]
