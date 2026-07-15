@@ -88,6 +88,23 @@ fn probs_array(p: Probabilities) -> [f64; 3] {
     [p.home_win, p.draw, p.away_win]
 }
 
+/// The **full-Kelly** stake fraction for a bet with win probability `prob` at decimal price
+/// `decimal`: `(prob * decimal - 1) / (decimal - 1)`, the fraction of bankroll that maximizes the
+/// long-run growth rate. Zero when there is no edge (the numerator is the expected value, so a
+/// non-positive edge stakes nothing) or the price is not above `1`.
+pub fn kelly_fraction(prob: f64, decimal: f64) -> f64 {
+    if decimal <= 1.0 {
+        return 0.0;
+    }
+    ((prob * decimal - 1.0) / (decimal - 1.0)).max(0.0)
+}
+
+/// **Fractional Kelly**: full Kelly scaled by `fraction` (e.g. `0.25` for quarter-Kelly, the usual
+/// hedge against estimation error and variance) and capped at one whole bankroll.
+pub fn fractional_kelly(prob: f64, decimal: f64, fraction: f64) -> f64 {
+    (kelly_fraction(prob, decimal) * fraction.max(0.0)).min(1.0)
+}
+
 /// Expected profit per unit staked on a decimal price `decimal` when the true win probability is
 /// `prob`: `prob * decimal - 1`. Positive exactly when `prob` beats the price's break-even
 /// probability `1 / decimal`, zero at a fair price, and never below `-1` (you cannot lose more than
@@ -250,6 +267,26 @@ mod tests {
         for e in edges {
             approx(e, 0.0);
         }
+    }
+
+    #[test]
+    fn kelly_stakes_the_growth_optimal_fraction_and_nothing_without_an_edge() {
+        // (0.6 * 2 - 1) / (2 - 1) = 0.2.
+        approx(kelly_fraction(0.6, 2.0), 0.2);
+        // (0.5 * 3 - 1) / (3 - 1) = 0.25.
+        approx(kelly_fraction(0.5, 3.0), 0.25);
+        // A fair price and a losing price stake nothing.
+        approx(kelly_fraction(0.5, 2.0), 0.0);
+        approx(kelly_fraction(0.4, 2.0), 0.0);
+        approx(kelly_fraction(0.9, 1.0), 0.0);
+    }
+
+    #[test]
+    fn fractional_kelly_scales_and_caps() {
+        approx(fractional_kelly(0.6, 2.0, 0.5), 0.1); // quarter... half of 0.2
+        approx(fractional_kelly(0.6, 2.0, 0.0), 0.0);
+        // A huge edge with an aggressive multiple never stakes more than the whole bankroll.
+        approx(fractional_kelly(0.99, 100.0, 5.0), 1.0);
     }
 
     #[test]
