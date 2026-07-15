@@ -240,6 +240,27 @@ Skill is the point, so it is measured carefully:
   variation distance) and which teams move most. A signal that barely shifts the title picture is
   reported honestly as such; the point is to *measure* each contribution rather than assert it.
 
+## Betting the model against the market
+
+Matching the market on a proper scoring rule is one thing; **beating the price** is another, and the
+`oracle-market` crate asks it directly. It is a small, pure library, built in layers that are each
+unit-tested in isolation: decimal odds and the **overround**; **de-vigging** (proportional, and
+**Shin's method**, which strips more margin from longshots to correct the favourite/longshot bias);
+per-outcome **edge** and **expected value**; **Kelly** and fractional-Kelly staking; a bet-selection
+**policy** (back the top-EV side only past an edge threshold, stake fractional Kelly, cap the risk);
+and a compounding **paper-trading bankroll** that settles each selected bet against the real result
+and reports ROI, hit rate, turnover, yield, and max drawdown, next to a Brier/log-loss comparison of
+the model versus the market on the same games.
+
+The backtest is deliberately **out of sample**: the model is fit on one season's synthetic history
+and bets a *different* season, whose noisy fair lines are priced with a vig to give the odds a bettor
+would face. It bets the goal model's own probabilities, never the market-anchored ensemble, which
+would be circular. The honest result reinforces the thesis above: with a tight edge filter the model
+can post a positive ROI over a handful of bets, but that is variance (a dozen bets, an absurd yield);
+loosen the filter to a real sample and it bleeds roughly the margin, because its Brier score is not
+actually better than the market's. A calibrated model is not the same as an edge, and the harness is
+built to show that rather than hide it.
+
 ## Honest limitations
 
 - The bundled roster/draw is a representative sample, not the official FIFA draw; the live adapter

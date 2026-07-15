@@ -1,6 +1,6 @@
 # Architecture
 
-`worldcup-oracle` is a Cargo **workspace** of eight focused crates. Dependencies flow
+`worldcup-oracle` is a Cargo **workspace** of nine focused crates. Dependencies flow
 strictly downhill from a zero-I/O domain core, so the prediction math, the data
 sources, and the transport layers can each change without disturbing the others.
 
@@ -13,6 +13,7 @@ graph TD
     model[oracle-model<br/>Dixon-Coles · Bayesian · ensemble]
     sim[oracle-sim<br/>Monte-Carlo]
     ingest[oracle-ingest<br/>DataProvider impls]
+    market[oracle-market<br/>odds · devig · Kelly · backtest]
     engine[oracle-engine<br/>event loop · pub/sub]
     api[oracle-api<br/>axum REST + WS]
     cli[oracle-cli<br/>wc-oracle + TUI]
@@ -23,14 +24,18 @@ graph TD
     sim --> model
     ingest --> domain
     ingest --> model
+    market --> domain
     engine --> domain
     engine --> ratings
     engine --> model
     engine --> sim
     engine --> ingest
+    engine --> market
     api --> engine
+    api --> market
     cli --> engine
     cli --> api
+    cli --> market
 ```
 
 `oracle-domain` depends on nothing but `serde`/`chrono`. Everything points *at* it;
@@ -354,6 +359,17 @@ seeded SplitMix64 generator, so the intervals are reproducible with no `rand` de
 Non-overlapping intervals are the honest test of whether a change is a real improvement or within
 noise; it is also the instrument that makes future model overhauls measurable rather than
 eyeballed.
+
+### Market backtest (`oracle-market` + `oracle-engine::query`)
+A separate pure crate for the betting question. `oracle-market` layers decimal-odds types and the
+overround, two de-vigging methods (proportional and Shin's), per-outcome edge and expected value,
+Kelly and fractional-Kelly staking, a bet-selection policy, a compounding paper-trading bankroll
+simulator, and a model-versus-market Brier/log-loss comparison; every layer is unit-tested on its
+own. `Explorer::market_backtest` drives it out of sample (model fit on the training seed, bets a
+different season priced with a vig) and returns a `BacktestReport`, surfaced on `/api/backtest`, the
+explorer's Backtest tab, and `wc-oracle market-backtest`. It bets the goal model's own
+probabilities, not the market-anchored ensemble, so the test is not circular; the honest result is
+that a calibrated model still does not beat the price once the margin is priced in.
 
 ### Durable event store (`oracle-engine::event_log`)
 With `EngineConfig.event_log` set, every consumed event is appended as one JSON line and
