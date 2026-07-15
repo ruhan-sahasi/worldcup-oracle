@@ -16,7 +16,7 @@
 //! the next layer up).
 #![forbid(unsafe_code)]
 
-use oracle_domain::Probabilities;
+use oracle_domain::{Outcome, Probabilities};
 use serde::{Deserialize, Serialize};
 
 /// Decimal (European) odds for the three match outcomes: home win, draw, away win.
@@ -139,6 +139,72 @@ impl Odds {
             expected_value(p[2], self.away),
         ]
     }
+}
+
+/// How to turn a matchup into at most one bet: only back an outcome whose edge clears `min_edge`,
+/// stake `kelly_fraction` of full Kelly, and never risk more than `max_fraction` of bankroll on a
+/// single bet.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct BetPolicy {
+    pub min_edge: f64,
+    pub kelly_fraction: f64,
+    pub max_fraction: f64,
+}
+
+impl Default for BetPolicy {
+    /// A cautious default: back only a 2%+ edge, stake quarter-Kelly, and cap any single bet at 5%
+    /// of bankroll.
+    fn default() -> Self {
+        Self {
+            min_edge: 0.02,
+            kelly_fraction: 0.25,
+            max_fraction: 0.05,
+        }
+    }
+}
+
+/// A chosen bet: which outcome, at what price, with the model's probability, the edge and expected
+/// value behind it, and the fraction of bankroll to stake under the policy.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct Selection {
+    pub outcome: Outcome,
+    pub decimal: f64,
+    pub model_prob: f64,
+    pub edge: f64,
+    pub ev: f64,
+    pub stake_fraction: f64,
+}
+
+/// Pick at most one bet from a matchup: the highest-EV outcome, taken only if its edge clears the
+/// policy threshold and the (fractional, capped) Kelly stake is positive. `None` means "no bet".
+pub fn select_bet(model: Probabilities, odds: Odds, policy: &BetPolicy) -> Option<Selection> {
+    let probs = probs_array(model);
+    let decimals = [odds.home, odds.draw, odds.away];
+    let edges = odds.edges(model);
+    let evs = odds.expected_values(model);
+    let outcomes = [Outcome::HomeWin, Outcome::Draw, Outcome::AwayWin];
+
+    let best = (0..3).max_by(|&i, &j| {
+        evs[i]
+            .partial_cmp(&evs[j])
+            .unwrap_or(std::cmp::Ordering::Equal)
+    })?;
+    if edges[best] < policy.min_edge {
+        return None;
+    }
+    let stake = fractional_kelly(probs[best], decimals[best], policy.kelly_fraction)
+        .min(policy.max_fraction);
+    if stake <= 0.0 {
+        return None;
+    }
+    Some(Selection {
+        outcome: outcomes[best],
+        decimal: decimals[best],
+        model_prob: probs[best],
+        edge: edges[best],
+        ev: evs[best],
+        stake_fraction: stake,
+    })
 }
 
 /// Shin's recovered (fair) probabilities from raw implied probabilities. Solves for the insider
@@ -287,6 +353,38 @@ mod tests {
         approx(fractional_kelly(0.6, 2.0, 0.0), 0.0);
         // A huge edge with an aggressive multiple never stakes more than the whole bankroll.
         approx(fractional_kelly(0.99, 100.0, 5.0), 1.0);
+    }
+
+    #[test]
+    fn select_bet_backs_the_value_side_and_respects_the_cap() {
+        let odds = Odds::from_fair(Probabilities::new(0.5, 0.3, 0.2), 0.06);
+        // Model is much higher on the home side than the book: a clear value bet.
+        let model = Probabilities::new(0.65, 0.20, 0.15);
+        let policy = BetPolicy {
+            min_edge: 0.02,
+            kelly_fraction: 1.0,
+            max_fraction: 0.05,
+        };
+        let sel = select_bet(model, odds, &policy).expect("a value bet");
+        assert_eq!(sel.outcome, Outcome::HomeWin);
+        assert!(sel.edge > 0.0 && sel.ev > 0.0);
+        // Full Kelly here would exceed 5%, so the cap binds.
+        approx(sel.stake_fraction, 0.05);
+    }
+
+    #[test]
+    fn select_bet_declines_a_fair_line_and_a_sub_threshold_edge() {
+        let fair = Probabilities::new(0.5, 0.3, 0.2);
+        // Matching a fair line: no edge anywhere -> no bet.
+        assert!(select_bet(fair, Odds::from_fair(fair, 0.0), &BetPolicy::default()).is_none());
+        // A real but tiny edge below the threshold is passed up.
+        let odds = Odds::from_fair(fair, 0.06);
+        let model = Probabilities::new(0.51, 0.29, 0.20);
+        let strict = BetPolicy {
+            min_edge: 0.10,
+            ..BetPolicy::default()
+        };
+        assert!(select_bet(model, odds, &strict).is_none());
     }
 
     #[test]
