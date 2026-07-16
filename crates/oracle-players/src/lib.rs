@@ -43,6 +43,24 @@ impl Rng {
     pub fn next_f64(&mut self) -> f64 {
         (self.next_u64() >> 11) as f64 / (1u64 << 53) as f64
     }
+
+    /// A Poisson-distributed count with mean `lambda`, by Knuth's multiplication method. Player and
+    /// per-match rates here are small (well below one), where Knuth is both exact and fast.
+    pub fn poisson(&mut self, lambda: f64) -> u32 {
+        if lambda <= 0.0 {
+            return 0;
+        }
+        let threshold = (-lambda).exp();
+        let mut product = 1.0;
+        let mut k = 0u32;
+        loop {
+            product *= self.next_f64();
+            if product <= threshold {
+                return k;
+            }
+            k += 1;
+        }
+    }
 }
 
 /// A player's identity in a market or race: their name and their team's name.
@@ -375,6 +393,23 @@ mod tests {
     #[test]
     fn different_seeds_diverge() {
         assert_ne!(Rng::new(1).next_u64(), Rng::new(2).next_u64());
+    }
+
+    #[test]
+    fn poisson_samples_have_the_right_mean_and_are_reproducible() {
+        // Zero rate never scores.
+        assert_eq!(Rng::new(3).poisson(0.0), 0);
+        // Sample mean converges to lambda.
+        let lambda = 0.8;
+        let mut rng = Rng::new(11);
+        let n = 200_000;
+        let total: u64 = (0..n).map(|_| u64::from(rng.poisson(lambda))).sum();
+        let mean = total as f64 / n as f64;
+        assert!((mean - lambda).abs() < 0.02, "mean {mean}");
+        // Same seed, same sequence of draws.
+        let mut a = Rng::new(99);
+        let mut b = Rng::new(99);
+        assert!((0..500).all(|_| a.poisson(1.3) == b.poisson(1.3)));
     }
 
     #[test]
