@@ -7,6 +7,8 @@
 //! wc-oracle predict    # one-off matchup prediction (ensemble + score grid)
 //! wc-oracle backtest   # calibration + bookmaker benchmark (real or synthetic data)
 //! wc-oracle market-backtest # paper-trade the model against the market (bankroll, ROI, edge)
+//! wc-oracle scorers    # goalscorer market for a matchup (anytime / brace / hat-trick)
+//! wc-oracle golden-boot # top-scorer race across the tournament
 //! wc-oracle tune       # search goal-model hyperparameters by held-out log-loss
 //! wc-oracle serve      # run the REST + WebSocket server
 //! wc-oracle watch      # live terminal dashboard (TUI)
@@ -125,6 +127,30 @@ enum Command {
         #[arg(long, default_value_t = 0.06)]
         margin: f64,
     },
+    /// Goalscorer market for a matchup (anytime, brace, hat-trick per player).
+    Scorers {
+        /// Home team (name or FIFA code).
+        #[arg(long)]
+        home: String,
+        /// Away team (name or FIFA code).
+        #[arg(long)]
+        away: String,
+        /// How many players to show.
+        #[arg(long, default_value_t = 20)]
+        top: usize,
+    },
+    /// Golden Boot race: each player's chance of finishing the tournament's top scorer.
+    GoldenBoot {
+        /// Monte-Carlo iterations.
+        #[arg(long, default_value_t = 20_000)]
+        iters: u32,
+        /// RNG seed (fixed seed => reproducible output).
+        #[arg(long, default_value_t = 42)]
+        seed: u64,
+        /// How many contenders to show.
+        #[arg(long, default_value_t = 20)]
+        top: usize,
+    },
     /// Run the REST + WebSocket server.
     Serve {
         /// Listen address.
@@ -191,6 +217,8 @@ async fn main() -> anyhow::Result<()> {
             cap,
             margin,
         } => cmd_market_backtest(seed, matches, bankroll, edge, kelly, cap, margin),
+        Command::Scorers { home, away, top } => cmd_scorers(&home, &away, top),
+        Command::GoldenBoot { iters, seed, top } => cmd_golden_boot(iters, seed, top),
         Command::Serve { addr, event_log } => cmd_serve(addr, event_log).await,
         Command::Watch { speed } => watch::run(speed).await,
         Command::Sensitivity { iters, seed, top } => cmd_sensitivity(iters, seed, top),
@@ -278,6 +306,49 @@ fn cmd_market_backtest(
         "did not clear the vig"
     };
     println!("\nVerdict: the model {verdict} over {} bets.", s.bets);
+    Ok(())
+}
+
+fn cmd_scorers(home: &str, away: &str, top: usize) -> anyhow::Result<()> {
+    let explorer = Explorer::new();
+    let h = explorer
+        .resolve(home)
+        .ok_or_else(|| anyhow::anyhow!("unknown team: {home}"))?;
+    let a = explorer
+        .resolve(away)
+        .ok_or_else(|| anyhow::anyhow!("unknown team: {away}"))?;
+    let market = explorer.scorer_market(h, a, true);
+    println!("Goalscorer market ({home} v {away})   anytime / brace / hat-trick\n");
+    for line in market.lines.iter().take(top) {
+        println!(
+            "  {:<16} {:<16} xg {:.2}   {:>5.1}%  {:>5.1}%  {:>5.1}%",
+            line.player.name,
+            line.player.team,
+            line.expected_goals,
+            line.anytime * 100.0,
+            line.brace * 100.0,
+            line.hat_trick * 100.0
+        );
+    }
+    Ok(())
+}
+
+fn cmd_golden_boot(iters: u32, seed: u64, top: usize) -> anyhow::Result<()> {
+    println!("Fitting the model, then simulating the Golden Boot race (seed {seed})...\n");
+    let explorer = Explorer::new();
+    let race = explorer.golden_boot(iters, seed);
+    println!("Golden Boot race   top scorer / top 3\n");
+    for (i, o) in race.iter().take(top).enumerate() {
+        println!(
+            "  {:>2}. {:<16} {:<16} exp {:>4.1}   {:>5.1}%  {:>5.1}%",
+            i + 1,
+            o.player.name,
+            o.player.team,
+            o.expected_goals,
+            o.p_top * 100.0,
+            o.p_top3 * 100.0
+        );
+    }
     Ok(())
 }
 
