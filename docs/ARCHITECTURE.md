@@ -1,6 +1,6 @@
 # Architecture
 
-`worldcup-oracle` is a Cargo **workspace** of nine focused crates. Dependencies flow
+`worldcup-oracle` is a Cargo **workspace** of ten focused crates. Dependencies flow
 strictly downhill from a zero-I/O domain core, so the prediction math, the data
 sources, and the transport layers can each change without disturbing the others.
 
@@ -14,6 +14,7 @@ graph TD
     sim[oracle-sim<br/>Monte-Carlo]
     ingest[oracle-ingest<br/>DataProvider impls]
     market[oracle-market<br/>odds · devig · Kelly · backtest]
+    players[oracle-players<br/>scorer markets · Golden Boot]
     engine[oracle-engine<br/>event loop · pub/sub]
     api[oracle-api<br/>axum REST + WS]
     cli[oracle-cli<br/>wc-oracle + TUI]
@@ -25,14 +26,17 @@ graph TD
     ingest --> domain
     ingest --> model
     market --> domain
+    players --> domain
     engine --> domain
     engine --> ratings
     engine --> model
     engine --> sim
     engine --> ingest
     engine --> market
+    engine --> players
     api --> engine
     api --> market
+    api --> players
     cli --> engine
     cli --> api
     cli --> market
@@ -370,6 +374,17 @@ different season priced with a vig) and returns a `BacktestReport`, surfaced on 
 explorer's Backtest tab, and `wc-oracle market-backtest`. It bets the goal model's own
 probabilities, not the market-anchored ensemble, so the test is not circular; the honest result is
 that a calibrated model still does not beat the price once the margin is priced in.
+
+### Goalscorer markets and the Golden Boot (`oracle-players` + `oracle-engine::query`)
+The player-level layer, a pure leaf crate. It shares a team's expected goals across its players by
+attacking weight, reads off the Poisson scorer markets (anytime, brace, hat-trick, first goal), and
+runs a seeded Monte-Carlo Golden Boot race over expected tournament goals, with its own SplitMix64
+generator and Knuth Poisson sampler so it carries no `rand` dependency and every layer is unit-tested
+in isolation. `Explorer::scorer_market` and `Explorer::golden_boot` feed it the squad model's attack
+weights and the goal model's expected goals, and it is surfaced on `/api/scorers`, `/api/golden-boot`,
+the explorer's Players tab, and `wc-oracle scorers` / `golden-boot`. The player weights are the squad
+model's own scores, so nothing is invented; the tournament expected-goals estimate is a labelled
+approximation over an exact scoring model.
 
 ### Durable event store (`oracle-engine::event_log`)
 With `EngineConfig.event_log` set, every consumed event is appended as one JSON line and

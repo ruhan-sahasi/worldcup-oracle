@@ -261,6 +261,24 @@ loosen the filter to a real sample and it bleeds roughly the margin, because its
 actually better than the market's. A calibrated model is not the same as an edge, and the harness is
 built to show that rather than hide it.
 
+## Who scores: goalscorer markets and the Golden Boot
+
+Every layer above reasons about teams; `oracle-players` reasons about the individuals who score. It
+takes a team's expected goals in a match and **shares them across the on-pitch players in proportion
+to their attacking weight** (the squad model's own attack scores, talisman boost included, so nothing
+new is invented), giving each player an expected-goals rate. From a Poisson on that rate fall the
+markets a fan actually bets: **anytime scorer** (`1 - e^-xg`), **brace** and **hat-trick**
+(at-least-two and at-least-three), and, treating each player's goals as a competing Poisson process,
+the **first goalscorer** (`(rate / total)(1 - e^-total)`, with the leftover a goalless match).
+
+The **Golden Boot** race lifts this to the whole tournament. Each team's expected tournament goals
+are its expected number of matches (three group games plus the round-reach probabilities from a quick
+simulation) times its representative per-match expected goals, shared across its outfielders, and a
+Monte-Carlo (a seeded SplitMix64 drawing each player's goals by Knuth's method) counts how often each
+finishes top scorer or on the podium. The expected-matches and per-match-goals steps are deliberate
+approximations, labelled as such; the allocation, the Poisson markets, and the race simulation on top
+are exact and independently unit-tested.
+
 ## Honest limitations
 
 - The bundled roster/draw is a representative sample, not the official FIFA draw; the live adapter

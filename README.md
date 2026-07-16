@@ -64,6 +64,7 @@ fully offline with **zero keys and zero network**.
 | **Title momentum** - the biggest risers and fallers in championship odds over the last several recomputes, read off the recorded history | who is surging or fading right now, a moving-picture complement to the static odds table |
 | **Lead changes** - when the title favourite changed hands over the tournament, with hysteresis so Monte-Carlo jitter between near-tied favourites is not counted | the story of the race in one timeline: who has worn the favourite tag and when it flipped |
 | **Market backtest** (`oracle-market`) - **de-vigging** (multiplicative + **Shin**), **edge/EV**, **Kelly staking**, and a compounding **paper-trading bankroll** simulator, run out-of-sample against a synthetic book | the honest quant question: after the vig, does the model beat the price? The truthful answer here is no, and the backtest shows why |
+| **Goalscorer markets + Golden Boot** (`oracle-players`) - a team's expected goals shared across its squad by attacking weight, giving **anytime / brace / hat-trick** and **first-scorer** markets per match, and a Monte-Carlo **top-scorer race** over the tournament | the player-level layer: who scores the goals, not just who wins the match |
 | **Bayesian live updater** with **score effects** | conditions on score, minute, and red cards; a trailing team chases and a leading team defends |
 | **Lineup adjustment** | a confirmed XI shifts each team's attack and defense |
 | **Suspension tracking** | yellow-card accumulation drops a suspended starter from the next match before its lineup is known |
@@ -163,6 +164,10 @@ cargo run --release -p oracle-cli -- backtest --cv 5   # rolling-origin CV with 
 
 # 6. Paper-trade the model against the market: bankroll, ROI, and an honest edge check.
 cargo run --release -p oracle-cli -- market-backtest --matches 5000 --seed 202
+
+# 7. Player markets: a matchup's goalscorers and the tournament Golden Boot race.
+cargo run --release -p oracle-cli -- scorers --home Brazil --away Japan
+cargo run --release -p oracle-cli -- golden-boot
 ```
 
 ```text
@@ -311,6 +316,8 @@ team and confederation ratings. The current matchup lives in the URL, so any pre
 | `GET` | `/consensus` | **consensus** title forecast blending both models + their live **divergence** (Jensen-Shannon) |
 | `GET` | `/api/simulate?iters=&seed=` | custom Monte-Carlo champion-odds run |
 | `GET` | `/api/backtest?seed=&matches=` | **paper-trade** the model vs a synthetic book: bankroll, ROI, yield, and a model-vs-market skill check |
+| `GET` | `/api/scorers?home=&away=` | **goalscorer market**: anytime, brace, hat-trick per player |
+| `GET` | `/api/golden-boot?iters=&seed=` | **Golden Boot** race: each player's top-scorer odds |
 | `GET` | `/api/sensitivity?iters=&seed=` | per-signal ablation: how much each signal moves the title |
 | `GET` | `/api/ratings` | team ratings + confederation strength levels |
 | `GET` | `/metrics` | Prometheus metrics |
