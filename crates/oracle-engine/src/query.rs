@@ -12,7 +12,7 @@
 use oracle_domain::{
     Confederation, MatchId, MatchStatus, Probabilities, ScoreGrid, Scoreline, TeamId, Tournament,
 };
-use oracle_ingest::data::{self, SignalMask, VenueAdj};
+use oracle_ingest::data::{self, Position, SignalMask, VenueAdj};
 use oracle_market::{
     paper_trade, skill_comparison, BacktestRun, BetPolicy, Odds, Opportunity, SkillComparison,
 };
@@ -21,7 +21,9 @@ use oracle_model::{
     implied_probabilities, BradleyTerry, DixonColesConfig, Ensemble, GoalModel, LiveConfig,
     Observation,
 };
-use oracle_players::{MatchPlayer, ScorerMarket};
+use oracle_players::{
+    GoldenBootConfig, GoldenBootContender, GoldenBootOdds, MatchPlayer, PlayerRef, ScorerMarket,
+};
 use oracle_ratings::{RatingStore, StateSpaceRatings};
 use oracle_sim::{meeting_probabilities, simulate_with_live, LiveInputs, SimConfig};
 use serde::Serialize;
@@ -166,6 +168,95 @@ impl Explorer {
             &lineup(away),
             away_xg,
         )
+    }
+
+    /// The Golden Boot race. Each team's expected tournament goals are estimated as its expected
+    /// number of matches (three group games plus the round-reach probabilities from a quick
+    /// simulation) times its representative per-match expected goals (averaged over all opponents),
+    /// then shared across its outfielders by attacking weight. A Monte-Carlo over those per-player
+    /// rates gives each contender's chance of finishing top scorer. The top forty are returned.
+    ///
+    /// The per-match-goals and expected-matches steps are deliberate approximations (independent of
+    /// who a team actually meets); the scoring model and the race simulation on top are exact.
+    pub fn golden_boot(&self, iters: u32, seed: u64) -> Vec<GoldenBootOdds> {
+        let inputs = LiveInputs {
+            venue: data::matchup_adjustments(&self.tournament),
+            shootout_rating: self.shootout_rating.clone(),
+            knockout_pedigree: self.knockout_pedigree.clone(),
+            ..Default::default()
+        };
+        let forecast = simulate_with_live(
+            &self.tournament,
+            &self.model,
+            SimConfig {
+                iterations: iters.clamp(1000, 100_000) as u64,
+                seed,
+                ..SimConfig::default()
+            },
+            &inputs,
+            LiveConfig::default(),
+        );
+        // Expected matches per team: three group games plus the chance of playing each knockout
+        // round (reaching a round means playing a match in it).
+        let expected_matches: HashMap<TeamId, f64> = forecast
+            .teams
+            .iter()
+            .map(|t| {
+                let knockout = t.p_advance_group
+                    + t.p_round_of_16
+                    + t.p_quarter_final
+                    + t.p_semi_final
+                    + t.p_final;
+                (t.team, 3.0 + knockout)
+            })
+            .collect();
+
+        let ids: Vec<TeamId> = self.tournament.teams.iter().map(|t| t.id).collect();
+        let contenders: Vec<GoldenBootContender> = ids
+            .iter()
+            .flat_map(|&team| {
+                // Representative per-match attacking output: mean expected goals over all opponents.
+                let (mut sum, mut count) = (0.0, 0u32);
+                for &opp in &ids {
+                    if opp != team {
+                        sum += self.model.expected_goals(team, opp, true).0;
+                        count += 1;
+                    }
+                }
+                let per_match = if count > 0 { sum / count as f64 } else { 0.0 };
+                let team_total = expected_matches.get(&team).copied().unwrap_or(3.0) * per_match;
+
+                let squad = data::squad(team);
+                let outfield: Vec<&data::Player> = squad
+                    .iter()
+                    .filter(|p| p.position != Position::Gk)
+                    .collect();
+                let weights: Vec<f64> = outfield.iter().map(|p| p.attack).collect();
+                let goals = oracle_players::allocate(&weights, team_total);
+                let team_name = self.name(team);
+                outfield
+                    .into_iter()
+                    .zip(goals)
+                    .map(|(p, expected_goals)| GoldenBootContender {
+                        player: PlayerRef {
+                            name: p.name.clone(),
+                            team: team_name.clone(),
+                        },
+                        expected_goals,
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+
+        let mut odds = oracle_players::golden_boot(
+            &contenders,
+            &GoldenBootConfig {
+                iters: iters.clamp(1000, 100_000),
+                seed,
+            },
+        );
+        odds.truncate(40);
+        odds
     }
 
     /// Resolve a team by FIFA code, full name, or a name substring (case-insensitive).
@@ -1227,6 +1318,25 @@ mod tests {
             .map(|l| l.expected_goals)
             .sum();
         assert!((home_goals - home_xg).abs() < 1e-9);
+    }
+
+    #[test]
+    fn golden_boot_race_ranks_contenders_and_is_reproducible() {
+        let ex = Explorer::new();
+        let race = ex.golden_boot(3000, 42);
+
+        assert!(!race.is_empty() && race.len() <= 40);
+        // Ranked by chance of finishing top scorer.
+        assert!(race.windows(2).all(|w| w[0].p_top >= w[1].p_top));
+        for o in &race {
+            assert!((0.0..=1.0).contains(&o.p_top));
+            assert!(o.p_top3 >= o.p_top - 1e-12);
+            assert!(o.expected_goals >= 0.0);
+        }
+        // The favourite carries real expected goals, and the run is reproducible from its seed.
+        assert!(race[0].expected_goals > 1.0);
+        let again = ex.golden_boot(3000, 42);
+        assert_eq!(race[0].player, again[0].player);
     }
 
     #[test]
