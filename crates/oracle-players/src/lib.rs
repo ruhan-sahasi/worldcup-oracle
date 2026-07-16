@@ -277,6 +277,112 @@ pub fn first_scorer_market(
     }
 }
 
+/// A Golden Boot contender: a player and their expected goals across the rest of the tournament.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GoldenBootContender {
+    pub player: PlayerRef,
+    pub expected_goals: f64,
+}
+
+/// Monte-Carlo settings for the Golden Boot race.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct GoldenBootConfig {
+    pub iters: u32,
+    pub seed: u64,
+}
+
+impl Default for GoldenBootConfig {
+    fn default() -> Self {
+        Self {
+            iters: 20_000,
+            seed: 42,
+        }
+    }
+}
+
+/// One contender's Golden Boot odds: their expected goals, the chance of finishing top scorer
+/// (`p_top`, ties split), and the chance of a top-three finish (`p_top3`, ties inclusive).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GoldenBootOdds {
+    pub player: PlayerRef,
+    pub expected_goals: f64,
+    pub p_top: f64,
+    pub p_top3: f64,
+}
+
+/// Simulate the Golden Boot race: each iteration draws every contender's goal count from a Poisson
+/// on their expected tournament goals, then credits the leader (ties split, so the win probabilities
+/// sum to one) and everyone finishing in the top three (ties inclusive). Reproducible from the
+/// config seed, ranked by the chance of finishing top scorer.
+pub fn golden_boot(
+    contenders: &[GoldenBootContender],
+    config: &GoldenBootConfig,
+) -> Vec<GoldenBootOdds> {
+    let n = contenders.len();
+    if n == 0 {
+        return Vec::new();
+    }
+    let iters = config.iters.max(1);
+    let mut rng = Rng::new(config.seed);
+    let mut tally = vec![0u32; n];
+    let mut wins = vec![0.0f64; n];
+    let mut podium = vec![0.0f64; n];
+
+    for _ in 0..iters {
+        for (i, c) in contenders.iter().enumerate() {
+            tally[i] = rng.poisson(c.expected_goals);
+        }
+        // The three largest tallies (with multiplicity), in one pass.
+        let (mut v1, mut v2, mut v3) = (0u32, 0u32, 0u32);
+        for &t in &tally {
+            if t > v1 {
+                v3 = v2;
+                v2 = v1;
+                v1 = t;
+            } else if t > v2 {
+                v3 = v2;
+                v2 = t;
+            } else if t > v3 {
+                v3 = t;
+            }
+        }
+        let leaders = tally.iter().filter(|&&t| t == v1).count();
+        let win_share = 1.0 / leaders as f64;
+        let podium_cut = v3.max(1);
+        for i in 0..n {
+            if tally[i] == v1 {
+                wins[i] += win_share;
+            }
+            if tally[i] >= podium_cut {
+                podium[i] += 1.0;
+            }
+        }
+    }
+
+    let iters_f = iters as f64;
+    let mut odds: Vec<GoldenBootOdds> = contenders
+        .iter()
+        .enumerate()
+        .map(|(i, c)| GoldenBootOdds {
+            player: c.player.clone(),
+            expected_goals: c.expected_goals,
+            p_top: wins[i] / iters_f,
+            p_top3: podium[i] / iters_f,
+        })
+        .collect();
+    odds.sort_by(|a, b| {
+        b.p_top
+            .partial_cmp(&a.p_top)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then(
+                b.expected_goals
+                    .partial_cmp(&a.expected_goals)
+                    .unwrap_or(std::cmp::Ordering::Equal),
+            )
+    });
+    odds
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -379,6 +485,50 @@ mod tests {
         let none = first_scorer_market("H", &[MatchPlayer::new("A", 1.0)], 0.0, "A", &[], 0.0);
         approx(none.no_goal, 1.0);
         approx(none.lines[0].prob, 0.0);
+    }
+
+    fn contender(name: &str, xg: f64) -> GoldenBootContender {
+        GoldenBootContender {
+            player: PlayerRef {
+                name: name.into(),
+                team: "T".into(),
+            },
+            expected_goals: xg,
+        }
+    }
+
+    #[test]
+    fn golden_boot_race_is_a_ranked_distribution_and_reproducible() {
+        let field = vec![
+            contender("Ace", 7.0),
+            contender("Second", 5.0),
+            contender("Third", 5.0),
+            contender("Squad", 3.0),
+            contender("Fringe", 1.0),
+        ];
+        let cfg = GoldenBootConfig {
+            iters: 20_000,
+            seed: 42,
+        };
+        let odds = golden_boot(&field, &cfg);
+
+        assert_eq!(odds.len(), 5);
+        // Win probabilities are a distribution (ties split, so they sum to one).
+        let total: f64 = odds.iter().map(|o| o.p_top).sum();
+        assert!((total - 1.0).abs() < 1e-9, "sum {total}");
+        // Ranked by chance of finishing top scorer, and the clear favourite leads.
+        assert!(odds.windows(2).all(|w| w[0].p_top >= w[1].p_top));
+        assert_eq!(odds[0].player.name, "Ace");
+        // Finishing top implies finishing top three, per player.
+        for o in &odds {
+            assert!(o.p_top3 >= o.p_top - 1e-12);
+            assert!((0.0..=1.0).contains(&o.p_top) && (0.0..=1.0).contains(&o.p_top3));
+        }
+        // Same seed, identical odds.
+        let again = golden_boot(&field, &cfg);
+        assert!((again[0].p_top - odds[0].p_top).abs() < 1e-12);
+
+        assert!(golden_boot(&[], &cfg).is_empty());
     }
 
     #[test]
