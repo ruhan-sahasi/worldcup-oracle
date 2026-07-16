@@ -1190,6 +1190,7 @@ dependencies = [
  "oracle-domain",
  "oracle-engine",
  "oracle-market",
+ "oracle-players",
  "serde",
  "serde_json",
  "tokio",

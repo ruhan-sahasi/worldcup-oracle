@@ -44,6 +44,8 @@
 //! | GET | `/api/kingmaker?q=` | rooting interest: which group results swing a team's title odds |
 //! | GET | `/api/collision?home=&away=` | probability two teams meet in the knockouts, by round |
 //! | GET | `/api/ratings` | team ratings + confederation strength levels |
+//! | GET | `/api/scorers?home=&away=` | goalscorer market for a matchup (anytime, brace, hat-trick) |
+//! | GET | `/api/golden-boot?iters=&seed=` | Golden Boot race: each player's top-scorer odds |
 //! | GET | `/metrics` | Prometheus metrics |
 //! | GET | `/live` | WebSocket: pushes a compact live view on every update |
 #![forbid(unsafe_code)]
@@ -66,6 +68,7 @@ use oracle_engine::query::{
 };
 use oracle_engine::{AdaptiveState, Engine, Explorer, ReportCard, Snapshot, Upset, WinProbSample};
 use oracle_market::BetPolicy;
+use oracle_players::{GoldenBootOdds, ScorerMarket};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::future::Future;
@@ -152,6 +155,8 @@ pub fn router(engine: Arc<Engine>, explorer: ExplorerSlot) -> Router {
         .route("/api/kingmaker", get(api_kingmaker))
         .route("/api/collision", get(api_collision))
         .route("/api/ratings", get(api_ratings))
+        .route("/api/scorers", get(api_scorers))
+        .route("/api/golden-boot", get(api_golden_boot))
         .route("/metrics", get(metrics))
         .route("/live", get(live_ws))
         .layer(TraceLayer::new_for_http())
@@ -234,6 +239,7 @@ async fn api_info(
             "/api/simulate?iters=&seed=", "/api/backtest?seed=&matches=",
             "/api/sensitivity?iters=&seed=",
             "/api/kingmaker?q=", "/api/collision?home=&away=", "/api/ratings",
+            "/api/scorers?home=&away=", "/api/golden-boot?iters=&seed=",
             "/metrics", "/live (websocket)"
         ],
     }))
@@ -419,6 +425,53 @@ async fn api_ratings(
     State(explorer): State<ExplorerSlot>,
 ) -> Result<Json<RatingsView>, StatusCode> {
     Ok(Json(ready(&explorer)?.ratings()))
+}
+
+#[derive(Deserialize)]
+struct ScorersParams {
+    home: String,
+    away: String,
+    neutral: Option<bool>,
+}
+
+/// The goalscorer market for a matchup (anytime, brace, hat-trick per player). Light enough to run
+/// inline. 404 on an unknown team, 503 until the explorer has fit.
+async fn api_scorers(
+    State(explorer): State<ExplorerSlot>,
+    Query(p): Query<ScorersParams>,
+) -> Result<Json<ScorerMarket>, StatusCode> {
+    let ex = ready(&explorer)?;
+    let (Some(home), Some(away)) = (ex.resolve(&p.home), ex.resolve(&p.away)) else {
+        return Err(StatusCode::NOT_FOUND);
+    };
+    Ok(Json(ex.scorer_market(
+        home,
+        away,
+        p.neutral.unwrap_or(true),
+    )))
+}
+
+#[derive(Deserialize)]
+struct GoldenBootParams {
+    iters: Option<u32>,
+    seed: Option<u64>,
+}
+
+/// The Golden Boot race (top-scorer odds). The Monte-Carlo over every squad is compute-heavy, so it
+/// runs off the async runtime.
+async fn api_golden_boot(
+    State(explorer): State<ExplorerSlot>,
+    Query(p): Query<GoldenBootParams>,
+) -> Result<Json<Vec<GoldenBootOdds>>, StatusCode> {
+    if explorer.get().is_none() {
+        return Err(StatusCode::SERVICE_UNAVAILABLE);
+    }
+    let iters = p.iters.unwrap_or(20_000);
+    let seed = p.seed.unwrap_or(42);
+    tokio::task::spawn_blocking(move || explorer.get().unwrap().golden_boot(iters, seed))
+        .await
+        .map(Json)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
 }
 
 #[derive(Deserialize)]
@@ -1417,6 +1470,20 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         assert_eq!(json(&body)["teams"].as_array().unwrap().len(), 48);
         assert_eq!(json(&body)["confederations"].as_array().unwrap().len(), 6);
+
+        // Scorers: a ranked market of both squads (16 + 16); unknown team is a 404.
+        let (status, body) = get(&state, "/api/scorers?home=Brazil&away=Japan").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json(&body)["lines"].as_array().unwrap().len(), 32);
+        let (status, _) = get(&state, "/api/scorers?home=Brazil&away=Atlantis").await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+
+        // Golden Boot: a ranked list of contenders with top-scorer odds.
+        let (status, body) = get(&state, "/api/golden-boot?iters=2000&seed=1").await;
+        assert_eq!(status, StatusCode::OK);
+        let race = json(&body);
+        assert!(race.is_array() && !race.as_array().unwrap().is_empty());
+        assert!(race[0]["p_top"].is_number() && race[0]["player"]["name"].is_string());
 
         // Sensitivity: nine signals, each a valid total-variation distance, ranked descending.
         let (status, body) = get(&state, "/api/sensitivity?iters=2000&seed=1").await;
