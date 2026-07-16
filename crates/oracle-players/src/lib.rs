@@ -70,6 +70,37 @@ pub fn allocate(weights: &[f64], team_xg: f64) -> Vec<f64> {
     clamped.iter().map(|w| xg * w / total).collect()
 }
 
+/// Poisson probability mass `P(X = k)` for rate `lambda >= 0`.
+fn poisson_pmf(lambda: f64, k: u32) -> f64 {
+    if lambda <= 0.0 {
+        return if k == 0 { 1.0 } else { 0.0 };
+    }
+    let mut p = (-lambda).exp();
+    for i in 1..=k {
+        p *= lambda / i as f64;
+    }
+    p
+}
+
+/// P(the player scores **at least one** goal), `1 - e^(-xg)`: the anytime-scorer market.
+pub fn anytime_scorer(xg: f64) -> f64 {
+    1.0 - (-xg.max(0.0)).exp()
+}
+
+/// P(the player scores **exactly** `k` goals), from a Poisson on their expected goals.
+pub fn exactly_goals(xg: f64, k: u32) -> f64 {
+    poisson_pmf(xg.max(0.0), k)
+}
+
+/// P(the player scores **at least** `k` goals): `k = 2` is a brace, `k = 3` a hat-trick.
+pub fn at_least_goals(xg: f64, k: u32) -> f64 {
+    if k == 0 {
+        return 1.0;
+    }
+    let x = xg.max(0.0);
+    (1.0 - (0..k).map(|i| poisson_pmf(x, i)).sum::<f64>()).clamp(0.0, 1.0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -100,6 +131,24 @@ mod tests {
         approx(floored.iter().sum::<f64>(), 2.0);
         // No players, no goals.
         assert!(allocate(&[], 5.0).is_empty());
+    }
+
+    #[test]
+    fn scorer_probabilities_follow_a_poisson() {
+        // Anytime equals "at least one", and is 0 at no threat, near 1 at heavy threat.
+        approx(anytime_scorer(0.0), 0.0);
+        approx(anytime_scorer(1.0), at_least_goals(1.0, 1));
+        assert!(anytime_scorer(3.0) > 0.94);
+        // Known Poisson values at lambda = 1: P(0) = P(1) = e^-1.
+        approx(exactly_goals(1.0, 0), (-1.0_f64).exp());
+        approx(exactly_goals(1.0, 1), (-1.0_f64).exp());
+        // More goals is always less likely; a brace beats a hat-trick.
+        assert!(at_least_goals(1.2, 1) > at_least_goals(1.2, 2));
+        assert!(at_least_goals(1.2, 2) > at_least_goals(1.2, 3));
+        // Exact masses plus the tail sum to one.
+        let tail = at_least_goals(0.8, 4);
+        let head: f64 = (0..4).map(|k| exactly_goals(0.8, k)).sum();
+        approx(head + tail, 1.0);
     }
 
     #[test]
