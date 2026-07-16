@@ -21,6 +21,7 @@ use oracle_model::{
     implied_probabilities, BradleyTerry, DixonColesConfig, Ensemble, GoalModel, LiveConfig,
     Observation,
 };
+use oracle_players::{MatchPlayer, ScorerMarket};
 use oracle_ratings::{RatingStore, StateSpaceRatings};
 use oracle_sim::{meeting_probabilities, simulate_with_live, LiveInputs, SimConfig};
 use serde::Serialize;
@@ -144,6 +145,27 @@ impl Explorer {
             run,
             skill,
         }
+    }
+
+    /// The goalscorer market for a matchup: allocate each side's expected goals across its squad by
+    /// attacking weight, then read off the anytime, brace, and hat-trick markets. Player weights are
+    /// the squad model's attack scores, so nothing is invented here.
+    pub fn scorer_market(&self, home: TeamId, away: TeamId, neutral: bool) -> ScorerMarket {
+        let (home_xg, away_xg) = self.model.expected_goals(home, away, neutral);
+        let lineup = |team: TeamId| -> Vec<MatchPlayer> {
+            data::squad(team)
+                .into_iter()
+                .map(|p| MatchPlayer::new(p.name, p.attack))
+                .collect()
+        };
+        oracle_players::scorer_market(
+            &self.name(home),
+            &lineup(home),
+            home_xg,
+            &self.name(away),
+            &lineup(away),
+            away_xg,
+        )
     }
 
     /// Resolve a team by FIFA code, full name, or a name substring (case-insensitive).
@@ -1178,6 +1200,33 @@ mod tests {
         assert!(report.skill.model_log_loss.is_finite());
         // Drawdown is a fraction in [0, 1].
         assert!((0.0..=1.0).contains(&report.run.summary.max_drawdown));
+    }
+
+    #[test]
+    fn scorer_market_ranks_players_and_conserves_team_goals() {
+        let ex = Explorer::new();
+        let bra = ex.resolve("Brazil").unwrap();
+        let nzl = ex.resolve("NZL").unwrap();
+        let market = ex.scorer_market(bra, nzl, true);
+
+        // Every squad member from both teams (16 + 16), ranked by anytime probability.
+        assert_eq!(market.lines.len(), 32);
+        assert!(market
+            .lines
+            .windows(2)
+            .all(|w| w[0].anytime >= w[1].anytime));
+        for l in &market.lines {
+            assert!((0.0..=1.0).contains(&l.anytime) && l.brace <= l.anytime);
+        }
+        // Allocation is conserved: Brazil's players' expected goals sum to the model's team xg.
+        let (home_xg, _) = ex.model.expected_goals(bra, nzl, true);
+        let home_goals: f64 = market
+            .lines
+            .iter()
+            .filter(|l| l.player.team == ex.name(bra))
+            .map(|l| l.expected_goals)
+            .sum();
+        assert!((home_goals - home_xg).abs() < 1e-9);
     }
 
     #[test]

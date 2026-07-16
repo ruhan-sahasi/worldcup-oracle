@@ -1240,6 +1240,7 @@ dependencies = [
  "oracle-ingest",
  "oracle-market",
  "oracle-model",
+ "oracle-players",
  "oracle-ratings",
  "oracle-sim",
  "serde",
