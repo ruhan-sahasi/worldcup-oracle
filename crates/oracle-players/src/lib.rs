@@ -101,6 +101,76 @@ pub fn at_least_goals(xg: f64, k: u32) -> f64 {
     (1.0 - (0..k).map(|i| poisson_pmf(x, i)).sum::<f64>()).clamp(0.0, 1.0)
 }
 
+/// A player available in a match: their name and attacking weight (the same weight the allocation
+/// shares goals by).
+#[derive(Debug, Clone)]
+pub struct MatchPlayer {
+    pub name: String,
+    pub weight: f64,
+}
+
+impl MatchPlayer {
+    pub fn new(name: impl Into<String>, weight: f64) -> Self {
+        Self {
+            name: name.into(),
+            weight,
+        }
+    }
+}
+
+/// One player's line in a match scorer market: their expected goals and the derived markets.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ScorerLine {
+    pub player: PlayerRef,
+    pub expected_goals: f64,
+    pub anytime: f64,
+    pub brace: f64,
+    pub hat_trick: f64,
+}
+
+/// The goalscorer market for a match: every player from both teams, ranked by anytime probability.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ScorerMarket {
+    pub lines: Vec<ScorerLine>,
+}
+
+/// Build a match scorer market: allocate each team's expected goals to its players, then read off
+/// the anytime, brace, and hat-trick markets, ranked by anytime probability (likeliest scorer first).
+pub fn scorer_market(
+    home_team: &str,
+    home_players: &[MatchPlayer],
+    home_xg: f64,
+    away_team: &str,
+    away_players: &[MatchPlayer],
+    away_xg: f64,
+) -> ScorerMarket {
+    let mut lines = Vec::with_capacity(home_players.len() + away_players.len());
+    for (team, players, xg) in [
+        (home_team, home_players, home_xg),
+        (away_team, away_players, away_xg),
+    ] {
+        let weights: Vec<f64> = players.iter().map(|p| p.weight).collect();
+        for (p, &goals) in players.iter().zip(allocate(&weights, xg).iter()) {
+            lines.push(ScorerLine {
+                player: PlayerRef {
+                    name: p.name.clone(),
+                    team: team.to_string(),
+                },
+                expected_goals: goals,
+                anytime: anytime_scorer(goals),
+                brace: at_least_goals(goals, 2),
+                hat_trick: at_least_goals(goals, 3),
+            });
+        }
+    }
+    lines.sort_by(|a, b| {
+        b.anytime
+            .partial_cmp(&a.anytime)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    ScorerMarket { lines }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -149,6 +219,40 @@ mod tests {
         let tail = at_least_goals(0.8, 4);
         let head: f64 = (0..4).map(|k| exactly_goals(0.8, k)).sum();
         approx(head + tail, 1.0);
+    }
+
+    #[test]
+    fn match_market_ranks_scorers_and_conserves_each_team_total() {
+        let home = vec![
+            MatchPlayer::new("Star", 1.0),
+            MatchPlayer::new("Mid", 0.5),
+            MatchPlayer::new("Back", 0.2),
+        ];
+        let away = vec![
+            MatchPlayer::new("Away FW", 0.8),
+            MatchPlayer::new("Away MF", 0.4),
+        ];
+        let m = scorer_market("Home", &home, 1.8, "Away", &away, 0.9);
+
+        assert_eq!(m.lines.len(), 5);
+        // Ranked by anytime probability, descending.
+        assert!(m.lines.windows(2).all(|w| w[0].anytime >= w[1].anytime));
+        // The likeliest scorer is the home talisman.
+        assert_eq!(m.lines[0].player.name, "Star");
+        assert_eq!(m.lines[0].player.team, "Home");
+        // Every probability is coherent: brace <= anytime, hat-trick <= brace.
+        for l in &m.lines {
+            assert!((0.0..=1.0).contains(&l.anytime));
+            assert!(l.brace <= l.anytime && l.hat_trick <= l.brace);
+        }
+        // Allocation is conserved per team.
+        let home_goals: f64 = m
+            .lines
+            .iter()
+            .filter(|l| l.player.team == "Home")
+            .map(|l| l.expected_goals)
+            .sum();
+        approx(home_goals, 1.8);
     }
 
     #[test]
