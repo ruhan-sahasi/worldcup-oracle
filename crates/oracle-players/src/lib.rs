@@ -171,6 +171,94 @@ pub fn scorer_market(
     ScorerMarket { lines }
 }
 
+/// Per-player expected goals for both teams as `(identity, expected goals)`, the shared basis for
+/// the scorer markets.
+fn per_player_goals(
+    home_team: &str,
+    home_players: &[MatchPlayer],
+    home_xg: f64,
+    away_team: &str,
+    away_players: &[MatchPlayer],
+    away_xg: f64,
+) -> Vec<(PlayerRef, f64)> {
+    let mut out = Vec::with_capacity(home_players.len() + away_players.len());
+    for (team, players, xg) in [
+        (home_team, home_players, home_xg),
+        (away_team, away_players, away_xg),
+    ] {
+        let weights: Vec<f64> = players.iter().map(|p| p.weight).collect();
+        for (p, &goals) in players.iter().zip(allocate(&weights, xg).iter()) {
+            out.push((
+                PlayerRef {
+                    name: p.name.clone(),
+                    team: team.to_string(),
+                },
+                goals,
+            ));
+        }
+    }
+    out
+}
+
+/// One player's first-goalscorer probability.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FirstScorerLine {
+    pub player: PlayerRef,
+    pub prob: f64,
+}
+
+/// The first-goalscorer market, plus the probability the match has **no** goal at all. The line
+/// probabilities and `no_goal` together sum to one.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct FirstScorerMarket {
+    pub no_goal: f64,
+    pub lines: Vec<FirstScorerLine>,
+}
+
+/// The first-goalscorer market, from competing Poisson processes: if goals arrive independently at
+/// each player's rate, the first goal is theirs with probability `rate / total`, and a goal happens
+/// at all with probability `1 - e^(-total)`. So `P(first = i) = (lambda_i / total)(1 - e^-total)`,
+/// and the leftover `e^-total` is a goalless match. Ranked by probability.
+pub fn first_scorer_market(
+    home_team: &str,
+    home_players: &[MatchPlayer],
+    home_xg: f64,
+    away_team: &str,
+    away_players: &[MatchPlayer],
+    away_xg: f64,
+) -> FirstScorerMarket {
+    let lambdas = per_player_goals(
+        home_team,
+        home_players,
+        home_xg,
+        away_team,
+        away_players,
+        away_xg,
+    );
+    let total: f64 = lambdas.iter().map(|(_, l)| l).sum();
+    let any_goal = 1.0 - (-total).exp();
+    let mut lines: Vec<FirstScorerLine> = lambdas
+        .into_iter()
+        .map(|(player, lambda)| FirstScorerLine {
+            player,
+            prob: if total > 0.0 {
+                lambda / total * any_goal
+            } else {
+                0.0
+            },
+        })
+        .collect();
+    lines.sort_by(|a, b| {
+        b.prob
+            .partial_cmp(&a.prob)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    FirstScorerMarket {
+        no_goal: (-total).exp(),
+        lines,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -253,6 +341,26 @@ mod tests {
             .map(|l| l.expected_goals)
             .sum();
         approx(home_goals, 1.8);
+    }
+
+    #[test]
+    fn first_scorer_market_is_a_proper_distribution_over_scorers_and_no_goal() {
+        let home = vec![MatchPlayer::new("Star", 1.0), MatchPlayer::new("Mid", 0.5)];
+        let away = vec![MatchPlayer::new("Away FW", 0.6)];
+        let m = first_scorer_market("Home", &home, 1.6, "Away", &away, 0.8);
+
+        // Everything (every scorer + a goalless match) sums to one.
+        let total: f64 = m.lines.iter().map(|l| l.prob).sum::<f64>() + m.no_goal;
+        approx(total, 1.0);
+        // The highest-rate player leads, and no_goal = e^-(total xg) = e^-2.4.
+        assert_eq!(m.lines[0].player.name, "Star");
+        approx(m.no_goal, (-2.4_f64).exp());
+        assert!(m.lines.windows(2).all(|w| w[0].prob >= w[1].prob));
+
+        // With no expected goals, a goalless match is certain and nobody scores first.
+        let none = first_scorer_market("H", &[MatchPlayer::new("A", 1.0)], 0.0, "A", &[], 0.0);
+        approx(none.no_goal, 1.0);
+        approx(none.lines[0].prob, 0.0);
     }
 
     #[test]
