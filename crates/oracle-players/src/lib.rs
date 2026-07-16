@@ -52,9 +52,55 @@ pub struct PlayerRef {
     pub team: String,
 }
 
+/// Share a team's expected goals `team_xg` out among its on-pitch players in proportion to their
+/// attacking `weights`, so the returned per-player expected goals sum back to `team_xg`. Negative
+/// weights are floored at zero; if every weight is zero (or there are no players) the goals are
+/// split evenly, so the total is always conserved.
+pub fn allocate(weights: &[f64], team_xg: f64) -> Vec<f64> {
+    let n = weights.len();
+    if n == 0 {
+        return Vec::new();
+    }
+    let xg = team_xg.max(0.0);
+    let clamped: Vec<f64> = weights.iter().map(|w| w.max(0.0)).collect();
+    let total: f64 = clamped.iter().sum();
+    if total <= 0.0 {
+        return vec![xg / n as f64; n];
+    }
+    clamped.iter().map(|w| xg * w / total).collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn approx(a: f64, b: f64) {
+        assert!((a - b).abs() < 1e-9, "{a} vs {b}");
+    }
+
+    #[test]
+    fn allocation_shares_expected_goals_in_proportion_to_weight() {
+        let a = allocate(&[2.0, 1.0, 1.0], 2.0);
+        approx(a[0], 1.0);
+        approx(a[1], 0.5);
+        approx(a[2], 0.5);
+        approx(a.iter().sum::<f64>(), 2.0);
+    }
+
+    #[test]
+    fn allocation_conserves_the_total_and_handles_degenerate_input() {
+        // Zero weights split evenly.
+        let even = allocate(&[0.0, 0.0, 0.0, 0.0], 3.0);
+        for e in &even {
+            approx(*e, 0.75);
+        }
+        // Negative weights are floored, and the total is still conserved.
+        let floored = allocate(&[-5.0, 1.0, 3.0], 2.0);
+        approx(floored[0], 0.0);
+        approx(floored.iter().sum::<f64>(), 2.0);
+        // No players, no goals.
+        assert!(allocate(&[], 5.0).is_empty());
+    }
 
     #[test]
     fn the_generator_is_deterministic_for_a_seed() {
