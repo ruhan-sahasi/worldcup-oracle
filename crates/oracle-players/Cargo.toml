@@ -1,0 +1,12 @@
+[package]
+name = "oracle-players"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Player-level goalscorer markets and a Golden Boot race for worldcup-oracle"
+
+[dependencies]
+serde.workspace = true

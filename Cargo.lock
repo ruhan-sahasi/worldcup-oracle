@@ -1287,6 +1287,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "oracle-players"
+version = "0.1.0"
+dependencies = [
+ "serde",
+]
+
+[[package]]
 name = "oracle-ratings"
 version = "0.1.0"
 dependencies = [

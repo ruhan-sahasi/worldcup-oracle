@@ -21,6 +21,7 @@ oracle-ingest = { path = "crates/oracle-ingest", version = "0.1.0" }
 oracle-engine = { path = "crates/oracle-engine", version = "0.1.0" }
 oracle-api = { path = "crates/oracle-api", version = "0.1.0" }
 oracle-market = { path = "crates/oracle-market", version = "0.1.0" }
+oracle-players = { path = "crates/oracle-players", version = "0.1.0" }
 
 # ---- serialization / data ----
 serde = { version = "1", features = ["derive"] }
