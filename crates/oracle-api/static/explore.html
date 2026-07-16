@@ -86,6 +86,7 @@
       <div class="tab" data-tab="simulate">Simulate</div>
       <div class="tab" data-tab="sensitivity">Sensitivity</div>
       <div class="tab" data-tab="backtest">Backtest</div>
+      <div class="tab" data-tab="players">Players</div>
       <div class="tab" data-tab="ratings">Ratings</div>
     </div>
 
@@ -183,6 +184,32 @@
       </div>
     </section>
 
+    <!-- ===== Players ===== -->
+    <section id="tab-players" class="hidden">
+      <div class="panel">
+        <h2>Goalscorer market</h2>
+        <div class="note">Each team's expected goals are shared across its squad by attacking weight, then read off as Poisson scorer markets. The player weights are the squad model's own attack scores.</div>
+        <div class="row">
+          <select id="p-home"></select>
+          <select id="p-away"></select>
+          <button id="run-scorers">Scorer market</button>
+          <span id="scorers-status" class="muted"></span>
+        </div>
+        <div id="scorers-out"></div>
+      </div>
+      <div class="panel">
+        <h2>Golden Boot race</h2>
+        <div class="note">A Monte-Carlo over every squad's expected tournament goals. Expected matches and per-match goals are approximations; the scoring model and the race on top are exact.</div>
+        <div class="row">
+          <label>iterations</label><input class="num" id="gb-iters" value="20000" />
+          <label>seed</label><input class="num" id="gb-seed" value="42" />
+          <button id="run-goldenboot">Run race</button>
+          <span id="goldenboot-status" class="muted"></span>
+        </div>
+        <div id="goldenboot-out"></div>
+      </div>
+    </section>
+
     <section id="tab-ratings" class="hidden">
       <div class="panel">
         <h2>Confederation strength</h2>
@@ -213,7 +240,7 @@
   let ratingsLoaded = false;
   document.querySelectorAll(".tab").forEach(t => t.onclick = () => {
     document.querySelectorAll(".tab").forEach(x => x.classList.toggle("active", x === t));
-    for (const name of ["matchup", "simulate", "sensitivity", "backtest", "ratings"]) {
+    for (const name of ["matchup", "simulate", "sensitivity", "backtest", "players", "ratings"]) {
       $("tab-" + name).classList.toggle("hidden", name !== t.dataset.tab);
     }
     if (t.dataset.tab === "ratings" && !ratingsLoaded) loadRatings();
@@ -233,7 +260,8 @@
       const data = await r.json();
       const opts = data.teams.map(t => `<option value="${esc(t.code)}">${esc(t.team)}</option>`).join("");
       $("home").innerHTML = opts; $("away").innerHTML = opts;
-      if (data.teams[1]) $("away").value = data.teams[1].code;
+      $("p-home").innerHTML = opts; $("p-away").innerHTML = opts;
+      if (data.teams[1]) { $("away").value = data.teams[1].code; $("p-away").value = data.teams[1].code; }
       window._ratings = data;
       return;
     }
@@ -499,6 +527,40 @@
     finally { $("run-backtest").disabled = false; }
   }
 
+  // ----- players -----
+  async function runScorers() {
+    $("run-scorers").disabled = true; $("scorers-status").textContent = "computing…"; $("scorers-out").innerHTML = "";
+    try {
+      const m = await api(`/api/scorers?home=${encodeURIComponent($("p-home").value)}&away=${encodeURIComponent($("p-away").value)}`);
+      $("scorers-status").textContent = "";
+      let h = `<table><tr><th>#</th><th>Player</th><th>Team</th><th>xG</th><th>Anytime</th><th>Brace</th><th>Hat-trick</th></tr>`;
+      m.lines.slice(0, 20).forEach((l, i) => {
+        h += `<tr><td>${i + 1}</td><td>${esc(l.player.name)}</td><td class="muted">${esc(l.player.team)}</td>
+          <td>${l.expected_goals.toFixed(2)}</td><td class="accent">${pct(l.anytime)}</td>
+          <td>${pct(l.brace)}</td><td>${pct(l.hat_trick)}</td></tr>`;
+      });
+      $("scorers-out").innerHTML = h + "</table>";
+    } catch (err) { $("scorers-status").textContent = err.message; }
+    finally { $("run-scorers").disabled = false; }
+  }
+
+  async function runGoldenBoot() {
+    $("run-goldenboot").disabled = true; $("goldenboot-status").textContent = "simulating the tournament…"; $("goldenboot-out").innerHTML = "";
+    const t0 = performance.now();
+    try {
+      const race = await api(`/api/golden-boot?iters=${encodeURIComponent($("gb-iters").value)}&seed=${encodeURIComponent($("gb-seed").value)}`);
+      const secs = ((performance.now() - t0) / 1000).toFixed(1);
+      $("goldenboot-status").textContent = `${race.length} contenders · ${secs}s`;
+      let h = `<table><tr><th>#</th><th>Player</th><th>Team</th><th>Exp. goals</th><th>Top scorer</th><th>Top 3</th></tr>`;
+      race.slice(0, 20).forEach((o, i) => {
+        h += `<tr><td>${i + 1}</td><td>${esc(o.player.name)}</td><td class="muted">${esc(o.player.team)}</td>
+          <td>${o.expected_goals.toFixed(1)}</td><td class="accent">${pct(o.p_top)}</td><td>${pct(o.p_top3)}</td></tr>`;
+      });
+      $("goldenboot-out").innerHTML = h + "</table>";
+    } catch (err) { $("goldenboot-status").textContent = err.message; }
+    finally { $("run-goldenboot").disabled = false; }
+  }
+
   // ----- ratings -----
   let sortKey = "elo", sortDesc = true;
   function renderRatings() {
@@ -543,6 +605,8 @@
   $("run-sim").onclick = runSim;
   $("run-sens").onclick = runSensitivity;
   $("run-backtest").onclick = runBacktest;
+  $("run-scorers").onclick = runScorers;
+  $("run-goldenboot").onclick = runGoldenBoot;
   $("rfilter").oninput = renderRatings;
   document.querySelectorAll(".preset").forEach(b => b.onclick = () => { $("iters").value = b.dataset.iters; runSim(); });
   // Enter anywhere in the matchup panel triggers a prediction.
