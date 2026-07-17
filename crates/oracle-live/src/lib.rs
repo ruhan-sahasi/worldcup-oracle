@@ -231,6 +231,14 @@ pub fn locked_profit(back_stake: f64, back_odds: f64, lay_odds: f64) -> f64 {
     back_stake * (back_odds - lay_odds) / lay_odds
 }
 
+/// The cash-out value of a back position: the guaranteed profit from fully hedging now at the
+/// current fair probability of the backed outcome. Zero when the outcome is exactly as likely as its
+/// back price implied, positive once it has become more likely, negative if less. At certainty it is
+/// the full back winnings.
+pub fn cash_out_value(back_stake: f64, back_odds: f64, current_prob: f64) -> f64 {
+    locked_profit(back_stake, back_odds, fair_odds(current_prob))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -354,6 +362,17 @@ mod tests {
         approx(dw, dl);
         approx(dw, locked_profit(10.0, 2.0, 4.0));
         approx(locked_profit(10.0, 2.0, 4.0), -5.0);
+    }
+
+    #[test]
+    fn cash_out_value_tracks_the_move_since_the_back() {
+        // Backed at 2.0 (break-even prob 0.5). Unchanged -> zero.
+        approx(cash_out_value(10.0, 2.0, 0.5), 0.0);
+        // More likely now -> a positive cash-out; less likely -> negative.
+        assert!(cash_out_value(10.0, 2.0, 0.6) > 0.0);
+        assert!(cash_out_value(10.0, 2.0, 0.4) < 0.0);
+        // Certain now -> the full back winnings.
+        approx(cash_out_value(10.0, 2.0, 1.0), 10.0);
     }
 
     #[test]
