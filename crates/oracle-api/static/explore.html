@@ -87,6 +87,7 @@
       <div class="tab" data-tab="sensitivity">Sensitivity</div>
       <div class="tab" data-tab="backtest">Backtest</div>
       <div class="tab" data-tab="players">Players</div>
+      <div class="tab" data-tab="inplay">In-play</div>
       <div class="tab" data-tab="ratings">Ratings</div>
     </div>
 
@@ -210,6 +211,23 @@
       </div>
     </section>
 
+    <!-- ===== In-play ===== -->
+    <section id="tab-inplay" class="hidden">
+      <div class="panel">
+        <h2>In-play trading</h2>
+        <div class="note">Back the pre-match favourite at fair odds, then trade the live position (cash out at a profit target or stop) across many simulated matches. At fair odds neither trading nor holding has an edge; cash-out reshapes the P&amp;L, not its mean.</div>
+        <div class="row">
+          <select id="i-home"></select>
+          <select id="i-away"></select>
+          <label>iterations</label><input class="num" id="ip-iters" value="20000" />
+          <label>seed</label><input class="num" id="ip-seed" value="42" />
+          <button id="run-inplay">Run</button>
+          <span id="inplay-status" class="muted"></span>
+        </div>
+        <div id="inplay-out"></div>
+      </div>
+    </section>
+
     <section id="tab-ratings" class="hidden">
       <div class="panel">
         <h2>Confederation strength</h2>
@@ -240,7 +258,7 @@
   let ratingsLoaded = false;
   document.querySelectorAll(".tab").forEach(t => t.onclick = () => {
     document.querySelectorAll(".tab").forEach(x => x.classList.toggle("active", x === t));
-    for (const name of ["matchup", "simulate", "sensitivity", "backtest", "players", "ratings"]) {
+    for (const name of ["matchup", "simulate", "sensitivity", "backtest", "players", "inplay", "ratings"]) {
       $("tab-" + name).classList.toggle("hidden", name !== t.dataset.tab);
     }
     if (t.dataset.tab === "ratings" && !ratingsLoaded) loadRatings();
@@ -261,7 +279,8 @@
       const opts = data.teams.map(t => `<option value="${esc(t.code)}">${esc(t.team)}</option>`).join("");
       $("home").innerHTML = opts; $("away").innerHTML = opts;
       $("p-home").innerHTML = opts; $("p-away").innerHTML = opts;
-      if (data.teams[1]) { $("away").value = data.teams[1].code; $("p-away").value = data.teams[1].code; }
+      $("i-home").innerHTML = opts; $("i-away").innerHTML = opts;
+      if (data.teams[1]) { $("away").value = data.teams[1].code; $("p-away").value = data.teams[1].code; $("i-away").value = data.teams[1].code; }
       window._ratings = data;
       return;
     }
@@ -561,6 +580,40 @@
     finally { $("run-goldenboot").disabled = false; }
   }
 
+  // ----- in-play -----
+  function winProbPathSvg(path) {
+    const W = 640, H = 160, pad = 6;
+    const x = m => pad + (m / 90) * (W - 2 * pad);
+    const y = p => (H - pad) - p * (H - 2 * pad);
+    const pts = path.map(pt => `${x(pt.minute).toFixed(1)},${y(pt.prob).toFixed(1)}`).join(" ");
+    return `<svg viewBox="0 0 ${W} ${H}" width="100%" height="${H}" style="margin-top:10px">
+      <line x1="${x(0)}" y1="${y(0.5)}" x2="${x(90)}" y2="${y(0.5)}" stroke="var(--line)" stroke-dasharray="4 3"/>
+      <polyline points="${pts}" fill="none" stroke="var(--away)" stroke-width="1.5"/></svg>`;
+  }
+
+  async function runInPlay() {
+    $("run-inplay").disabled = true; $("inplay-status").textContent = "simulating…"; $("inplay-out").innerHTML = "";
+    const t0 = performance.now();
+    try {
+      const v = await api(`/api/inplay?home=${encodeURIComponent($("i-home").value)}&away=${encodeURIComponent($("i-away").value)}&iters=${encodeURIComponent($("ip-iters").value)}&seed=${encodeURIComponent($("ip-seed").value)}`);
+      const secs = ((performance.now() - t0) / 1000).toFixed(1);
+      const r = v.report;
+      $("inplay-status").textContent = `${r.trades.toLocaleString()} matches · ${secs}s`;
+      const money = x => (x >= 0 ? "+" : "") + x.toFixed(2);
+      $("inplay-out").innerHTML =
+        `<div class="rcstat">backing <b>${esc(v.backed)}</b> at ${v.back_odds.toFixed(2)} <span class="meta">${esc(v.home)} v ${esc(v.away)}</span></div>` +
+        `<table>
+          <tr><th>Strategy</th><th>Mean P&amp;L</th><th>ROI</th><th>Cash-out rate</th><th>Profitable</th><th>Max drawdown</th></tr>
+          <tr><td>Cash-out</td><td class="accent">${money(r.mean_pnl)}</td><td>${(r.roi * 100).toFixed(1)}%</td><td>${pct(r.cash_out_rate)}</td><td>${pct(r.profitable_rate)}</td><td>${r.max_drawdown.toFixed(1)}u</td></tr>
+          <tr><td>Hold to settle</td><td>${money(r.hold_mean_pnl)}</td><td colspan="4" class="muted">baseline (never cash out)</td></tr>
+        </table>` +
+        `<h2 style="margin-top:14px">Sample match: win probability for ${esc(v.backed)}</h2>` +
+        winProbPathSvg(v.sample_path) +
+        `<div class="note">Dashed line = evens. Fair odds keep the mean P&amp;L near zero; cash-out trades variance and drawdown, not edge.</div>`;
+    } catch (err) { $("inplay-status").textContent = err.message; }
+    finally { $("run-inplay").disabled = false; }
+  }
+
   // ----- ratings -----
   let sortKey = "elo", sortDesc = true;
   function renderRatings() {
@@ -607,6 +660,7 @@
   $("run-backtest").onclick = runBacktest;
   $("run-scorers").onclick = runScorers;
   $("run-goldenboot").onclick = runGoldenBoot;
+  $("run-inplay").onclick = runInPlay;
   $("rfilter").oninput = renderRatings;
   document.querySelectorAll(".preset").forEach(b => b.onclick = () => { $("iters").value = b.dataset.iters; runSim(); });
   // Enter anywhere in the matchup panel triggers a prediction.
