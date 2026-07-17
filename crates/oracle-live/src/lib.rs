@@ -300,6 +300,114 @@ pub fn trade_match(
     }
 }
 
+/// Which outcome a final score settled to.
+fn outcome_of(state: MatchState) -> Outcome {
+    match state.home.cmp(&state.away) {
+        std::cmp::Ordering::Greater => Outcome::HomeWin,
+        std::cmp::Ordering::Equal => Outcome::Draw,
+        std::cmp::Ordering::Less => Outcome::AwayWin,
+    }
+}
+
+/// The most likely of the three outcomes under a distribution.
+fn favourite(p: Probabilities) -> Outcome {
+    if p.home_win >= p.draw && p.home_win >= p.away_win {
+        Outcome::HomeWin
+    } else if p.away_win >= p.draw {
+        Outcome::AwayWin
+    } else {
+        Outcome::Draw
+    }
+}
+
+/// Settings for the in-play trading backtest.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct InPlayConfig {
+    pub trade: TradeConfig,
+    pub iters: u32,
+    pub seed: u64,
+    pub step: u16,
+}
+
+impl Default for InPlayConfig {
+    fn default() -> Self {
+        Self {
+            trade: TradeConfig::default(),
+            iters: 20_000,
+            seed: 42,
+            step: 5,
+        }
+    }
+}
+
+/// The result of the in-play trading backtest, with a hold-to-settlement baseline for comparison.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct InPlayReport {
+    pub trades: u32,
+    /// Mean profit per match of the cash-out strategy, and as a fraction of stake.
+    pub mean_pnl: f64,
+    pub roi: f64,
+    /// Fraction of matches that cashed out in play rather than settling.
+    pub cash_out_rate: f64,
+    /// Fraction of matches that finished in profit.
+    pub profitable_rate: f64,
+    /// Worst peak-to-trough fall of the cumulative P&L, in stake units.
+    pub max_drawdown: f64,
+    /// Mean profit per match of simply holding the pre-match bet (never cashing out).
+    pub hold_mean_pnl: f64,
+}
+
+/// Backtest trading the pre-match favourite in play over many simulated matches. Each match is
+/// simulated from the goal rates, the favourite is backed at fair odds, and the position is managed
+/// by [`trade_match`]; the same bet held to settlement is tracked alongside as a baseline. Because
+/// the odds are fair, neither approach has an edge, so the honest comparison is about the shape of
+/// the P&L (drawdown, cash-out frequency), not its mean. Reproducible from the seed.
+pub fn inplay_backtest(lambda_home: f64, lambda_away: f64, config: &InPlayConfig) -> InPlayReport {
+    let pre_match = win_probabilities(MatchState::kickoff(), lambda_home, lambda_away);
+    let backed = favourite(pre_match);
+    let back_odds = fair_odds(pre_match.of(backed));
+    let stake = config.trade.stake;
+    let iters = config.iters.max(1);
+
+    let mut rng = Rng::new(config.seed);
+    let (mut total, mut hold_total, mut cashed, mut profitable) = (0.0, 0.0, 0u32, 0u32);
+    let (mut cumulative, mut peak, mut max_drawdown) = (0.0f64, 0.0f64, 0.0f64);
+
+    for _ in 0..iters {
+        let timeline = simulate_match(&mut rng, lambda_home, lambda_away);
+        let won = outcome_of(*timeline.last().unwrap()) == backed;
+        let path = win_prob_path(&timeline, lambda_home, lambda_away, backed, config.step);
+        let result = trade_match(back_odds, &path, won, &config.trade);
+
+        total += result.pnl;
+        hold_total += if won {
+            stake * (back_odds - 1.0)
+        } else {
+            -stake
+        };
+        if result.cashed_out {
+            cashed += 1;
+        }
+        if result.pnl > 0.0 {
+            profitable += 1;
+        }
+        cumulative += result.pnl;
+        peak = peak.max(cumulative);
+        max_drawdown = max_drawdown.max(peak - cumulative);
+    }
+
+    let n = iters as f64;
+    InPlayReport {
+        trades: iters,
+        mean_pnl: total / n,
+        roi: total / n / stake,
+        cash_out_rate: cashed as f64 / n,
+        profitable_rate: profitable as f64 / n,
+        max_drawdown: max_drawdown / stake,
+        hold_mean_pnl: hold_total / n,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -473,6 +581,32 @@ mod tests {
         approx(won.pnl, 10.0);
         let lost = trade_match(2.0, &path, false, &patient);
         approx(lost.pnl, -10.0);
+    }
+
+    #[test]
+    fn inplay_backtest_is_reproducible_and_edge_free() {
+        let cfg = InPlayConfig {
+            iters: 20_000,
+            ..InPlayConfig::default()
+        };
+        let a = inplay_backtest(1.7, 1.0, &cfg);
+        let b = inplay_backtest(1.7, 1.0, &cfg);
+
+        // Reproducible from the seed.
+        approx(a.mean_pnl, b.mean_pnl);
+        assert_eq!(a.trades, 20_000);
+        // Rates are proportions; some matches genuinely cash out in play.
+        assert!((0.0..=1.0).contains(&a.cash_out_rate) && a.cash_out_rate > 0.0);
+        assert!((0.0..=1.0).contains(&a.profitable_rate));
+        assert!(a.max_drawdown >= 0.0);
+        // Fair odds mean no edge: both the traded and the held P&L average near zero.
+        let stake = cfg.trade.stake;
+        assert!(a.mean_pnl.abs() < 0.1 * stake, "traded mean {}", a.mean_pnl);
+        assert!(
+            a.hold_mean_pnl.abs() < 0.1 * stake,
+            "held mean {}",
+            a.hold_mean_pnl
+        );
     }
 
     #[test]
