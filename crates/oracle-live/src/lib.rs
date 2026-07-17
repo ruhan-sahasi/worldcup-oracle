@@ -16,7 +16,48 @@
 //! reproducible from a seed with no external `rand` dependency.
 #![forbid(unsafe_code)]
 
+use oracle_domain::Probabilities;
 use serde::{Deserialize, Serialize};
+
+/// Poisson probability mass `P(X = k)` for rate `lambda >= 0`.
+fn poisson_pmf(lambda: f64, k: u32) -> f64 {
+    if lambda <= 0.0 {
+        return if k == 0 { 1.0 } else { 0.0 };
+    }
+    let mut p = (-lambda).exp();
+    for i in 1..=k {
+        p *= lambda / i as f64;
+    }
+    p
+}
+
+/// The full 90-minute length used to prorate the remaining goal rate.
+const FULL_MATCH: f64 = 90.0;
+
+/// The live win/draw/win probability from a match state and the two sides' **full-match** goal
+/// rates. The remaining goals are Poisson with rate prorated by the time left, added to the current
+/// score. At kickoff this is the pre-match forecast; at the whistle it is the settled result.
+pub fn win_probabilities(state: MatchState, lambda_home: f64, lambda_away: f64) -> Probabilities {
+    let remaining = (FULL_MATCH - (state.minute as f64).min(FULL_MATCH)) / FULL_MATCH;
+    let lh = lambda_home.max(0.0) * remaining;
+    let la = lambda_away.max(0.0) * remaining;
+    const K: u32 = 12;
+    let (mut home, mut draw, mut away) = (0.0, 0.0, 0.0);
+    for x in 0..=K {
+        let px = poisson_pmf(lh, x);
+        for y in 0..=K {
+            let p = px * poisson_pmf(la, y);
+            let final_home = state.home as i32 + x as i32;
+            let final_away = state.away as i32 + y as i32;
+            match final_home.cmp(&final_away) {
+                std::cmp::Ordering::Greater => home += p,
+                std::cmp::Ordering::Equal => draw += p,
+                std::cmp::Ordering::Less => away += p,
+            }
+        }
+    }
+    Probabilities::new(home, draw, away)
+}
 
 /// The score at a point in a match: minutes elapsed and goals for each side.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -83,6 +124,38 @@ impl Rng {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn st(minute: u16, home: u8, away: u8) -> MatchState {
+        MatchState { minute, home, away }
+    }
+
+    #[test]
+    fn full_time_win_probability_is_settled_by_the_score() {
+        let full = win_probabilities(st(90, 2, 0), 1.5, 1.2);
+        assert!((full.home_win - 1.0).abs() < 1e-9);
+        let level = win_probabilities(st(90, 1, 1), 1.5, 1.2);
+        assert!((level.draw - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn kickoff_probability_tracks_the_goal_rates() {
+        // Equal rates: symmetric, with a real draw chance.
+        let even = win_probabilities(st(0, 0, 0), 1.3, 1.3);
+        assert!((even.home_win - even.away_win).abs() < 1e-9);
+        assert!(even.draw > 0.15);
+        // A stronger home rate favours the home side.
+        let favoured = win_probabilities(st(0, 0, 0), 2.0, 0.8);
+        assert!(favoured.home_win > favoured.away_win);
+    }
+
+    #[test]
+    fn a_lead_is_worth_more_as_time_runs_out() {
+        let early = win_probabilities(st(10, 1, 0), 1.4, 1.4);
+        let late = win_probabilities(st(85, 1, 0), 1.4, 1.4);
+        assert!(late.home_win > early.home_win);
+        // And the probabilities always normalize.
+        assert!((late.home_win + late.draw + late.away_win - 1.0).abs() < 1e-9);
+    }
 
     #[test]
     fn match_state_starts_goalless_at_kickoff() {
