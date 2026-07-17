@@ -46,6 +46,7 @@
 //! | GET | `/api/ratings` | team ratings + confederation strength levels |
 //! | GET | `/api/scorers?home=&away=` | goalscorer market for a matchup (anytime, brace, hat-trick) |
 //! | GET | `/api/golden-boot?iters=&seed=` | Golden Boot race: each player's top-scorer odds |
+//! | GET | `/api/inplay?home=&away=` | in-play win-probability path + a live cash-out trading backtest |
 //! | GET | `/metrics` | Prometheus metrics |
 //! | GET | `/live` | WebSocket: pushes a compact live view on every update |
 #![forbid(unsafe_code)]
@@ -63,8 +64,9 @@ use axum::{
 use futures_util::{SinkExt, StreamExt};
 use oracle_domain::{MatchId, MatchStatus, Probabilities, Scoreline, Stage, TeamId};
 use oracle_engine::query::{
-    BacktestReport, BtChampions, BtMatchup, CollisionForecast, Explanation, KingmakerReport,
-    MatchupForecast, PosteriorForecast, RatingsView, SensitivityForecast, SimForecast,
+    BacktestReport, BtChampions, BtMatchup, CollisionForecast, Explanation, InPlayView,
+    KingmakerReport, MatchupForecast, PosteriorForecast, RatingsView, SensitivityForecast,
+    SimForecast,
 };
 use oracle_engine::{AdaptiveState, Engine, Explorer, ReportCard, Snapshot, Upset, WinProbSample};
 use oracle_market::BetPolicy;
@@ -157,6 +159,7 @@ pub fn router(engine: Arc<Engine>, explorer: ExplorerSlot) -> Router {
         .route("/api/ratings", get(api_ratings))
         .route("/api/scorers", get(api_scorers))
         .route("/api/golden-boot", get(api_golden_boot))
+        .route("/api/inplay", get(api_inplay))
         .route("/metrics", get(metrics))
         .route("/live", get(live_ws))
         .layer(TraceLayer::new_for_http())
@@ -240,6 +243,7 @@ async fn api_info(
             "/api/sensitivity?iters=&seed=",
             "/api/kingmaker?q=", "/api/collision?home=&away=", "/api/ratings",
             "/api/scorers?home=&away=", "/api/golden-boot?iters=&seed=",
+            "/api/inplay?home=&away=",
             "/metrics", "/live (websocket)"
         ],
     }))
@@ -472,6 +476,38 @@ async fn api_golden_boot(
         .await
         .map(Json)
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+}
+
+#[derive(Deserialize)]
+struct InPlayParams {
+    home: String,
+    away: String,
+    iters: Option<u32>,
+    seed: Option<u64>,
+}
+
+/// The in-play trading study for a matchup (win-probability path + a cash-out backtest). The
+/// backtest simulates thousands of matches, so it runs off the async runtime. 404 on an unknown
+/// team, 503 until the explorer has fit.
+async fn api_inplay(
+    State(explorer): State<ExplorerSlot>,
+    Query(p): Query<InPlayParams>,
+) -> Result<Json<InPlayView>, StatusCode> {
+    let ex = ready(&explorer)?;
+    let (Some(home), Some(away)) = (ex.resolve(&p.home), ex.resolve(&p.away)) else {
+        return Err(StatusCode::NOT_FOUND);
+    };
+    let iters = p.iters.unwrap_or(20_000);
+    let seed = p.seed.unwrap_or(42);
+    tokio::task::spawn_blocking(move || {
+        explorer
+            .get()
+            .unwrap()
+            .inplay_backtest(home, away, iters, seed)
+    })
+    .await
+    .map(Json)
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
 }
 
 #[derive(Deserialize)]
@@ -1484,6 +1520,15 @@ mod tests {
         let race = json(&body);
         assert!(race.is_array() && !race.as_array().unwrap().is_empty());
         assert!(race[0]["p_top"].is_number() && race[0]["player"]["name"].is_string());
+
+        // In-play: a backed side, a report, and a sample win-probability path; unknown team -> 404.
+        let (status, body) = get(&state, "/api/inplay?home=Brazil&away=Japan&iters=1000").await;
+        assert_eq!(status, StatusCode::OK);
+        let inplay = json(&body);
+        assert!(inplay["back_odds"].is_number() && inplay["report"]["trades"].is_number());
+        assert!(!inplay["sample_path"].as_array().unwrap().is_empty());
+        let (status, _) = get(&state, "/api/inplay?home=Brazil&away=Atlantis").await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
 
         // Sensitivity: nine signals, each a valid total-variation distance, ranked descending.
         let (status, body) = get(&state, "/api/sensitivity?iters=2000&seed=1").await;
