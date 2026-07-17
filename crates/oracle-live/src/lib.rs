@@ -121,6 +121,39 @@ impl Rng {
     }
 }
 
+/// Simulate a match's goals from the two full-match rates: draw each side's goal count from a
+/// Poisson, scatter the goals across the 90 minutes, and return the score after each one, bracketed
+/// by kickoff (0-0) and a final minute-90 state. Reproducible from the generator's seed.
+pub fn simulate_match(rng: &mut Rng, lambda_home: f64, lambda_away: f64) -> Vec<MatchState> {
+    let mut goals: Vec<(u16, bool)> = Vec::new();
+    for (lambda, is_home) in [(lambda_home, true), (lambda_away, false)] {
+        for _ in 0..rng.poisson(lambda.max(0.0)) {
+            let minute = 1 + (rng.next_f64() * FULL_MATCH) as u16;
+            goals.push((minute.min(90), is_home));
+        }
+    }
+    goals.sort_by_key(|&(minute, _)| minute);
+
+    let mut states = vec![MatchState::kickoff()];
+    let (mut home, mut away) = (0u8, 0u8);
+    for (minute, is_home) in goals {
+        if is_home {
+            home += 1;
+        } else {
+            away += 1;
+        }
+        states.push(MatchState { minute, home, away });
+    }
+    if states.last().map_or(true, |s| s.minute < 90) {
+        states.push(MatchState {
+            minute: 90,
+            home,
+            away,
+        });
+    }
+    states
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -155,6 +188,40 @@ mod tests {
         assert!(late.home_win > early.home_win);
         // And the probabilities always normalize.
         assert!((late.home_win + late.draw + late.away_win - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn simulated_match_is_a_coherent_reproducible_timeline() {
+        let mut a = Rng::new(5);
+        let mut b = Rng::new(5);
+        let ta = simulate_match(&mut a, 1.6, 1.1);
+        let tb = simulate_match(&mut b, 1.6, 1.1);
+        assert_eq!(ta, tb, "same seed, same timeline");
+
+        // Starts at kickoff, ends at minute 90, minutes and scores never go backwards, and each
+        // step adds exactly one goal.
+        assert_eq!(ta[0], MatchState::kickoff());
+        assert_eq!(ta.last().unwrap().minute, 90);
+        for w in ta.windows(2) {
+            assert!(w[1].minute >= w[0].minute);
+            let added = (w[1].home - w[0].home) + (w[1].away - w[0].away);
+            assert!(added <= 1, "at most one goal per recorded step");
+        }
+    }
+
+    #[test]
+    fn simulated_goal_counts_match_the_rates() {
+        let mut rng = Rng::new(3);
+        let (mut home_total, mut away_total) = (0u64, 0u64);
+        let n = 20_000;
+        for _ in 0..n {
+            let t = simulate_match(&mut rng, 1.8, 0.9);
+            let last = t.last().unwrap();
+            home_total += u64::from(last.home);
+            away_total += u64::from(last.away);
+        }
+        assert!((home_total as f64 / n as f64 - 1.8).abs() < 0.05);
+        assert!((away_total as f64 / n as f64 - 0.9).abs() < 0.05);
     }
 
     #[test]
