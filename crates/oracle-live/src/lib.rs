@@ -16,7 +16,7 @@
 //! reproducible from a seed with no external `rand` dependency.
 #![forbid(unsafe_code)]
 
-use oracle_domain::Probabilities;
+use oracle_domain::{Outcome, Probabilities};
 use serde::{Deserialize, Serialize};
 
 /// Poisson probability mass `P(X = k)` for rate `lambda >= 0`.
@@ -154,6 +154,59 @@ pub fn simulate_match(rng: &mut Rng, lambda_home: f64, lambda_away: f64) -> Vec<
     states
 }
 
+/// One point on a live win-probability path: the minute and the probability of the tracked outcome.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct PathPoint {
+    pub minute: u16,
+    pub prob: f64,
+}
+
+/// The score as of `minute`: the latest timeline state at or before it (kickoff if none).
+fn score_at(timeline: &[MatchState], minute: u16) -> MatchState {
+    let mut current = timeline
+        .first()
+        .copied()
+        .unwrap_or_else(MatchState::kickoff);
+    for &state in timeline {
+        if state.minute <= minute {
+            current = state;
+        } else {
+            break;
+        }
+    }
+    MatchState {
+        minute,
+        home: current.home,
+        away: current.away,
+    }
+}
+
+/// The live probability of `outcome` across a match: at every sampled minute (a `step`-minute grid
+/// plus each goal minute), combine the score so far with the live model. This is the drama graph a
+/// trader watches, and the price path the trading simulator settles against.
+pub fn win_prob_path(
+    timeline: &[MatchState],
+    lambda_home: f64,
+    lambda_away: f64,
+    outcome: Outcome,
+    step: u16,
+) -> Vec<PathPoint> {
+    let step = step.max(1);
+    let mut minutes: Vec<u16> = (0..=90).step_by(step as usize).collect();
+    minutes.extend(timeline.iter().map(|s| s.minute));
+    minutes.push(90);
+    minutes.sort_unstable();
+    minutes.dedup();
+    minutes
+        .into_iter()
+        .map(|minute| PathPoint {
+            minute,
+            prob: win_probabilities(score_at(timeline, minute), lambda_home, lambda_away)
+                .of(outcome),
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -222,6 +275,28 @@ mod tests {
         }
         assert!((home_total as f64 / n as f64 - 1.8).abs() < 0.05);
         assert!((away_total as f64 / n as f64 - 0.9).abs() < 0.05);
+    }
+
+    #[test]
+    fn win_prob_path_starts_pre_match_and_settles_at_full_time() {
+        // Home scores at 30' and holds on.
+        let timeline = vec![st(0, 0, 0), st(30, 1, 0), st(90, 1, 0)];
+        let path = win_prob_path(&timeline, 1.4, 1.2, Outcome::HomeWin, 5);
+
+        assert_eq!(path.first().unwrap().minute, 0);
+        assert_eq!(path.last().unwrap().minute, 90);
+        // Kickoff point equals the pre-match home probability, strictly between 0 and 1.
+        let pre = win_probabilities(MatchState::kickoff(), 1.4, 1.2).home_win;
+        assert!((path[0].prob - pre).abs() < 1e-9 && path[0].prob > 0.0 && path[0].prob < 1.0);
+        // Home held the lead, so the path settles to 1.
+        assert!((path.last().unwrap().prob - 1.0).abs() < 1e-9);
+        // Minutes increase, probabilities stay in range.
+        for w in path.windows(2) {
+            assert!(w[1].minute > w[0].minute);
+        }
+        for p in &path {
+            assert!((0.0..=1.0).contains(&p.prob));
+        }
     }
 
     #[test]
