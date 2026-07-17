@@ -239,6 +239,67 @@ pub fn cash_out_value(back_stake: f64, back_odds: f64, current_prob: f64) -> f64
     locked_profit(back_stake, back_odds, fair_odds(current_prob))
 }
 
+/// A trading rule for a live position: how much to stake, and the cash-out triggers as fractions of
+/// the stake (take profit at `+profit_target`, cut a loss at `-stop_loss`).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct TradeConfig {
+    pub stake: f64,
+    pub profit_target: f64,
+    pub stop_loss: f64,
+}
+
+impl Default for TradeConfig {
+    fn default() -> Self {
+        Self {
+            stake: 10.0,
+            profit_target: 0.5,
+            stop_loss: 0.5,
+        }
+    }
+}
+
+/// The outcome of trading one match.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct TradeResult {
+    pub pnl: f64,
+    pub cashed_out: bool,
+    pub exit_minute: u16,
+}
+
+/// Trade a single back position over a win-probability `path`: back the outcome at `back_odds`, and
+/// at each in-play point cash out if the position has reached the profit target or the stop. If
+/// neither triggers before full time, hold to settlement (`won` decides the payout). The final,
+/// settled path point is not a cash-out opportunity, so holding is distinguishable from cashing out.
+pub fn trade_match(
+    back_odds: f64,
+    path: &[PathPoint],
+    won: bool,
+    config: &TradeConfig,
+) -> TradeResult {
+    let target = config.profit_target * config.stake;
+    let stop = -config.stop_loss.abs() * config.stake;
+    for point in path.iter().filter(|p| p.minute < 90) {
+        let value = cash_out_value(config.stake, back_odds, point.prob);
+        if value >= target || value <= stop {
+            return TradeResult {
+                pnl: value,
+                cashed_out: true,
+                exit_minute: point.minute,
+            };
+        }
+    }
+    let pnl = if won {
+        config.stake * (back_odds - 1.0)
+    } else {
+        -config.stake
+    };
+    TradeResult {
+        pnl,
+        cashed_out: false,
+        exit_minute: 90,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -373,6 +434,45 @@ mod tests {
         assert!(cash_out_value(10.0, 2.0, 0.4) < 0.0);
         // Certain now -> the full back winnings.
         approx(cash_out_value(10.0, 2.0, 1.0), 10.0);
+    }
+
+    fn pt(minute: u16, prob: f64) -> PathPoint {
+        PathPoint { minute, prob }
+    }
+
+    #[test]
+    fn a_winning_position_cashes_out_at_the_profit_target() {
+        let path = vec![pt(0, 0.5), pt(45, 0.8), pt(89, 0.95), pt(90, 1.0)];
+        let cfg = TradeConfig {
+            stake: 10.0,
+            profit_target: 0.5,
+            stop_loss: 0.5,
+        };
+        let r = trade_match(2.0, &path, true, &cfg);
+        assert!(r.cashed_out && r.exit_minute == 45);
+        approx(r.pnl, 6.0); // locked profit at prob 0.8, backed at 2.0
+    }
+
+    #[test]
+    fn a_fading_position_stops_out() {
+        let path = vec![pt(0, 0.5), pt(45, 0.2), pt(90, 0.0)];
+        let r = trade_match(2.0, &path, false, &TradeConfig::default());
+        assert!(r.cashed_out && r.exit_minute == 45 && r.pnl < 0.0);
+    }
+
+    #[test]
+    fn without_a_trigger_the_position_is_held_to_settlement() {
+        let path = vec![pt(0, 0.5), pt(45, 0.55), pt(90, 1.0)];
+        let patient = TradeConfig {
+            stake: 10.0,
+            profit_target: 100.0,
+            stop_loss: 100.0,
+        };
+        let won = trade_match(2.0, &path, true, &patient);
+        assert!(!won.cashed_out && won.exit_minute == 90);
+        approx(won.pnl, 10.0);
+        let lost = trade_match(2.0, &path, false, &patient);
+        approx(lost.pnl, -10.0);
     }
 
     #[test]
