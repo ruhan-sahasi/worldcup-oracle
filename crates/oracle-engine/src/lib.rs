@@ -27,7 +27,7 @@ mod snapshot;
 
 pub use event_log::EventLog;
 pub use oracle_model::ReliabilityReport;
-pub use query::{signal_sensitivity, BacktestReport, Explorer, SignalContribution};
+pub use query::{signal_sensitivity, BacktestReport, Explorer, InPlayView, SignalContribution};
 pub use snapshot::{
     AdaptiveState, BracketRound, BracketTie, BtChampion, Call, ChampionTimeline, Consensus,
     ConsensusTeam, FormLine, LeadChange, LeadChanges, LeverageTie, MatchLeverage, MatchPrediction,

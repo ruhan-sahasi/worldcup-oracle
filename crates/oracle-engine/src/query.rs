@@ -10,9 +10,11 @@
 //! (`Arc<Explorer>`) across request handlers.
 
 use oracle_domain::{
-    Confederation, MatchId, MatchStatus, Probabilities, ScoreGrid, Scoreline, TeamId, Tournament,
+    Confederation, MatchId, MatchStatus, Outcome, Probabilities, ScoreGrid, Scoreline, TeamId,
+    Tournament,
 };
 use oracle_ingest::data::{self, Position, SignalMask, VenueAdj};
+use oracle_live::{self, InPlayConfig, InPlayReport, MatchState, PathPoint, Rng};
 use oracle_market::{
     paper_trade, skill_comparison, BacktestRun, BetPolicy, Odds, Opportunity, SkillComparison,
 };
@@ -31,6 +33,18 @@ use std::collections::HashMap;
 
 /// Cap on the paper-trading backtest universe, so one request cannot tie up the server.
 const BACKTEST_MAX_MATCHES: usize = 5000;
+
+/// An in-play trading study for a matchup: the backed side and its fair price, a settled trading
+/// backtest, and one sample win-probability path to visualize.
+#[derive(Debug, Clone, Serialize)]
+pub struct InPlayView {
+    pub home: String,
+    pub away: String,
+    pub backed: String,
+    pub back_odds: f64,
+    pub report: InPlayReport,
+    pub sample_path: Vec<PathPoint>,
+}
 
 /// A completed market backtest: the parameters it ran under, the settled bankroll run, and the
 /// model-versus-market skill comparison over the same matches.
@@ -257,6 +271,44 @@ impl Explorer {
         );
         odds.truncate(40);
         odds
+    }
+
+    /// An in-play trading study for a matchup: back the pre-match favourite at fair odds and trade
+    /// the live position (cash out at a profit target or stop) across many simulated matches, with a
+    /// hold-to-settlement baseline, plus one sample win-probability path. The goal rates come from
+    /// the model; the trading and the honest edge-free comparison come from `oracle-live`.
+    pub fn inplay_backtest(&self, home: TeamId, away: TeamId, iters: u32, seed: u64) -> InPlayView {
+        let (lh, la) = self.model.expected_goals(home, away, true);
+        let config = InPlayConfig {
+            iters: iters.clamp(1000, 100_000),
+            seed,
+            ..InPlayConfig::default()
+        };
+        let report = oracle_live::inplay_backtest(lh, la, &config);
+
+        let pre = oracle_live::win_probabilities(MatchState::kickoff(), lh, la);
+        let (backed_outcome, backed) = if pre.home_win >= pre.draw && pre.home_win >= pre.away_win {
+            (Outcome::HomeWin, self.name(home))
+        } else if pre.away_win >= pre.draw {
+            (Outcome::AwayWin, self.name(away))
+        } else {
+            (Outcome::Draw, "Draw".to_string())
+        };
+        let back_odds = oracle_live::fair_odds(pre.of(backed_outcome));
+
+        let mut rng = Rng::new(seed);
+        let timeline = oracle_live::simulate_match(&mut rng, lh, la);
+        let sample_path =
+            oracle_live::win_prob_path(&timeline, lh, la, backed_outcome, config.step);
+
+        InPlayView {
+            home: self.name(home),
+            away: self.name(away),
+            backed,
+            back_odds,
+            report,
+            sample_path,
+        }
     }
 
     /// Resolve a team by FIFA code, full name, or a name substring (case-insensitive).
@@ -1337,6 +1389,27 @@ mod tests {
         assert!(race[0].expected_goals > 1.0);
         let again = ex.golden_boot(3000, 42);
         assert_eq!(race[0].player, again[0].player);
+    }
+
+    #[test]
+    fn inplay_backtest_view_is_coherent_and_reproducible() {
+        let ex = Explorer::new();
+        let bra = ex.resolve("Brazil").unwrap();
+        let jpn = ex.resolve("Japan").unwrap();
+        let view = ex.inplay_backtest(bra, jpn, 3000, 42);
+
+        // The favourite is one of the two sides (Brazil, here) at odds above evens.
+        assert!(view.backed == view.home || view.backed == view.away || view.backed == "Draw");
+        assert!(view.back_odds > 1.0);
+        assert_eq!(view.report.trades, 3000);
+        // The sample path spans the match.
+        assert_eq!(view.sample_path.first().unwrap().minute, 0);
+        assert_eq!(view.sample_path.last().unwrap().minute, 90);
+        // Fair odds: neither trading nor holding has a meaningful edge.
+        assert!(view.report.mean_pnl.abs() < 1.0 && view.report.hold_mean_pnl.abs() < 1.0);
+        // Reproducible from the seed.
+        let again = ex.inplay_backtest(bra, jpn, 3000, 42);
+        assert!((view.report.mean_pnl - again.report.mean_pnl).abs() < 1e-9);
     }
 
     #[test]

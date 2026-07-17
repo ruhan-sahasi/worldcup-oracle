@@ -16,6 +16,7 @@ oracle-sim.workspace = true
 oracle-ingest.workspace = true
 oracle-market.workspace = true
 oracle-players.workspace = true
+oracle-live.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
 arc-swap.workspace = true
