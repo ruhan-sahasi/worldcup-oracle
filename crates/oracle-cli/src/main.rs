@@ -9,6 +9,7 @@
 //! wc-oracle market-backtest # paper-trade the model against the market (bankroll, ROI, edge)
 //! wc-oracle scorers    # goalscorer market for a matchup (anytime / brace / hat-trick)
 //! wc-oracle golden-boot # top-scorer race across the tournament
+//! wc-oracle in-play    # in-play trading study (cash-out vs hold) for a matchup
 //! wc-oracle tune       # search goal-model hyperparameters by held-out log-loss
 //! wc-oracle serve      # run the REST + WebSocket server
 //! wc-oracle watch      # live terminal dashboard (TUI)
@@ -151,6 +152,21 @@ enum Command {
         #[arg(long, default_value_t = 20)]
         top: usize,
     },
+    /// In-play trading study for a matchup: a live cash-out backtest versus holding to settlement.
+    InPlay {
+        /// Home team (name or FIFA code).
+        #[arg(long)]
+        home: String,
+        /// Away team (name or FIFA code).
+        #[arg(long)]
+        away: String,
+        /// Monte-Carlo matches to simulate.
+        #[arg(long, default_value_t = 20_000)]
+        iters: u32,
+        /// RNG seed (fixed seed => reproducible output).
+        #[arg(long, default_value_t = 42)]
+        seed: u64,
+    },
     /// Run the REST + WebSocket server.
     Serve {
         /// Listen address.
@@ -219,6 +235,12 @@ async fn main() -> anyhow::Result<()> {
         } => cmd_market_backtest(seed, matches, bankroll, edge, kelly, cap, margin),
         Command::Scorers { home, away, top } => cmd_scorers(&home, &away, top),
         Command::GoldenBoot { iters, seed, top } => cmd_golden_boot(iters, seed, top),
+        Command::InPlay {
+            home,
+            away,
+            iters,
+            seed,
+        } => cmd_inplay(&home, &away, iters, seed),
         Command::Serve { addr, event_log } => cmd_serve(addr, event_log).await,
         Command::Watch { speed } => watch::run(speed).await,
         Command::Sensitivity { iters, seed, top } => cmd_sensitivity(iters, seed, top),
@@ -349,6 +371,36 @@ fn cmd_golden_boot(iters: u32, seed: u64, top: usize) -> anyhow::Result<()> {
             o.p_top3 * 100.0
         );
     }
+    Ok(())
+}
+
+fn cmd_inplay(home: &str, away: &str, iters: u32, seed: u64) -> anyhow::Result<()> {
+    println!("Fitting the model, then simulating in-play trading (seed {seed})...\n");
+    let explorer = Explorer::new();
+    let h = explorer
+        .resolve(home)
+        .ok_or_else(|| anyhow::anyhow!("unknown team: {home}"))?;
+    let a = explorer
+        .resolve(away)
+        .ok_or_else(|| anyhow::anyhow!("unknown team: {away}"))?;
+    let view = explorer.inplay_backtest(h, a, iters, seed);
+    let r = &view.report;
+    println!(
+        "Backing {} at {:.2}   ({} v {})\n",
+        view.backed, view.back_odds, view.home, view.away
+    );
+    println!(
+        "  Cash-out:       mean {:+.3}   ROI {:+.1}%   cash-out {:.0}%   max drawdown {:.1}u",
+        r.mean_pnl,
+        r.roi * 100.0,
+        r.cash_out_rate * 100.0,
+        r.max_drawdown
+    );
+    println!(
+        "  Hold to settle: mean {:+.3}   (baseline, never cash out)",
+        r.hold_mean_pnl
+    );
+    println!("\nFair odds mean no edge either way; cash-out trades variance, not profit.");
     Ok(())
 }
 
