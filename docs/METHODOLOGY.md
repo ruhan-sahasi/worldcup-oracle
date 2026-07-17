@@ -279,6 +279,25 @@ finishes top scorer or on the podium. The expected-matches and per-match-goals s
 approximations, labelled as such; the allocation, the Poisson markets, and the race simulation on top
 are exact and independently unit-tested.
 
+## In-play: trading the live position
+
+`oracle-live` follows a match after kickoff. Its in-play win probability adds the current score to the
+remaining goals, which are Poisson with a rate **prorated by the time left**: at kickoff it is the
+pre-match forecast, by the whistle the remaining rate is zero so it settles to the result on the
+board, and in between a lead is worth steadily more as the clock runs down. Simulating a goal
+timeline and sampling that model minute by minute gives the live win-probability path, the drama
+graph a trader watches.
+
+On top sit the exchange tools. **Hedging** a back bet of stake `S` taken at odds `B` means laying
+`S B / L` at the current lay odds `L`, which locks in `S (B - L) / L` whichever way the match goes;
+**cash-out** value is exactly that locked figure at the current price. A trading backtest then backs
+the pre-match favourite at fair odds and either cashes out at a profit target or stop or holds to
+settlement, over thousands of simulated matches, against a hold-to-settlement baseline. Because the
+odds are fair, the result is the honest one: both average essentially zero, so cash-out reshapes the
+**distribution** of P&L (lower variance, different drawdown) but does not manufacture an edge. It is
+the in-play echo of the market backtest's finding: the machinery is real, and it is honest about not
+printing money.
+
 ## Honest limitations
 
 - The bundled roster/draw is a representative sample, not the official FIFA draw; the live adapter

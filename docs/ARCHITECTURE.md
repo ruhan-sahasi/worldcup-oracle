@@ -1,6 +1,6 @@
 # Architecture
 
-`worldcup-oracle` is a Cargo **workspace** of ten focused crates. Dependencies flow
+`worldcup-oracle` is a Cargo **workspace** of eleven focused crates. Dependencies flow
 strictly downhill from a zero-I/O domain core, so the prediction math, the data
 sources, and the transport layers can each change without disturbing the others.
 
@@ -15,6 +15,7 @@ graph TD
     ingest[oracle-ingest<br/>DataProvider impls]
     market[oracle-market<br/>odds · devig · Kelly · backtest]
     players[oracle-players<br/>scorer markets · Golden Boot]
+    live[oracle-live<br/>in-play win prob · trading]
     engine[oracle-engine<br/>event loop · pub/sub]
     api[oracle-api<br/>axum REST + WS]
     cli[oracle-cli<br/>wc-oracle + TUI]
@@ -27,6 +28,7 @@ graph TD
     ingest --> model
     market --> domain
     players --> domain
+    live --> domain
     engine --> domain
     engine --> ratings
     engine --> model
@@ -34,6 +36,7 @@ graph TD
     engine --> ingest
     engine --> market
     engine --> players
+    engine --> live
     api --> engine
     api --> market
     api --> players
@@ -385,6 +388,18 @@ weights and the goal model's expected goals, and it is surfaced on `/api/scorers
 the explorer's Players tab, and `wc-oracle scorers` / `golden-boot`. The player weights are the squad
 model's own scores, so nothing is invented; the tournament expected-goals estimate is a labelled
 approximation over an exact scoring model.
+
+### In-play trading (`oracle-live` + `oracle-engine::query`)
+The in-play layer, a pure leaf crate. It re-derives the win probability from a match state and the
+goal rates (current score plus remaining Poisson goals, prorated by time left), simulates a goal
+timeline into a live win-probability path, and prices the exchange tools a trader uses: the hedge
+stake and locked profit, and cash-out value. On top it backtests trading the pre-match favourite in
+play (cash out at a profit target or stop, or hold) over many seeded matches against a
+hold-to-settlement baseline, with its own SplitMix64 generator so it carries no `rand` dependency.
+`Explorer::inplay_backtest` supplies the goal model's expected goals and returns the study, surfaced
+on `/api/inplay`, the explorer's In-play tab, and `wc-oracle in-play`. At fair odds neither approach
+has an edge, so the honest conclusion is that cash-out reshapes the P&L distribution rather than
+beating a held bet.
 
 ### Durable event store (`oracle-engine::event_log`)
 With `EngineConfig.event_log` set, every consumed event is appended as one JSON line and
