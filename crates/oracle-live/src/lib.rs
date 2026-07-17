@@ -207,6 +207,30 @@ pub fn win_prob_path(
         .collect()
 }
 
+/// The fair decimal odds for a probability, `1 / p` (floored at 1.0, guarded against zero).
+pub fn fair_odds(prob: f64) -> f64 {
+    (1.0 / prob.clamp(1e-9, 1.0)).max(1.0)
+}
+
+/// The lay stake that hedges a back bet to an equal profit whatever the result: `stake * B / L` for
+/// back odds `B` and current lay odds `L`.
+pub fn hedge_stake(back_stake: f64, back_odds: f64, lay_odds: f64) -> f64 {
+    if lay_odds <= 0.0 {
+        return 0.0;
+    }
+    back_stake * back_odds / lay_odds
+}
+
+/// The profit locked in by that hedge, the same whichever way the match goes: `stake * (B - L) / L`.
+/// Positive when the odds have shortened since the back (the position is in profit), negative when
+/// they have drifted out.
+pub fn locked_profit(back_stake: f64, back_odds: f64, lay_odds: f64) -> f64 {
+    if lay_odds <= 0.0 {
+        return 0.0;
+    }
+    back_stake * (back_odds - lay_odds) / lay_odds
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -297,6 +321,39 @@ mod tests {
         for p in &path {
             assert!((0.0..=1.0).contains(&p.prob));
         }
+    }
+
+    fn approx(a: f64, b: f64) {
+        assert!((a - b).abs() < 1e-9, "{a} vs {b}");
+    }
+
+    // Profit if the backed outcome wins / loses, after laying `hedge` at `lay_odds`.
+    fn settle(back_stake: f64, back_odds: f64, lay_odds: f64) -> (f64, f64) {
+        let hedge = hedge_stake(back_stake, back_odds, lay_odds);
+        let win = back_stake * (back_odds - 1.0) - (lay_odds - 1.0) * hedge;
+        let lose = -back_stake + hedge;
+        (win, lose)
+    }
+
+    #[test]
+    fn fair_odds_invert_probability() {
+        approx(fair_odds(0.5), 2.0);
+        approx(fair_odds(0.25), 4.0);
+        approx(fair_odds(1.0), 1.0);
+    }
+
+    #[test]
+    fn hedging_locks_an_equal_profit_both_ways() {
+        // Odds shortened (3.0 -> 2.0): the hedge locks a profit, equal whichever way it settles.
+        let (win, lose) = settle(10.0, 3.0, 2.0);
+        approx(win, lose);
+        approx(win, locked_profit(10.0, 3.0, 2.0));
+        approx(locked_profit(10.0, 3.0, 2.0), 5.0);
+        // Odds drifted out (2.0 -> 4.0): the locked figure is a loss, still equal both ways.
+        let (dw, dl) = settle(10.0, 2.0, 4.0);
+        approx(dw, dl);
+        approx(dw, locked_profit(10.0, 2.0, 4.0));
+        approx(locked_profit(10.0, 2.0, 4.0), -5.0);
     }
 
     #[test]
