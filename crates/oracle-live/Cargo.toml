@@ -1,0 +1,13 @@
+[package]
+name = "oracle-live"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "In-play win probability and live trading (hedging, cash-out) for worldcup-oracle"
+
+[dependencies]
+oracle-domain.workspace = true
+serde.workspace = true

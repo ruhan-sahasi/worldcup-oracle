@@ -1273,6 +1273,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "oracle-live"
+version = "0.1.0"
+dependencies = [
+ "oracle-domain",
+ "serde",
+]
+
+[[package]]
 name = "oracle-market"
 version = "0.1.0"
 dependencies = [
