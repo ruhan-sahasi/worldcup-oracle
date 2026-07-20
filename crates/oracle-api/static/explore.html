@@ -88,6 +88,7 @@
       <div class="tab" data-tab="backtest">Backtest</div>
       <div class="tab" data-tab="players">Players</div>
       <div class="tab" data-tab="inplay">In-play</div>
+      <div class="tab" data-tab="derivatives">Derivatives</div>
       <div class="tab" data-tab="ratings">Ratings</div>
     </div>
 
@@ -228,6 +229,21 @@
       </div>
     </section>
 
+    <!-- ===== Derivatives ===== -->
+    <section id="tab-derivatives" class="hidden">
+      <div class="panel">
+        <h2>Derivative markets</h2>
+        <div class="note">Every market priced exactly off the model's score grid: totals, Asian handicap, correct score, and the side markets.</div>
+        <div class="row">
+          <select id="d-home"></select>
+          <select id="d-away"></select>
+          <button id="run-derivatives">Price</button>
+          <span id="derivatives-status" class="muted"></span>
+        </div>
+        <div id="derivatives-out"></div>
+      </div>
+    </section>
+
     <section id="tab-ratings" class="hidden">
       <div class="panel">
         <h2>Confederation strength</h2>
@@ -258,7 +274,7 @@
   let ratingsLoaded = false;
   document.querySelectorAll(".tab").forEach(t => t.onclick = () => {
     document.querySelectorAll(".tab").forEach(x => x.classList.toggle("active", x === t));
-    for (const name of ["matchup", "simulate", "sensitivity", "backtest", "players", "inplay", "ratings"]) {
+    for (const name of ["matchup", "simulate", "sensitivity", "backtest", "players", "inplay", "derivatives", "ratings"]) {
       $("tab-" + name).classList.toggle("hidden", name !== t.dataset.tab);
     }
     if (t.dataset.tab === "ratings" && !ratingsLoaded) loadRatings();
@@ -280,7 +296,8 @@
       $("home").innerHTML = opts; $("away").innerHTML = opts;
       $("p-home").innerHTML = opts; $("p-away").innerHTML = opts;
       $("i-home").innerHTML = opts; $("i-away").innerHTML = opts;
-      if (data.teams[1]) { $("away").value = data.teams[1].code; $("p-away").value = data.teams[1].code; $("i-away").value = data.teams[1].code; }
+      $("d-home").innerHTML = opts; $("d-away").innerHTML = opts;
+      if (data.teams[1]) { $("away").value = data.teams[1].code; $("p-away").value = data.teams[1].code; $("i-away").value = data.teams[1].code; $("d-away").value = data.teams[1].code; }
       window._ratings = data;
       return;
     }
@@ -614,6 +631,38 @@
     finally { $("run-inplay").disabled = false; }
   }
 
+  // ----- derivatives -----
+  async function runDerivatives() {
+    $("run-derivatives").disabled = true; $("derivatives-status").textContent = "pricing…"; $("derivatives-out").innerHTML = "";
+    try {
+      const b = await api(`/api/derivatives?home=${encodeURIComponent($("d-home").value)}&away=${encodeURIComponent($("d-away").value)}`);
+      $("derivatives-status").textContent = "";
+      const o = b.outcome;
+      const totals = b.totals.lines.map(l => `<tr><td>${l.line}</td><td class="accent">${pct(l.over)}</td><td>${pct(l.under)}</td></tr>`).join("");
+      const hcap = b.handicap.map(h => `<tr><td>${h.line >= 0 ? "+" : ""}${h.line}</td><td>${pct(h.home_win)}</td><td>${pct(h.push)}</td><td>${pct(h.away_win)}</td><td>${h.fair_home_odds.toFixed(2)}</td><td>${h.fair_away_odds.toFixed(2)}</td></tr>`).join("");
+      const cs = b.correct_score.top.map(s => `<tr><td>${s.home}-${s.away}</td><td>${pct(s.prob)}</td></tr>`).join("") +
+        `<tr><td class="muted">any other</td><td>${pct(b.correct_score.other)}</td></tr>`;
+      const g = b.goals, dc = b.double_chance, dnb = b.draw_no_bet;
+      $("derivatives-out").innerHTML =
+        `<div class="rcstat">1X2 <b>${pct(o.home_win)}</b> / ${pct(o.draw)} / ${pct(o.away_win)} · expected goals ${b.totals.expected.toFixed(2)}</div>
+         <h2 style="margin-top:12px">Totals (over / under)</h2>
+         <table><tr><th>Line</th><th>Over</th><th>Under</th></tr>${totals}</table>
+         <h2 style="margin-top:12px">Asian handicap (home line)</h2>
+         <table><tr><th>Line</th><th>Home</th><th>Push</th><th>Away</th><th>Fair H</th><th>Fair A</th></tr>${hcap}</table>
+         <h2 style="margin-top:12px">Correct score</h2>
+         <table><tr><th>Score</th><th>Prob</th></tr>${cs}</table>
+         <h2 style="margin-top:12px">Side markets</h2>
+         <table>
+           <tr><td>Both teams to score</td><td>${pct(g.btts_yes)} yes / ${pct(g.btts_no)} no</td></tr>
+           <tr><td>Clean sheet</td><td>home ${pct(g.clean_sheet_home)} / away ${pct(g.clean_sheet_away)}</td></tr>
+           <tr><td>Win to nil</td><td>home ${pct(g.win_to_nil_home)} / away ${pct(g.win_to_nil_away)}</td></tr>
+           <tr><td>Double chance</td><td>1X ${pct(dc.home_or_draw)} · 12 ${pct(dc.home_or_away)} · X2 ${pct(dc.draw_or_away)}</td></tr>
+           <tr><td>Draw no bet</td><td>home ${pct(dnb.home)} / away ${pct(dnb.away)}</td></tr>
+         </table>`;
+    } catch (err) { $("derivatives-status").textContent = err.message; }
+    finally { $("run-derivatives").disabled = false; }
+  }
+
   // ----- ratings -----
   let sortKey = "elo", sortDesc = true;
   function renderRatings() {
@@ -661,6 +710,7 @@
   $("run-scorers").onclick = runScorers;
   $("run-goldenboot").onclick = runGoldenBoot;
   $("run-inplay").onclick = runInPlay;
+  $("run-derivatives").onclick = runDerivatives;
   $("rfilter").oninput = renderRatings;
   document.querySelectorAll(".preset").forEach(b => b.onclick = () => { $("iters").value = b.dataset.iters; runSim(); });
   // Enter anywhere in the matchup panel triggers a prediction.
