@@ -112,6 +112,51 @@ pub fn total_probability(grid: &ScoreGrid) -> f64 {
     grid.grid.iter().flat_map(|row| row.iter()).sum()
 }
 
+/// The goal-based side markets: both teams to score, clean sheets, and win-to-nil.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct GoalMarkets {
+    pub btts_yes: f64,
+    pub btts_no: f64,
+    /// Home keeps a clean sheet (the away side fails to score), and vice versa.
+    pub clean_sheet_home: f64,
+    pub clean_sheet_away: f64,
+    /// Home wins without conceding, and vice versa.
+    pub win_to_nil_home: f64,
+    pub win_to_nil_away: f64,
+}
+
+/// Price the goal-based side markets off the grid.
+pub fn goal_markets(grid: &ScoreGrid) -> GoalMarkets {
+    let mut btts_yes = 0.0;
+    let mut win_to_nil_home = 0.0;
+    let mut win_to_nil_away = 0.0;
+    for (h, row) in grid.grid.iter().enumerate() {
+        for (a, &p) in row.iter().enumerate() {
+            if h >= 1 && a >= 1 {
+                btts_yes += p;
+            }
+            if h >= 1 && a == 0 {
+                win_to_nil_home += p;
+            }
+            if a >= 1 && h == 0 {
+                win_to_nil_away += p;
+            }
+        }
+    }
+    let total = total_probability(grid);
+    let home_goals = home_goal_distribution(grid);
+    let away_goals = away_goal_distribution(grid);
+    GoalMarkets {
+        btts_yes,
+        btts_no: total - btts_yes,
+        // Home's clean sheet means the away side scored zero.
+        clean_sheet_home: away_goals.first().copied().unwrap_or(0.0),
+        clean_sheet_away: home_goals.first().copied().unwrap_or(0.0),
+        win_to_nil_home,
+        win_to_nil_away,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -148,6 +193,18 @@ mod tests {
         for l in &t.lines {
             approx(l.over + l.under, 1.0);
         }
+    }
+
+    #[test]
+    fn goal_markets_price_off_the_grid() {
+        let g = grid(vec![vec![0.1, 0.2], vec![0.3, 0.4]]);
+        let m = goal_markets(&g);
+        approx(m.btts_yes, 0.4); // only 1-1
+        approx(m.btts_no, 0.6);
+        approx(m.clean_sheet_home, 0.4); // away scored 0: 0-0 and 1-0
+        approx(m.clean_sheet_away, 0.3); // home scored 0: 0-0 and 0-1
+        approx(m.win_to_nil_home, 0.3); // 1-0
+        approx(m.win_to_nil_away, 0.2); // 0-1
     }
 
     #[test]
