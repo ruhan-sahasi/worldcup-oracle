@@ -1223,6 +1223,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "oracle-derivatives"
+version = "0.1.0"
+dependencies = [
+ "oracle-domain",
+ "serde",
+]
+
+[[package]]
 name = "oracle-domain"
 version = "0.1.0"
 dependencies = [
