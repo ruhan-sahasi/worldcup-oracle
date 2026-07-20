@@ -157,6 +157,48 @@ pub fn goal_markets(grid: &ScoreGrid) -> GoalMarkets {
     }
 }
 
+/// The double-chance market: two of the three outcomes each.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct DoubleChance {
+    pub home_or_draw: f64,
+    pub home_or_away: f64,
+    pub draw_or_away: f64,
+}
+
+/// Double chance, straight from the 1x2 probabilities.
+pub fn double_chance(grid: &ScoreGrid) -> DoubleChance {
+    let p = grid.outcome_probabilities();
+    DoubleChance {
+        home_or_draw: p.home_win + p.draw,
+        home_or_away: p.home_win + p.away_win,
+        draw_or_away: p.draw + p.away_win,
+    }
+}
+
+/// The draw-no-bet market: the draw is void (stake refunded), so the win probabilities are
+/// renormalized over just the two sides.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct DrawNoBet {
+    pub home: f64,
+    pub away: f64,
+}
+
+/// Draw-no-bet, renormalizing the 1x2 probabilities with the draw removed.
+pub fn draw_no_bet(grid: &ScoreGrid) -> DrawNoBet {
+    let p = grid.outcome_probabilities();
+    let decisive = p.home_win + p.away_win;
+    if decisive <= 0.0 {
+        return DrawNoBet {
+            home: 0.5,
+            away: 0.5,
+        };
+    }
+    DrawNoBet {
+        home: p.home_win / decisive,
+        away: p.away_win / decisive,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -205,6 +247,23 @@ mod tests {
         approx(m.clean_sheet_away, 0.3); // home scored 0: 0-0 and 0-1
         approx(m.win_to_nil_home, 0.3); // 1-0
         approx(m.win_to_nil_away, 0.2); // 0-1
+    }
+
+    #[test]
+    fn double_chance_and_draw_no_bet_follow_the_1x2() {
+        // outcome: home 0.3, draw 0.5, away 0.2.
+        let g = grid(vec![vec![0.1, 0.2], vec![0.3, 0.4]]);
+        let dc = double_chance(&g);
+        approx(dc.home_or_draw, 0.8);
+        approx(dc.home_or_away, 0.5);
+        approx(dc.draw_or_away, 0.7);
+        // The three double chances cover every pair, so they sum to twice the whole.
+        approx(dc.home_or_draw + dc.home_or_away + dc.draw_or_away, 2.0);
+
+        let dnb = draw_no_bet(&g);
+        approx(dnb.home, 0.6); // 0.3 / (0.3 + 0.2)
+        approx(dnb.away, 0.4);
+        approx(dnb.home + dnb.away, 1.0);
     }
 
     #[test]
