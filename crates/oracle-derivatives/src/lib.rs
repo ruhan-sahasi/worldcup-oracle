@@ -324,6 +324,46 @@ pub fn handicap_ladder(grid: &ScoreGrid, lines: &[f64]) -> Vec<HandicapLine> {
         .collect()
 }
 
+/// One exact scoreline and its probability.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct ScoreEntry {
+    pub home: u8,
+    pub away: u8,
+    pub prob: f64,
+}
+
+/// The correct-score market: the `n` most likely exact scores, and the residual "any other score".
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CorrectScore {
+    pub top: Vec<ScoreEntry>,
+    pub other: f64,
+}
+
+/// Price the correct-score market: rank every scoreline, keep the top `n`, and fold the rest into a
+/// single "any other" residual so the board sums to the grid's total.
+pub fn correct_score(grid: &ScoreGrid, n: usize) -> CorrectScore {
+    let mut scores: Vec<ScoreEntry> = grid
+        .grid
+        .iter()
+        .enumerate()
+        .flat_map(|(h, row)| {
+            row.iter().enumerate().map(move |(a, &prob)| ScoreEntry {
+                home: h as u8,
+                away: a as u8,
+                prob,
+            })
+        })
+        .collect();
+    scores.sort_by(|x, y| {
+        y.prob
+            .partial_cmp(&x.prob)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    let top: Vec<ScoreEntry> = scores.into_iter().take(n).collect();
+    let other = (total_probability(grid) - top.iter().map(|s| s.prob).sum::<f64>()).max(0.0);
+    CorrectScore { top, other }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -448,6 +488,21 @@ mod tests {
         for l in &ladder {
             approx(l.home_win + l.push + l.away_win, 1.0);
         }
+    }
+
+    #[test]
+    fn correct_score_board_ranks_and_folds_the_rest() {
+        let g = grid(vec![vec![0.1, 0.2], vec![0.3, 0.4]]);
+        let cs = correct_score(&g, 2);
+        assert_eq!((cs.top[0].home, cs.top[0].away), (1, 1));
+        approx(cs.top[0].prob, 0.4);
+        assert_eq!((cs.top[1].home, cs.top[1].away), (1, 0));
+        approx(cs.top[1].prob, 0.3);
+        approx(cs.other, 0.3); // 0.1 + 0.2 folded in
+                               // The board is exhaustive.
+        approx(cs.top.iter().map(|s| s.prob).sum::<f64>() + cs.other, 1.0);
+        // Ranked by probability.
+        assert!(cs.top.windows(2).all(|w| w[0].prob >= w[1].prob));
     }
 
     #[test]
