@@ -288,11 +288,19 @@ fn fair_odds(win: f64, push: f64) -> f64 {
     ((1.0 - push) / win).clamp(1.0, 1000.0)
 }
 
-/// Price a single **half or whole** Asian-handicap line (its double is an integer). Quarter lines
-/// are handled in the ladder, which splits them across the two adjacent lines.
+/// Price a single Asian-handicap line. A half or whole line (its double is an integer) settles
+/// directly; a **quarter** line splits the stake evenly across the two adjacent half/whole lines, so
+/// its effective win/push/lose fractions are the average of theirs (the correct expected
+/// settlement, capturing half-win and half-loss). Fair odds follow from those fractions.
 pub fn handicap_line(grid: &ScoreGrid, line: f64) -> HandicapLine {
     let dist = margin_distribution(grid);
-    let (home_win, push, away_win) = settle_line(&dist, line);
+    let (home_win, push, away_win) = if (2.0 * line).fract().abs() < 1e-9 {
+        settle_line(&dist, line)
+    } else {
+        let (w1, p1, l1) = settle_line(&dist, line - 0.25);
+        let (w2, p2, l2) = settle_line(&dist, line + 0.25);
+        (0.5 * (w1 + w2), 0.5 * (p1 + p2), 0.5 * (l1 + l2))
+    };
     HandicapLine {
         line,
         home_win,
@@ -301,6 +309,19 @@ pub fn handicap_line(grid: &ScoreGrid, line: f64) -> HandicapLine {
         fair_home_odds: fair_odds(home_win, push),
         fair_away_odds: fair_odds(away_win, push),
     }
+}
+
+/// The standard Asian-handicap ladder a book quotes around the level line.
+pub const STANDARD_HANDICAPS: [f64; 11] = [
+    -1.5, -1.0, -0.75, -0.5, -0.25, 0.0, 0.25, 0.5, 0.75, 1.0, 1.5,
+];
+
+/// Price a ladder of handicap lines.
+pub fn handicap_ladder(grid: &ScoreGrid, lines: &[f64]) -> Vec<HandicapLine> {
+    lines
+        .iter()
+        .map(|&line| handicap_line(grid, line))
+        .collect()
 }
 
 #[cfg(test)]
@@ -408,6 +429,25 @@ mod tests {
         approx(plus.home_win, 0.8);
         approx(plus.push, 0.0);
         approx(plus.away_win, 0.2);
+    }
+
+    #[test]
+    fn quarter_handicap_splits_across_the_two_adjacent_lines() {
+        let g = grid(vec![vec![0.1, 0.2], vec![0.3, 0.4]]);
+        // Home -0.25 splits between 0.0 (0.3 / 0.5 / 0.2) and -0.5 (0.3 / 0.0 / 0.7):
+        // averages to 0.30 / 0.25 / 0.45.
+        let q = handicap_line(&g, -0.25);
+        approx(q.home_win, 0.30);
+        approx(q.push, 0.25);
+        approx(q.away_win, 0.45);
+        approx(q.home_win + q.push + q.away_win, 1.0);
+
+        let ladder = handicap_ladder(&g, &STANDARD_HANDICAPS);
+        assert_eq!(ladder.len(), STANDARD_HANDICAPS.len());
+        // Every line's fractions form a distribution.
+        for l in &ladder {
+            approx(l.home_win + l.push + l.away_win, 1.0);
+        }
     }
 
     #[test]
