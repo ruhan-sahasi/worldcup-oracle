@@ -1,6 +1,6 @@
 # Architecture
 
-`worldcup-oracle` is a Cargo **workspace** of eleven focused crates. Dependencies flow
+`worldcup-oracle` is a Cargo **workspace** of twelve focused crates. Dependencies flow
 strictly downhill from a zero-I/O domain core, so the prediction math, the data
 sources, and the transport layers can each change without disturbing the others.
 
@@ -16,6 +16,7 @@ graph TD
     market[oracle-market<br/>odds · devig · Kelly · backtest]
     players[oracle-players<br/>scorer markets · Golden Boot]
     live[oracle-live<br/>in-play win prob · trading]
+    derivatives[oracle-derivatives<br/>totals · handicap · correct score]
     engine[oracle-engine<br/>event loop · pub/sub]
     api[oracle-api<br/>axum REST + WS]
     cli[oracle-cli<br/>wc-oracle + TUI]
@@ -29,6 +30,7 @@ graph TD
     market --> domain
     players --> domain
     live --> domain
+    derivatives --> domain
     engine --> domain
     engine --> ratings
     engine --> model
@@ -37,9 +39,11 @@ graph TD
     engine --> market
     engine --> players
     engine --> live
+    engine --> derivatives
     api --> engine
     api --> market
     api --> players
+    api --> derivatives
     cli --> engine
     cli --> api
     cli --> market
@@ -400,6 +404,16 @@ hold-to-settlement baseline, with its own SplitMix64 generator so it carries no 
 on `/api/inplay`, the explorer's In-play tab, and `wc-oracle in-play`. At fair odds neither approach
 has an edge, so the honest conclusion is that cash-out reshapes the P&L distribution rather than
 beating a held bet.
+
+### Derivative markets (`oracle-derivatives` + `oracle-engine::query`)
+A pure leaf crate that turns the goal model's bivariate score grid into the full market board a book
+quotes, every market a closed-form sum over the grid: totals (goal distribution + over/under ladder),
+both-teams-to-score, clean sheets, win-to-nil, double chance, draw-no-bet, the winning-margin
+distribution, the Asian-handicap ladder (whole/half lines settle directly with push refunds; quarter
+lines split the stake across the two adjacent lines), and the correct-score board. `Explorer::
+derivatives` builds it from `GoalModel::score_grid`, surfaced on `/api/derivatives`, the explorer's
+Derivatives tab, and `wc-oracle derivatives`. Because everything derives from the same grid as the
+headline forecast, the board is internally consistent by construction.
 
 ### Durable event store (`oracle-engine::event_log`)
 With `EngineConfig.event_log` set, every consumed event is appended as one JSON line and

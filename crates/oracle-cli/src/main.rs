@@ -10,6 +10,7 @@
 //! wc-oracle scorers    # goalscorer market for a matchup (anytime / brace / hat-trick)
 //! wc-oracle golden-boot # top-scorer race across the tournament
 //! wc-oracle in-play    # in-play trading study (cash-out vs hold) for a matchup
+//! wc-oracle derivatives # totals, Asian handicap, correct score, and more for a matchup
 //! wc-oracle tune       # search goal-model hyperparameters by held-out log-loss
 //! wc-oracle serve      # run the REST + WebSocket server
 //! wc-oracle watch      # live terminal dashboard (TUI)
@@ -167,6 +168,15 @@ enum Command {
         #[arg(long, default_value_t = 42)]
         seed: u64,
     },
+    /// Derivative markets for a matchup: totals, Asian handicap, correct score, and the side markets.
+    Derivatives {
+        /// Home team (name or FIFA code).
+        #[arg(long)]
+        home: String,
+        /// Away team (name or FIFA code).
+        #[arg(long)]
+        away: String,
+    },
     /// Run the REST + WebSocket server.
     Serve {
         /// Listen address.
@@ -241,6 +251,7 @@ async fn main() -> anyhow::Result<()> {
             iters,
             seed,
         } => cmd_inplay(&home, &away, iters, seed),
+        Command::Derivatives { home, away } => cmd_derivatives(&home, &away),
         Command::Serve { addr, event_log } => cmd_serve(addr, event_log).await,
         Command::Watch { speed } => watch::run(speed).await,
         Command::Sensitivity { iters, seed, top } => cmd_sensitivity(iters, seed, top),
@@ -371,6 +382,61 @@ fn cmd_golden_boot(iters: u32, seed: u64, top: usize) -> anyhow::Result<()> {
             o.p_top3 * 100.0
         );
     }
+    Ok(())
+}
+
+fn cmd_derivatives(home: &str, away: &str) -> anyhow::Result<()> {
+    let explorer = Explorer::new();
+    let h = explorer
+        .resolve(home)
+        .ok_or_else(|| anyhow::anyhow!("unknown team: {home}"))?;
+    let a = explorer
+        .resolve(away)
+        .ok_or_else(|| anyhow::anyhow!("unknown team: {away}"))?;
+    let b = explorer.derivatives(h, a, true);
+    let o = &b.outcome;
+    println!("Derivative markets: {home} v {away}\n");
+    println!(
+        "  1X2:  {:.1}% / {:.1}% / {:.1}%    expected goals {:.2}",
+        o.home_win * 100.0,
+        o.draw * 100.0,
+        o.away_win * 100.0,
+        b.totals.expected
+    );
+    println!("\n  Totals:");
+    for l in &b.totals.lines {
+        println!(
+            "    {:.1}   over {:>5.1}%   under {:>5.1}%",
+            l.line,
+            l.over * 100.0,
+            l.under * 100.0
+        );
+    }
+    println!("\n  Asian handicap (home line):");
+    for hc in &b.handicap {
+        println!(
+            "    {:+.2}   home {:>5.1}%  push {:>5.1}%  away {:>5.1}%   fair {:.2} / {:.2}",
+            hc.line,
+            hc.home_win * 100.0,
+            hc.push * 100.0,
+            hc.away_win * 100.0,
+            hc.fair_home_odds,
+            hc.fair_away_odds
+        );
+    }
+    println!("\n  Correct score:");
+    for s in &b.correct_score.top {
+        println!("    {}-{}   {:>5.1}%", s.home, s.away, s.prob * 100.0);
+    }
+    println!("    any other   {:>5.1}%", b.correct_score.other * 100.0);
+    println!(
+        "\n  BTTS {:.0}%   clean sheet H/A {:.0}%/{:.0}%   draw-no-bet H/A {:.0}%/{:.0}%",
+        b.goals.btts_yes * 100.0,
+        b.goals.clean_sheet_home * 100.0,
+        b.goals.clean_sheet_away * 100.0,
+        b.draw_no_bet.home * 100.0,
+        b.draw_no_bet.away * 100.0
+    );
     Ok(())
 }
 

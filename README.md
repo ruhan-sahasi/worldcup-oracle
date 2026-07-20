@@ -66,6 +66,7 @@ fully offline with **zero keys and zero network**.
 | **Market backtest** (`oracle-market`) - **de-vigging** (multiplicative + **Shin**), **edge/EV**, **Kelly staking**, and a compounding **paper-trading bankroll** simulator, run out-of-sample against a synthetic book | the honest quant question: after the vig, does the model beat the price? The truthful answer here is no, and the backtest shows why |
 | **Goalscorer markets + Golden Boot** (`oracle-players`) - a team's expected goals shared across its squad by attacking weight, giving **anytime / brace / hat-trick** and **first-scorer** markets per match, and a Monte-Carlo **top-scorer race** over the tournament | the player-level layer: who scores the goals, not just who wins the match |
 | **In-play trading** (`oracle-live`) - a minute-by-minute **live win-probability** model, exchange **hedging / cash-out** math, and a trading backtest of a live position against a hold baseline | the time dimension: what the odds do during a match, and whether trading them beats holding (it does not, at fair odds, and the backtest shows why) |
+| **Derivative markets** (`oracle-derivatives`) - **totals** ladders, **Asian handicaps** (quarter-line splits + push refunds), **correct score**, double chance, draw-no-bet, clean sheets, all **closed-form** off the score grid | the full board a book quotes, priced exactly from the model's joint scoreline distribution, no Monte-Carlo |
 | **Bayesian live updater** with **score effects** | conditions on score, minute, and red cards; a trailing team chases and a leading team defends |
 | **Lineup adjustment** | a confirmed XI shifts each team's attack and defense |
 | **Suspension tracking** | yellow-card accumulation drops a suspended starter from the next match before its lineup is known |
@@ -172,6 +173,9 @@ cargo run --release -p oracle-cli -- golden-boot
 
 # 8. In-play trading: cash out a live position, or hold? (Spoiler at fair odds: it is a wash.)
 cargo run --release -p oracle-cli -- in-play --home Brazil --away Japan
+
+# 9. The full derivative board for a matchup: totals, Asian handicap, correct score.
+cargo run --release -p oracle-cli -- derivatives --home Brazil --away Japan
 ```
 
 ```text
@@ -323,6 +327,7 @@ team and confederation ratings. The current matchup lives in the URL, so any pre
 | `GET` | `/api/scorers?home=&away=` | **goalscorer market**: anytime, brace, hat-trick per player |
 | `GET` | `/api/golden-boot?iters=&seed=` | **Golden Boot** race: each player's top-scorer odds |
 | `GET` | `/api/inplay?home=&away=` | **in-play** win-probability path + a live cash-out trading backtest |
+| `GET` | `/api/derivatives?home=&away=` | full **derivative board**: totals, Asian handicap, correct score, and more |
 | `GET` | `/api/sensitivity?iters=&seed=` | per-signal ablation: how much each signal moves the title |
 | `GET` | `/api/ratings` | team ratings + confederation strength levels |
 | `GET` | `/metrics` | Prometheus metrics |

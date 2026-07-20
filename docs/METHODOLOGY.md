@@ -298,6 +298,23 @@ odds are fair, the result is the honest one: both average essentially zero, so c
 the in-play echo of the market backtest's finding: the machinery is real, and it is honest about not
 printing money.
 
+## The full board: derivative markets
+
+The goal model does not just give win/draw/win, it gives the whole **joint distribution over
+scorelines** (the score grid). `oracle-derivatives` re-expresses that one object as every market a
+book quotes, each a closed-form sum over the grid with no Monte-Carlo: **totals** (the goal
+distribution and the over/under ladder), **both teams to score**, **clean sheets** and
+**win-to-nil**, **double chance** and **draw-no-bet**, and the **correct-score** board.
+
+The centrepiece is the **Asian handicap**, which is more intricate than it looks. From the winning-
+margin distribution, a handicap line settles win/push/lose on the margin adjusted by the line, so a
+whole line can push (the stake is refunded) while a half line cannot, and the fair odds are
+`(1 - push) / win` to remove the refunded mass. A **quarter** line splits the stake evenly across the
+two adjacent lines, so its effective settlement is the average of theirs, capturing the half-win and
+half-loss outcomes exactly. All of it is priced off the same grid the headline forecast comes from,
+so the board is internally consistent by construction (the handicap at the level line reproduces the
+1x2, over-plus-under is one, the correct-score board is exhaustive).
+
 ## Honest limitations
 
 - The bundled roster/draw is a representative sample, not the official FIFA draw; the live adapter
