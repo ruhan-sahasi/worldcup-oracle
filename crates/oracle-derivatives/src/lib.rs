@@ -16,10 +16,83 @@
 #![forbid(unsafe_code)]
 
 use oracle_domain::ScoreGrid;
+use serde::{Deserialize, Serialize};
 
 /// The width of the grid (goal counts `0..=max` modelled per side).
 fn width(grid: &ScoreGrid) -> usize {
     grid.grid.first().map_or(0, |row| row.len())
+}
+
+/// The distribution over the total goals in the match: `dist[k] = P(home + away == k)`.
+pub fn total_goals_distribution(grid: &ScoreGrid) -> Vec<f64> {
+    let (rows, cols) = (grid.grid.len(), width(grid));
+    if rows == 0 || cols == 0 {
+        return Vec::new();
+    }
+    let mut dist = vec![0.0; (rows - 1) + (cols - 1) + 1];
+    for (h, row) in grid.grid.iter().enumerate() {
+        for (a, &p) in row.iter().enumerate() {
+            dist[h + a] += p;
+        }
+    }
+    dist
+}
+
+/// The expected number of goals in the match.
+pub fn expected_total_goals(grid: &ScoreGrid) -> f64 {
+    total_goals_distribution(grid)
+        .iter()
+        .enumerate()
+        .map(|(k, &p)| k as f64 * p)
+        .sum()
+}
+
+/// One over/under line: the probability the total is over the line, and under it.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct TotalsLine {
+    pub line: f64,
+    pub over: f64,
+    pub under: f64,
+}
+
+/// The totals market: the expected total, the over/under ladder for the given lines, and the full
+/// total-goals distribution.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Totals {
+    pub expected: f64,
+    pub lines: Vec<TotalsLine>,
+    pub distribution: Vec<f64>,
+}
+
+/// The standard over/under lines a book quotes.
+pub const STANDARD_TOTALS: [f64; 5] = [0.5, 1.5, 2.5, 3.5, 4.5];
+
+/// Price the totals market over `lines` (goal lines are half-integers, so there is no push).
+pub fn totals(grid: &ScoreGrid, lines: &[f64]) -> Totals {
+    let dist = total_goals_distribution(grid);
+    let priced = lines
+        .iter()
+        .map(|&line| {
+            let over = dist
+                .iter()
+                .enumerate()
+                .filter(|(k, _)| *k as f64 > line)
+                .map(|(_, &p)| p)
+                .sum();
+            let under = dist
+                .iter()
+                .enumerate()
+                .filter(|(k, _)| (*k as f64) < line)
+                .map(|(_, &p)| p)
+                .sum();
+            TotalsLine { line, over, under }
+        })
+        .collect();
+    Totals {
+        expected: dist.iter().enumerate().map(|(k, &p)| k as f64 * p).sum(),
+        lines: priced,
+        distribution: dist,
+    }
 }
 
 /// P(home team scores exactly `h`) for each `h`, marginalizing over the away score.
@@ -53,6 +126,28 @@ mod tests {
 
     pub(crate) fn approx(a: f64, b: f64) {
         assert!((a - b).abs() < 1e-9, "{a} vs {b}");
+    }
+
+    #[test]
+    fn totals_ladder_and_distribution_are_exact() {
+        let g = grid(vec![vec![0.1, 0.2], vec![0.3, 0.4]]);
+        let dist = total_goals_distribution(&g);
+        approx(dist[0], 0.1); // 0-0
+        approx(dist[1], 0.5); // 0-1 and 1-0
+        approx(dist[2], 0.4); // 1-1
+        approx(expected_total_goals(&g), 1.3);
+
+        let t = totals(&g, &[0.5, 1.5, 2.5]);
+        approx(t.lines[0].over, 0.9);
+        approx(t.lines[0].under, 0.1);
+        approx(t.lines[1].over, 0.4);
+        approx(t.lines[1].under, 0.6);
+        approx(t.lines[2].over, 0.0);
+        approx(t.lines[2].under, 1.0);
+        // Over and under partition the mass on a half line.
+        for l in &t.lines {
+            approx(l.over + l.under, 1.0);
+        }
     }
 
     #[test]
