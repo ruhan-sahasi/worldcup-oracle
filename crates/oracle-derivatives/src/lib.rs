@@ -15,7 +15,7 @@
 //! many each side scores) and its total mass, the primitives the market modules are built from.
 #![forbid(unsafe_code)]
 
-use oracle_domain::ScoreGrid;
+use oracle_domain::{Probabilities, ScoreGrid};
 use serde::{Deserialize, Serialize};
 
 /// The width of the grid (goal counts `0..=max` modelled per side).
@@ -364,6 +364,34 @@ pub fn correct_score(grid: &ScoreGrid, n: usize) -> CorrectScore {
     CorrectScore { top, other }
 }
 
+/// The full derivative-markets board for a match, all priced off one score grid.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DerivativesBoard {
+    pub outcome: Probabilities,
+    pub totals: Totals,
+    pub goals: GoalMarkets,
+    pub double_chance: DoubleChance,
+    pub draw_no_bet: DrawNoBet,
+    pub margin: MarginDistribution,
+    pub handicap: Vec<HandicapLine>,
+    pub correct_score: CorrectScore,
+}
+
+/// Build the whole board from a score grid: the 1x2 outcome plus every derivative market, using the
+/// standard totals and handicap ladders and the top `correct_score_n` scorelines.
+pub fn board(grid: &ScoreGrid, correct_score_n: usize) -> DerivativesBoard {
+    DerivativesBoard {
+        outcome: grid.outcome_probabilities(),
+        totals: totals(grid, &STANDARD_TOTALS),
+        goals: goal_markets(grid),
+        double_chance: double_chance(grid),
+        draw_no_bet: draw_no_bet(grid),
+        margin: margin_distribution(grid),
+        handicap: handicap_ladder(grid, &STANDARD_HANDICAPS),
+        correct_score: correct_score(grid, correct_score_n),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -503,6 +531,38 @@ mod tests {
         approx(cs.top.iter().map(|s| s.prob).sum::<f64>() + cs.other, 1.0);
         // Ranked by probability.
         assert!(cs.top.windows(2).all(|w| w[0].prob >= w[1].prob));
+    }
+
+    #[test]
+    fn the_board_bundles_every_market_coherently() {
+        // A fuller grid via the domain's Poisson-ish builder keeps it realistic.
+        let g = ScoreGrid::from_fn(6, |h, a| {
+            let lh = 1.6f64;
+            let la = 1.1f64;
+            let pois = |lam: f64, k: usize| {
+                let mut p = (-lam).exp();
+                for i in 1..=k {
+                    p *= lam / i as f64;
+                }
+                p
+            };
+            pois(lh, h) * pois(la, a)
+        });
+        let b = board(&g, 6);
+        approx(
+            b.outcome.home_win + b.outcome.draw + b.outcome.away_win,
+            1.0,
+        );
+        assert_eq!(b.totals.lines.len(), STANDARD_TOTALS.len());
+        assert_eq!(b.handicap.len(), STANDARD_HANDICAPS.len());
+        approx(
+            b.correct_score.top.iter().map(|s| s.prob).sum::<f64>() + b.correct_score.other,
+            1.0,
+        );
+        // Home is the favourite here, so its clean sheet is likelier than the away side's.
+        assert!(b.goals.clean_sheet_home > b.goals.clean_sheet_away);
+        // Expected total is a sane number of goals.
+        assert!(b.totals.expected > 1.0 && b.totals.expected < 5.0);
     }
 
     #[test]
