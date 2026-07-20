@@ -17,6 +17,7 @@ oracle-ingest.workspace = true
 oracle-market.workspace = true
 oracle-players.workspace = true
 oracle-live.workspace = true
+oracle-derivatives.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
 arc-swap.workspace = true

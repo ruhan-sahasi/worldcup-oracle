@@ -9,6 +9,7 @@
 //! Everything is fit once in [`Explorer::new`] and then queried; the type is cheap to share
 //! (`Arc<Explorer>`) across request handlers.
 
+use oracle_derivatives::DerivativesBoard;
 use oracle_domain::{
     Confederation, MatchId, MatchStatus, Outcome, Probabilities, ScoreGrid, Scoreline, TeamId,
     Tournament,
@@ -309,6 +310,13 @@ impl Explorer {
             report,
             sample_path,
         }
+    }
+
+    /// The full derivative-markets board for a matchup (totals, Asian handicaps, correct score,
+    /// double chance, and the rest), priced exactly off the goal model's score grid.
+    pub fn derivatives(&self, home: TeamId, away: TeamId, neutral: bool) -> DerivativesBoard {
+        let grid = self.model.score_grid(home, away, neutral);
+        oracle_derivatives::board(&grid, 8)
     }
 
     /// Resolve a team by FIFA code, full name, or a name substring (case-insensitive).
@@ -1410,6 +1418,32 @@ mod tests {
         // Reproducible from the seed.
         let again = ex.inplay_backtest(bra, jpn, 3000, 42);
         assert!((view.report.mean_pnl - again.report.mean_pnl).abs() < 1e-9);
+    }
+
+    #[test]
+    fn derivatives_board_prices_the_full_market() {
+        let ex = Explorer::new();
+        let bra = ex.resolve("Brazil").unwrap();
+        let jpn = ex.resolve("Japan").unwrap();
+        let board = ex.derivatives(bra, jpn, true);
+
+        // Coherent 1x2, the standard ladders, and an exhaustive correct-score board.
+        assert!(
+            (board.outcome.home_win + board.outcome.draw + board.outcome.away_win - 1.0).abs()
+                < 1e-9
+        );
+        assert_eq!(
+            board.handicap.len(),
+            oracle_derivatives::STANDARD_HANDICAPS.len()
+        );
+        assert_eq!(
+            board.totals.lines.len(),
+            oracle_derivatives::STANDARD_TOTALS.len()
+        );
+        let cs =
+            board.correct_score.top.iter().map(|s| s.prob).sum::<f64>() + board.correct_score.other;
+        assert!((cs - 1.0).abs() < 1e-6);
+        assert!(board.totals.expected > 0.5);
     }
 
     #[test]

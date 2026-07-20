@@ -1245,6 +1245,7 @@ dependencies = [
  "anyhow",
  "arc-swap",
  "chrono",
+ "oracle-derivatives",
  "oracle-domain",
  "oracle-ingest",
  "oracle-live",
