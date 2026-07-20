@@ -249,6 +249,60 @@ pub fn prob_margin(grid: &ScoreGrid, d: i32) -> f64 {
     }
 }
 
+/// One Asian-handicap line, from the home side's perspective. `home_win` / `push` / `away_win` are
+/// the effective settlement fractions of a unit stake (a push refunds the stake), and the fair odds
+/// price each side accounting for the push refund.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct HandicapLine {
+    pub line: f64,
+    pub home_win: f64,
+    pub push: f64,
+    pub away_win: f64,
+    pub fair_home_odds: f64,
+    pub fair_away_odds: f64,
+}
+
+/// Settle a half/whole handicap line against the margin distribution: the adjusted margin is the
+/// real margin plus the home line, and it wins/pushes/loses as it is positive/zero/negative.
+fn settle_line(dist: &MarginDistribution, line: f64) -> (f64, f64, f64) {
+    let (mut win, mut push, mut lose) = (0.0, 0.0, 0.0);
+    for (i, &p) in dist.probs.iter().enumerate() {
+        let adjusted = (dist.min + i as i32) as f64 + line;
+        if adjusted > 1e-9 {
+            win += p;
+        } else if adjusted < -1e-9 {
+            lose += p;
+        } else {
+            push += p;
+        }
+    }
+    (win, push, lose)
+}
+
+/// Fair odds for a side that wins with probability `win` when a fraction `push` is refunded:
+/// `(1 - push) / win`, clamped to a sane range.
+fn fair_odds(win: f64, push: f64) -> f64 {
+    if win <= 1e-9 {
+        return 1000.0;
+    }
+    ((1.0 - push) / win).clamp(1.0, 1000.0)
+}
+
+/// Price a single **half or whole** Asian-handicap line (its double is an integer). Quarter lines
+/// are handled in the ladder, which splits them across the two adjacent lines.
+pub fn handicap_line(grid: &ScoreGrid, line: f64) -> HandicapLine {
+    let dist = margin_distribution(grid);
+    let (home_win, push, away_win) = settle_line(&dist, line);
+    HandicapLine {
+        line,
+        home_win,
+        push,
+        away_win,
+        fair_home_odds: fair_odds(home_win, push),
+        fair_away_odds: fair_odds(away_win, push),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -329,6 +383,31 @@ mod tests {
         approx(prob_margin(&g, 1), 0.3);
         approx(prob_margin(&g, -1), 0.2);
         approx(prob_margin(&g, 5), 0.0);
+    }
+
+    #[test]
+    fn whole_and_half_handicap_lines_settle_correctly() {
+        // margins: -1 -> 0.2, 0 -> 0.5, +1 -> 0.3.
+        let g = grid(vec![vec![0.1, 0.2], vec![0.3, 0.4]]);
+
+        // Level line (0.0): a level margin pushes.
+        let level = handicap_line(&g, 0.0);
+        approx(level.home_win, 0.3);
+        approx(level.push, 0.5);
+        approx(level.away_win, 0.2);
+        approx(level.fair_home_odds, 0.5 / 0.3); // (1 - push) / win
+
+        // Home -0.5: home must win outright.
+        let minus = handicap_line(&g, -0.5);
+        approx(minus.home_win, 0.3);
+        approx(minus.push, 0.0);
+        approx(minus.away_win, 0.7);
+
+        // Home +0.5: home wins or draws covers.
+        let plus = handicap_line(&g, 0.5);
+        approx(plus.home_win, 0.8);
+        approx(plus.push, 0.0);
+        approx(plus.away_win, 0.2);
     }
 
     #[test]
