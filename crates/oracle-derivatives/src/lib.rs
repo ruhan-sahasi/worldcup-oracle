@@ -199,6 +199,56 @@ pub fn draw_no_bet(grid: &ScoreGrid) -> DrawNoBet {
     }
 }
 
+/// The distribution over the winning margin `home - away`: `probs[i] = P(margin == min + i)`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MarginDistribution {
+    /// The most negative margin represented (a heavy away win).
+    pub min: i32,
+    pub probs: Vec<f64>,
+    pub expected: f64,
+}
+
+/// The winning-margin distribution summed off the grid.
+pub fn margin_distribution(grid: &ScoreGrid) -> MarginDistribution {
+    let (rows, cols) = (grid.grid.len(), width(grid));
+    if rows == 0 || cols == 0 {
+        return MarginDistribution {
+            min: 0,
+            probs: Vec::new(),
+            expected: 0.0,
+        };
+    }
+    let min = -((cols - 1) as i32);
+    let mut probs = vec![0.0; (rows - 1) + (cols - 1) + 1];
+    for (h, row) in grid.grid.iter().enumerate() {
+        for (a, &p) in row.iter().enumerate() {
+            let margin = h as i32 - a as i32;
+            probs[(margin - min) as usize] += p;
+        }
+    }
+    let expected = probs
+        .iter()
+        .enumerate()
+        .map(|(i, &p)| (min + i as i32) as f64 * p)
+        .sum();
+    MarginDistribution {
+        min,
+        probs,
+        expected,
+    }
+}
+
+/// P(the winning margin equals exactly `d`), where `d = home - away`.
+pub fn prob_margin(grid: &ScoreGrid, d: i32) -> f64 {
+    let dist = margin_distribution(grid);
+    let idx = d - dist.min;
+    if idx < 0 || idx as usize >= dist.probs.len() {
+        0.0
+    } else {
+        dist.probs[idx as usize]
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -264,6 +314,21 @@ mod tests {
         approx(dnb.home, 0.6); // 0.3 / (0.3 + 0.2)
         approx(dnb.away, 0.4);
         approx(dnb.home + dnb.away, 1.0);
+    }
+
+    #[test]
+    fn margin_distribution_is_exact() {
+        let g = grid(vec![vec![0.1, 0.2], vec![0.3, 0.4]]);
+        let m = margin_distribution(&g);
+        assert_eq!(m.min, -1);
+        approx(m.probs[0], 0.2); // margin -1 (0-1)
+        approx(m.probs[1], 0.5); // margin 0 (0-0, 1-1)
+        approx(m.probs[2], 0.3); // margin +1 (1-0)
+        approx(m.expected, 0.1); // -0.2 + 0 + 0.3
+        approx(prob_margin(&g, 0), 0.5);
+        approx(prob_margin(&g, 1), 0.3);
+        approx(prob_margin(&g, -1), 0.2);
+        approx(prob_margin(&g, 5), 0.0);
     }
 
     #[test]
