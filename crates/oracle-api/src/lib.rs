@@ -47,6 +47,7 @@
 //! | GET | `/api/scorers?home=&away=` | goalscorer market for a matchup (anytime, brace, hat-trick) |
 //! | GET | `/api/golden-boot?iters=&seed=` | Golden Boot race: each player's top-scorer odds |
 //! | GET | `/api/inplay?home=&away=` | in-play win-probability path + a live cash-out trading backtest |
+//! | GET | `/api/derivatives?home=&away=` | full derivative board: totals, Asian handicap, correct score, and more |
 //! | GET | `/metrics` | Prometheus metrics |
 //! | GET | `/live` | WebSocket: pushes a compact live view on every update |
 #![forbid(unsafe_code)]
@@ -62,6 +63,7 @@ use axum::{
     Router,
 };
 use futures_util::{SinkExt, StreamExt};
+use oracle_derivatives::DerivativesBoard;
 use oracle_domain::{MatchId, MatchStatus, Probabilities, Scoreline, Stage, TeamId};
 use oracle_engine::query::{
     BacktestReport, BtChampions, BtMatchup, CollisionForecast, Explanation, InPlayView,
@@ -160,6 +162,7 @@ pub fn router(engine: Arc<Engine>, explorer: ExplorerSlot) -> Router {
         .route("/api/scorers", get(api_scorers))
         .route("/api/golden-boot", get(api_golden_boot))
         .route("/api/inplay", get(api_inplay))
+        .route("/api/derivatives", get(api_derivatives))
         .route("/metrics", get(metrics))
         .route("/live", get(live_ws))
         .layer(TraceLayer::new_for_http())
@@ -243,7 +246,7 @@ async fn api_info(
             "/api/sensitivity?iters=&seed=",
             "/api/kingmaker?q=", "/api/collision?home=&away=", "/api/ratings",
             "/api/scorers?home=&away=", "/api/golden-boot?iters=&seed=",
-            "/api/inplay?home=&away=",
+            "/api/inplay?home=&away=", "/api/derivatives?home=&away=",
             "/metrics", "/live (websocket)"
         ],
     }))
@@ -476,6 +479,26 @@ async fn api_golden_boot(
         .await
         .map(Json)
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+}
+
+#[derive(Deserialize)]
+struct DerivativesParams {
+    home: String,
+    away: String,
+    neutral: Option<bool>,
+}
+
+/// The full derivative-markets board for a matchup (totals, Asian handicap, correct score, and the
+/// rest). Closed-form off the score grid, so it runs inline. 404 on an unknown team.
+async fn api_derivatives(
+    State(explorer): State<ExplorerSlot>,
+    Query(p): Query<DerivativesParams>,
+) -> Result<Json<DerivativesBoard>, StatusCode> {
+    let ex = ready(&explorer)?;
+    let (Some(home), Some(away)) = (ex.resolve(&p.home), ex.resolve(&p.away)) else {
+        return Err(StatusCode::NOT_FOUND);
+    };
+    Ok(Json(ex.derivatives(home, away, p.neutral.unwrap_or(true))))
 }
 
 #[derive(Deserialize)]
@@ -1528,6 +1551,16 @@ mod tests {
         assert!(inplay["back_odds"].is_number() && inplay["report"]["trades"].is_number());
         assert!(!inplay["sample_path"].as_array().unwrap().is_empty());
         let (status, _) = get(&state, "/api/inplay?home=Brazil&away=Atlantis").await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+
+        // Derivatives: a full board with a handicap ladder and a correct-score board.
+        let (status, body) = get(&state, "/api/derivatives?home=Brazil&away=Japan").await;
+        assert_eq!(status, StatusCode::OK);
+        let board = json(&body);
+        assert!(!board["handicap"].as_array().unwrap().is_empty());
+        assert!(board["totals"]["expected"].is_number());
+        assert!(!board["correct_score"]["top"].as_array().unwrap().is_empty());
+        let (status, _) = get(&state, "/api/derivatives?home=Brazil&away=Atlantis").await;
         assert_eq!(status, StatusCode::NOT_FOUND);
 
         // Sensitivity: nine signals, each a valid total-variation distance, ranked descending.
