@@ -634,6 +634,32 @@ impl GoalModel {
         self.defense.get(&t).copied().unwrap_or(0.0)
     }
 
+    /// Whether the fit produced coefficients for `team`. A team the fit never saw is treated as
+    /// league-average by [`Self::expected_goals`] (both coefficients default to 0), which
+    /// over-rates a genuine minnow - callers can detect that here and seed a rating instead.
+    pub fn contains_team(&self, team: TeamId) -> bool {
+        self.attack.contains_key(&team)
+    }
+
+    /// The `(attack, defense)` coefficients of the weakest fitted team: the lowest attack and the
+    /// lowest defense across the table (both reduce a side's edge). Used to give a plausible floor
+    /// rating to a real team the offline fit never saw, rather than the misleading average default.
+    pub fn weakest_coefficients(&self) -> (f64, f64) {
+        let min_atk = self.attack.values().copied().fold(f64::INFINITY, f64::min);
+        let min_def = self.defense.values().copied().fold(f64::INFINITY, f64::min);
+        (
+            if min_atk.is_finite() { min_atk } else { 0.0 },
+            if min_def.is_finite() { min_def } else { 0.0 },
+        )
+    }
+
+    /// Seed a team's attack/defense coefficients directly, overwriting any existing values. Used to
+    /// give a rating to a real team absent from the offline fit before a stage-conditioned forecast.
+    pub fn set_team_coefficients(&mut self, team: TeamId, attack: f64, defense: f64) {
+        self.attack.insert(team, attack);
+        self.defense.insert(team, defense);
+    }
+
     /// Online update from a single finished match: one gradient-ascent step on the two
     /// teams' attack/defense coefficients toward the observed score, at learning rate `lr`.
     ///

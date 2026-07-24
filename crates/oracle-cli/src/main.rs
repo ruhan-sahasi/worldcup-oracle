@@ -10,6 +10,7 @@
 //! wc-oracle scorers    # goalscorer market for a matchup (anytime / brace / hat-trick)
 //! wc-oracle golden-boot # top-scorer race across the tournament
 //! wc-oracle in-play    # in-play trading study (cash-out vs hold) for a matchup
+//! wc-oracle derivatives # totals, Asian handicap, correct score, and more for a matchup
 //! wc-oracle tune       # search goal-model hyperparameters by held-out log-loss
 //! wc-oracle serve      # run the REST + WebSocket server
 //! wc-oracle watch      # live terminal dashboard (TUI)
@@ -22,7 +23,7 @@ mod watch;
 use clap::{Parser, Subcommand};
 use oracle_domain::{Outcome, Probabilities, ScoreGrid, Team, TeamId};
 use oracle_engine::Explorer;
-use oracle_ingest::data;
+use oracle_ingest::{actual_2026, data};
 use oracle_market::BetPolicy;
 use oracle_model::{Ensemble, GoalModel, LiveConfig};
 use oracle_ratings::RatingStore;
@@ -55,6 +56,11 @@ enum Command {
         /// How many teams to show.
         #[arg(long, default_value_t = 24)]
         top: usize,
+        /// Condition on the REAL 2026 field still alive at a stage and forecast forward from it
+        /// (`round-of-16` | `quarter-final` | `semi-final` | `final`). Omit to simulate the whole
+        /// synthetic tournament from scratch.
+        #[arg(long)]
+        stage: Option<String>,
     },
     /// Predict a single matchup (pre-match ensemble + exact-score grid).
     Predict {
@@ -167,6 +173,15 @@ enum Command {
         #[arg(long, default_value_t = 42)]
         seed: u64,
     },
+    /// Derivative markets for a matchup: totals, Asian handicap, correct score, and the side markets.
+    Derivatives {
+        /// Home team (name or FIFA code).
+        #[arg(long)]
+        home: String,
+        /// Away team (name or FIFA code).
+        #[arg(long)]
+        away: String,
+    },
     /// Run the REST + WebSocket server.
     Serve {
         /// Listen address.
@@ -201,7 +216,12 @@ enum Command {
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     match cli.command {
-        Command::Simulate { iters, seed, top } => cmd_simulate(iters, seed, top),
+        Command::Simulate {
+            iters,
+            seed,
+            top,
+            stage,
+        } => cmd_simulate(iters, seed, top, stage),
         Command::Predict {
             home,
             away,
@@ -241,6 +261,7 @@ async fn main() -> anyhow::Result<()> {
             iters,
             seed,
         } => cmd_inplay(&home, &away, iters, seed),
+        Command::Derivatives { home, away } => cmd_derivatives(&home, &away),
         Command::Serve { addr, event_log } => cmd_serve(addr, event_log).await,
         Command::Watch { speed } => watch::run(speed).await,
         Command::Sensitivity { iters, seed, top } => cmd_sensitivity(iters, seed, top),
@@ -374,6 +395,61 @@ fn cmd_golden_boot(iters: u32, seed: u64, top: usize) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn cmd_derivatives(home: &str, away: &str) -> anyhow::Result<()> {
+    let explorer = Explorer::new();
+    let h = explorer
+        .resolve(home)
+        .ok_or_else(|| anyhow::anyhow!("unknown team: {home}"))?;
+    let a = explorer
+        .resolve(away)
+        .ok_or_else(|| anyhow::anyhow!("unknown team: {away}"))?;
+    let b = explorer.derivatives(h, a, true);
+    let o = &b.outcome;
+    println!("Derivative markets: {home} v {away}\n");
+    println!(
+        "  1X2:  {:.1}% / {:.1}% / {:.1}%    expected goals {:.2}",
+        o.home_win * 100.0,
+        o.draw * 100.0,
+        o.away_win * 100.0,
+        b.totals.expected
+    );
+    println!("\n  Totals:");
+    for l in &b.totals.lines {
+        println!(
+            "    {:.1}   over {:>5.1}%   under {:>5.1}%",
+            l.line,
+            l.over * 100.0,
+            l.under * 100.0
+        );
+    }
+    println!("\n  Asian handicap (home line):");
+    for hc in &b.handicap {
+        println!(
+            "    {:+.2}   home {:>5.1}%  push {:>5.1}%  away {:>5.1}%   fair {:.2} / {:.2}",
+            hc.line,
+            hc.home_win * 100.0,
+            hc.push * 100.0,
+            hc.away_win * 100.0,
+            hc.fair_home_odds,
+            hc.fair_away_odds
+        );
+    }
+    println!("\n  Correct score:");
+    for s in &b.correct_score.top {
+        println!("    {}-{}   {:>5.1}%", s.home, s.away, s.prob * 100.0);
+    }
+    println!("    any other   {:>5.1}%", b.correct_score.other * 100.0);
+    println!(
+        "\n  BTTS {:.0}%   clean sheet H/A {:.0}%/{:.0}%   draw-no-bet H/A {:.0}%/{:.0}%",
+        b.goals.btts_yes * 100.0,
+        b.goals.clean_sheet_home * 100.0,
+        b.goals.clean_sheet_away * 100.0,
+        b.draw_no_bet.home * 100.0,
+        b.draw_no_bet.away * 100.0
+    );
+    Ok(())
+}
+
 fn cmd_inplay(home: &str, away: &str, iters: u32, seed: u64) -> anyhow::Result<()> {
     println!("Fitting the model, then simulating in-play trading (seed {seed})...\n");
     let explorer = Explorer::new();
@@ -404,7 +480,10 @@ fn cmd_inplay(home: &str, away: &str, iters: u32, seed: u64) -> anyhow::Result<(
     Ok(())
 }
 
-fn cmd_simulate(iters: u64, seed: u64, top: usize) -> anyhow::Result<()> {
+fn cmd_simulate(iters: u64, seed: u64, top: usize, stage: Option<String>) -> anyhow::Result<()> {
+    if let Some(slug) = stage {
+        return cmd_simulate_stage(&slug, iters, seed, top);
+    }
     let tournament = data::world_cup_2026();
     let model = data::fit_baseline_model(seed);
     let names: std::collections::HashMap<_, _> = tournament
@@ -465,6 +544,106 @@ fn cmd_simulate(iters: u64, seed: u64, top: usize) -> anyhow::Result<()> {
     println!(
         "\n{} simulations in {:.2}s  ({:.0} tournaments/sec); ±MC err is the Monte-Carlo \
          standard error on the champion probability",
+        iters,
+        elapsed.as_secs_f64(),
+        iters as f64 / elapsed.as_secs_f64().max(1e-9),
+    );
+    Ok(())
+}
+
+/// `simulate --stage <round>`: take the REAL 2026 teams still alive at a knockout stage and
+/// simulate the remaining bracket forward over just that field. The real result is printed
+/// underneath so the model's pick can be compared with what actually happened.
+fn cmd_simulate_stage(slug: &str, iters: u64, seed: u64, top: usize) -> anyhow::Result<()> {
+    let stage = actual_2026::parse_stage(slug).ok_or_else(|| {
+        anyhow::anyhow!(
+            "unknown stage '{slug}' (use round-of-16 | quarter-final | semi-final | final)"
+        )
+    })?;
+    let tournament = actual_2026::stage_tournament(stage).ok_or_else(|| {
+        anyhow::anyhow!(
+            "stage '{slug}' is not covered by the real dataset (Round of 16 onward only)"
+        )
+    })?;
+
+    // Real teams the offline fit never saw (e.g. Cape Verde) get a weak floor rating.
+    let mut model = data::fit_baseline_model(seed);
+    let (weak_atk, weak_def) = model.weakest_coefficients();
+    for t in &tournament.teams {
+        if !model.contains_team(t.id) {
+            model.set_team_coefficients(t.id, weak_atk, weak_def);
+        }
+    }
+    let names: std::collections::HashMap<_, _> = tournament
+        .teams
+        .iter()
+        .map(|t| (t.id, t.name.clone()))
+        .collect();
+
+    println!(
+        "Real 2026 field still alive at the {stage} ({} teams) - simulating {} tournaments (seed {})...\n",
+        tournament.teams.len(),
+        iters,
+        seed
+    );
+    let inputs = LiveInputs {
+        shootout_rating: data::shootout_ratings(),
+        knockout_pedigree: data::knockout_pedigree(),
+        ..Default::default()
+    };
+    let start = Instant::now();
+    let forecast = simulate_with_live(
+        &tournament,
+        &model,
+        SimConfig {
+            iterations: iters,
+            seed,
+            ..SimConfig::default()
+        },
+        &inputs,
+        LiveConfig::default(),
+    );
+    let elapsed = start.elapsed();
+    let n = forecast.iterations.max(1) as f64;
+    let stderr = |p: f64| (p * (1.0 - p) / n).sqrt();
+
+    println!(
+        "{:>3}  {:<16} {:>15} {:>12}",
+        "#", "Team", "Champ (±MC err)", "Reach final"
+    );
+    println!("{}", "-".repeat(52));
+    for (i, t) in forecast.ranked().into_iter().take(top).enumerate() {
+        let name = names.get(&t.team).cloned().unwrap_or_default();
+        println!(
+            "{:>3}  {:<16} {:>6.1}% ±{:>4.1}% {:>11.1}%",
+            i + 1,
+            name,
+            t.p_champion * 100.0,
+            stderr(t.p_champion) * 100.0,
+            t.p_final * 100.0,
+        );
+    }
+
+    let o = actual_2026::actual_outcome();
+    let full = |code: &str| {
+        actual_2026::resolve_code(code)
+            .map(|t| t.name)
+            .unwrap_or_else(|| code.to_string())
+    };
+    let fav = forecast
+        .ranked()
+        .first()
+        .and_then(|t| names.get(&t.team).cloned())
+        .unwrap_or_default();
+    println!(
+        "\nModel's pick: {fav}.  Actual 2026: {} won the final over {}; {} beat {} for third.",
+        full(o.champion),
+        full(o.runner_up),
+        full(o.third),
+        full(o.fourth)
+    );
+    println!(
+        "{} simulations in {:.2}s ({:.0} tournaments/sec)",
         iters,
         elapsed.as_secs_f64(),
         iters as f64 / elapsed.as_secs_f64().max(1e-9),

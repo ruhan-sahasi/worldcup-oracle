@@ -1187,6 +1187,7 @@ dependencies = [
  "anyhow",
  "axum",
  "futures-util",
+ "oracle-derivatives",
  "oracle-domain",
  "oracle-engine",
  "oracle-market",

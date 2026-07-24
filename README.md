@@ -32,15 +32,19 @@ fully offline with **zero keys and zero network**.
 - **Champion odds** -> a parallel Monte-Carlo simulator plays the rest of the
   tournament tens of thousands of times to estimate each team's chance of advancing,
   reaching each round, and winning it all.
+- **Stage-conditioned forecast** -> pick a round of the *real* 2026 tournament (Round of 16 to
+  Final) and the engine forecasts forward over only the teams that were still alive at that round,
+  then shows the real result so you can compare the model's pick with what happened.
 - **Live, event-driven** -> an async engine consumes a stream of match events and
   pushes fresh forecasts to subscribers in real time.
 - **Three pluggable data sources** behind one trait -> deterministic simulation,
   replay of a finished tournament, or the live [football-data.org](https://www.football-data.org) feed.
 - **Lineup aware** -> a confirmed starting XI adjusts a team's effective attack and
   defense, so resting or losing a key player visibly moves that team's odds.
-- **Multiple surfaces** -> a REST API, a WebSocket live stream, a live web dashboard, an
-  interactive model explorer, a polished CLI/TUI, and **fan pages**: a personal `/team` hub, a
-  shareable prediction `/card`, an upset radar, and a live-match win-probability "drama graph".
+- **Multiple surfaces** -> a REST API, a WebSocket live stream, a **winner-predictor landing page**
+  (pick a stage, see who the model makes champion), a live web dashboard, an interactive model
+  explorer, a polished CLI/TUI, and **fan pages**: a personal `/team` hub, a shareable prediction
+  `/card`, an upset radar, and a live-match win-probability "drama graph".
 
 ## 🧠 The model (in one breath)
 
@@ -66,6 +70,7 @@ fully offline with **zero keys and zero network**.
 | **Market backtest** (`oracle-market`) - **de-vigging** (multiplicative + **Shin**), **edge/EV**, **Kelly staking**, and a compounding **paper-trading bankroll** simulator, run out-of-sample against a synthetic book | the honest quant question: after the vig, does the model beat the price? The truthful answer here is no, and the backtest shows why |
 | **Goalscorer markets + Golden Boot** (`oracle-players`) - a team's expected goals shared across its squad by attacking weight, giving **anytime / brace / hat-trick** and **first-scorer** markets per match, and a Monte-Carlo **top-scorer race** over the tournament | the player-level layer: who scores the goals, not just who wins the match |
 | **In-play trading** (`oracle-live`) - a minute-by-minute **live win-probability** model, exchange **hedging / cash-out** math, and a trading backtest of a live position against a hold baseline | the time dimension: what the odds do during a match, and whether trading them beats holding (it does not, at fair odds, and the backtest shows why) |
+| **Derivative markets** (`oracle-derivatives`) - **totals** ladders, **Asian handicaps** (quarter-line splits + push refunds), **correct score**, double chance, draw-no-bet, clean sheets, all **closed-form** off the score grid | the full board a book quotes, priced exactly from the model's joint scoreline distribution, no Monte-Carlo |
 | **Bayesian live updater** with **score effects** | conditions on score, minute, and red cards; a trailing team chases and a leading team defends |
 | **Lineup adjustment** | a confirmed XI shifts each team's attack and defense |
 | **Suspension tracking** | yellow-card accumulation drops a suspended starter from the next match before its lineup is known |
@@ -123,6 +128,8 @@ cargo build --release
 
 # 2. Champion odds for the 2026 World Cup (reproducible with --seed):
 cargo run --release -p oracle-cli -- simulate --iters 50000
+# ...or condition on the REAL 2026 field still alive at a stage and forecast forward from it:
+cargo run --release -p oracle-cli -- simulate --stage quarter-final   # or round-of-16 | semi-final | final
 ```
 
 ```text
@@ -133,6 +140,10 @@ cargo run --release -p oracle-cli -- simulate --iters 50000
   3  Spain               6.7% ± 0.2%    11.3%    18.8%    31.7%    52.4%
   ...
 (host advantage, altitude, and rest folded in; ±MC err is the Monte-Carlo standard error)
+
+# --stage takes the real teams that survived to that round and simulates the rest:
+#   Real 2026 field still alive at the Quarter-final (8 teams) ...
+#     1  Argentina  26.2% ± 0.3% ...   Model's pick: Argentina.  Actual 2026: Spain won the final ...
 ```
 
 ```bash
@@ -172,6 +183,9 @@ cargo run --release -p oracle-cli -- golden-boot
 
 # 8. In-play trading: cash out a live position, or hold? (Spoiler at fair odds: it is a wash.)
 cargo run --release -p oracle-cli -- in-play --home Brazil --away Japan
+
+# 9. The full derivative board for a matchup: totals, Asian handicap, correct score.
+cargo run --release -p oracle-cli -- derivatives --home Brazil --away Japan
 ```
 
 ```text
@@ -271,17 +285,21 @@ little is reported as such rather than asserted to matter.
 cargo run --release -p oracle-cli -- serve         # or: cargo run -p oracle-api --bin oracle-server
 # record every event to a durable log and recover from it on restart:
 cargo run --release -p oracle-cli -- serve --event-log oracle.jsonl
-# open the live dashboard, or the interactive model explorer:
-open http://localhost:8080/
+# open the winner predictor (landing page), the live dashboard, or the model explorer:
+open http://localhost:8080/            # pick a stage → who wins?
+open http://localhost:8080/dashboard
 open http://localhost:8080/explore
 # or hit the API directly:
 curl localhost:8080/predict/tournament | jq '.teams[:5]'
 curl 'localhost:8080/api/predict?home=Brazil&away=Morocco' | jq '.ensemble'
 curl 'localhost:8080/api/posterior?home=Brazil&away=Morocco' | jq      # HMC credible intervals
 curl 'localhost:8080/api/simulate?iters=20000&seed=42' | jq '.teams[:5]'
+curl 'localhost:8080/api/stage?stage=quarter-final' | jq '.teams[:3]'  # real field still alive
 ```
 
-Visiting `/` serves a self-contained dashboard (no build step, no CDN) that subscribes to
+Visiting `/` serves a self-contained **winner predictor** (no build step, no CDN): pick a stage of the
+real 2026 tournament and it forecasts forward over the teams still alive, then reveals what actually
+happened. `/dashboard` serves the live dashboard that subscribes to
 the `/live` WebSocket and renders live match win bars, a championship-odds leaderboard, a
 probability-over-time chart, a feed-health indicator, and a **self-recalibration** readout (the
 live forecast temperature, context-effect gain, and results folded in, so you can watch the model
@@ -300,7 +318,8 @@ team and confederation ratings. The current matchup lives in the URL, so any pre
 
 | Method | Path | Description |
 |--------|------|-------------|
-| `GET` | `/` | **live web dashboard** (with the upset radar + live drama graphs) |
+| `GET` | `/` | **winner predictor**: pick a stage, forecast over the teams still alive, reveal the real result |
+| `GET` | `/dashboard` | **live web dashboard** (with the upset radar + live drama graphs) |
 | `GET` | `/explore` | **interactive model explorer** |
 | `GET` | `/team` | **fan "your team" hub** (page) |
 | `GET` | `/card` | **shareable prediction card** (team or matchup) |
@@ -319,10 +338,12 @@ team and confederation ratings. The current matchup lives in the URL, so any pre
 | `GET` | `/bt/champions` | second model's **live** champion odds over the current bracket, conditioning on ties already decided |
 | `GET` | `/consensus` | **consensus** title forecast blending both models + their live **divergence** (Jensen-Shannon) |
 | `GET` | `/api/simulate?iters=&seed=` | custom Monte-Carlo champion-odds run |
+| `GET` | `/api/stage?stage=&iters=&seed=` | **stage-conditioned** forecast over the real 2026 field still alive (R16→Final) |
 | `GET` | `/api/backtest?seed=&matches=` | **paper-trade** the model vs a synthetic book: bankroll, ROI, yield, and a model-vs-market skill check |
 | `GET` | `/api/scorers?home=&away=` | **goalscorer market**: anytime, brace, hat-trick per player |
 | `GET` | `/api/golden-boot?iters=&seed=` | **Golden Boot** race: each player's top-scorer odds |
 | `GET` | `/api/inplay?home=&away=` | **in-play** win-probability path + a live cash-out trading backtest |
+| `GET` | `/api/derivatives?home=&away=` | full **derivative board**: totals, Asian handicap, correct score, and more |
 | `GET` | `/api/sensitivity?iters=&seed=` | per-signal ablation: how much each signal moves the title |
 | `GET` | `/api/ratings` | team ratings + confederation strength levels |
 | `GET` | `/metrics` | Prometheus metrics |

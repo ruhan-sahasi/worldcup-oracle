@@ -11,10 +11,13 @@
 //! | [`FootballDataProvider`] | live football-data.org API | yes | yes |
 //!
 //! Supporting infrastructure: a token-bucket [`rate_limit::RateLimiter`] and a
-//! [`cache::TtlCache`] (the back-pressure + caching around the live API), and the
-//! embedded [`data`] module (the offline 2026 tournament + synthetic training data).
+//! [`cache::TtlCache`] (the back-pressure + caching around the live API), the
+//! embedded [`data`] module (the offline 2026 tournament + synthetic training data),
+//! and the [`actual_2026`] module (the *real* 2026 knockout results, R16 onward,
+//! for the stage-conditioned forecast).
 #![forbid(unsafe_code)]
 
+pub mod actual_2026;
 pub mod cache;
 pub mod data;
 pub mod error;

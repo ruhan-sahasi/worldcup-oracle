@@ -9,7 +9,8 @@
 //! ## Endpoints
 //! | Method | Path | Purpose |
 //! |--------|------|---------|
-//! | GET | `/` | live tournament dashboard |
+//! | GET | `/` | winner predictor: pick a stage, forecast over the teams still alive |
+//! | GET | `/dashboard` | live tournament dashboard |
 //! | GET | `/explore` | interactive model explorer |
 //! | GET | `/team` | fan "your team" hub (page) |
 //! | GET | `/card` | shareable prediction card (team or matchup) |
@@ -39,6 +40,7 @@
 //! | GET | `/api/bt/champions` | second model's champion odds (bracket DP) |
 //! | GET | `/api/posterior?home=&away=` | HMC posterior credible intervals for a matchup |
 //! | GET | `/api/simulate?iters=&seed=` | custom Monte-Carlo champion-odds run |
+//! | GET | `/api/stage?stage=&iters=&seed=` | forecast over the real 2026 field still alive at a stage |
 //! | GET | `/api/backtest?seed=&matches=` | paper-trade the model against a synthetic book (bankroll, ROI, skill) |
 //! | GET | `/api/sensitivity?iters=&seed=` | per-signal ablation: how much each signal moves the title |
 //! | GET | `/api/kingmaker?q=` | rooting interest: which group results swing a team's title odds |
@@ -47,6 +49,7 @@
 //! | GET | `/api/scorers?home=&away=` | goalscorer market for a matchup (anytime, brace, hat-trick) |
 //! | GET | `/api/golden-boot?iters=&seed=` | Golden Boot race: each player's top-scorer odds |
 //! | GET | `/api/inplay?home=&away=` | in-play win-probability path + a live cash-out trading backtest |
+//! | GET | `/api/derivatives?home=&away=` | full derivative board: totals, Asian handicap, correct score, and more |
 //! | GET | `/metrics` | Prometheus metrics |
 //! | GET | `/live` | WebSocket: pushes a compact live view on every update |
 #![forbid(unsafe_code)]
@@ -62,11 +65,12 @@ use axum::{
     Router,
 };
 use futures_util::{SinkExt, StreamExt};
+use oracle_derivatives::DerivativesBoard;
 use oracle_domain::{MatchId, MatchStatus, Probabilities, Scoreline, Stage, TeamId};
 use oracle_engine::query::{
     BacktestReport, BtChampions, BtMatchup, CollisionForecast, Explanation, InPlayView,
     KingmakerReport, MatchupForecast, PosteriorForecast, RatingsView, SensitivityForecast,
-    SimForecast,
+    SimForecast, StageForecast,
 };
 use oracle_engine::{AdaptiveState, Engine, Explorer, ReportCard, Snapshot, Upset, WinProbSample};
 use oracle_market::BetPolicy;
@@ -120,7 +124,8 @@ pub fn spawn_explorer() -> ExplorerSlot {
 /// `/explore` page and `/api/*` query endpoints from the `Explorer`.
 pub fn router(engine: Arc<Engine>, explorer: ExplorerSlot) -> Router {
     Router::new()
-        .route("/", get(dashboard))
+        .route("/", get(landing))
+        .route("/dashboard", get(dashboard))
         .route("/explore", get(explorer_page))
         .route("/team", get(team_page))
         .route("/card", get(card_page))
@@ -152,6 +157,7 @@ pub fn router(engine: Arc<Engine>, explorer: ExplorerSlot) -> Router {
         .route("/api/bt/champions", get(api_bt_champions))
         .route("/api/posterior", get(api_posterior))
         .route("/api/simulate", get(api_simulate))
+        .route("/api/stage", get(api_stage))
         .route("/api/backtest", get(api_backtest))
         .route("/api/sensitivity", get(api_sensitivity))
         .route("/api/kingmaker", get(api_kingmaker))
@@ -160,6 +166,7 @@ pub fn router(engine: Arc<Engine>, explorer: ExplorerSlot) -> Router {
         .route("/api/scorers", get(api_scorers))
         .route("/api/golden-boot", get(api_golden_boot))
         .route("/api/inplay", get(api_inplay))
+        .route("/api/derivatives", get(api_derivatives))
         .route("/metrics", get(metrics))
         .route("/live", get(live_ws))
         .layer(TraceLayer::new_for_http())
@@ -207,7 +214,14 @@ async fn health() -> &'static str {
     "ok"
 }
 
-/// The live dashboard, a self-contained page that consumes the `/live` WebSocket.
+/// The landing page (served at `/`): a self-contained "who wins the World Cup?" predictor with a
+/// stage selector, backed by `/api/stage`.
+async fn landing() -> Html<&'static str> {
+    Html(include_str!("../static/landing.html"))
+}
+
+/// The live dashboard (served at `/dashboard`), a self-contained page that consumes the `/live`
+/// WebSocket.
 async fn dashboard() -> Html<&'static str> {
     Html(include_str!("../static/index.html"))
 }
@@ -232,18 +246,20 @@ async fn api_info(
             "context_gain": snap.adaptive.context_gain,
         },
         "endpoints": [
-            "/ (live dashboard)", "/explore (model explorer)", "/team (fan team hub)",
+            "/ (winner predictor + stage selector)", "/dashboard (live dashboard)",
+            "/explore (model explorer)", "/team (fan team hub)",
             "/card (shareable prediction card)", "/health", "/teams", "/matches",
             "/predict/match/{id}", "/predict/tournament", "/upsets", "/report", "/bt/champions",
             "/consensus", "/calibration", "/power", "/form", "/road", "/bracket", "/leverage",
             "/openness", "/history", "/momentum", "/lead-changes", "/api/team?q=",
             "/api/predict?home=&away=", "/api/explain?home=&away=", "/api/posterior?home=&away=",
             "/api/bt?home=&away=", "/api/bt/champions",
-            "/api/simulate?iters=&seed=", "/api/backtest?seed=&matches=",
+            "/api/simulate?iters=&seed=", "/api/stage?stage=&iters=&seed=",
+            "/api/backtest?seed=&matches=",
             "/api/sensitivity?iters=&seed=",
             "/api/kingmaker?q=", "/api/collision?home=&away=", "/api/ratings",
             "/api/scorers?home=&away=", "/api/golden-boot?iters=&seed=",
-            "/api/inplay?home=&away=",
+            "/api/inplay?home=&away=", "/api/derivatives?home=&away=",
             "/metrics", "/live (websocket)"
         ],
     }))
@@ -382,6 +398,38 @@ async fn api_simulate(
 }
 
 #[derive(Deserialize)]
+struct StageParams {
+    stage: String,
+    iters: Option<u64>,
+    seed: Option<u64>,
+}
+
+/// Stage-conditioned forecast: championship odds over the **real** 2026 field still alive at the
+/// chosen stage (`stage=round-of-16|quarter-final|semi-final|final`). 404 for a stage the verified
+/// dataset does not cover; 503 while the model is still warming up.
+async fn api_stage(
+    State(explorer): State<ExplorerSlot>,
+    Query(p): Query<StageParams>,
+) -> Result<Json<StageForecast>, StatusCode> {
+    if explorer.get().is_none() {
+        return Err(StatusCode::SERVICE_UNAVAILABLE);
+    }
+    let iters = p.iters.unwrap_or(20_000);
+    let seed = p.seed.unwrap_or(42);
+    let stage = p.stage;
+    tokio::task::spawn_blocking(move || {
+        explorer
+            .get()
+            .unwrap()
+            .stage_forecast_by_slug(&stage, iters, seed)
+    })
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+    .map(Json)
+    .ok_or(StatusCode::NOT_FOUND)
+}
+
+#[derive(Deserialize)]
 struct BacktestParams {
     seed: Option<u64>,
     matches: Option<usize>,
@@ -476,6 +524,26 @@ async fn api_golden_boot(
         .await
         .map(Json)
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+}
+
+#[derive(Deserialize)]
+struct DerivativesParams {
+    home: String,
+    away: String,
+    neutral: Option<bool>,
+}
+
+/// The full derivative-markets board for a matchup (totals, Asian handicap, correct score, and the
+/// rest). Closed-form off the score grid, so it runs inline. 404 on an unknown team.
+async fn api_derivatives(
+    State(explorer): State<ExplorerSlot>,
+    Query(p): Query<DerivativesParams>,
+) -> Result<Json<DerivativesBoard>, StatusCode> {
+    let ex = ready(&explorer)?;
+    let (Some(home), Some(away)) = (ex.resolve(&p.home), ex.resolve(&p.away)) else {
+        return Err(StatusCode::NOT_FOUND);
+    };
+    Ok(Json(ex.derivatives(home, away, p.neutral.unwrap_or(true))))
 }
 
 #[derive(Deserialize)]
@@ -1392,13 +1460,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unknown_match_is_404_and_dashboard_is_served() {
+    async fn unknown_match_is_404_and_pages_are_served() {
         let (state, cancel) = test_state().await;
 
         let (status, _) = get(&state, "/predict/match/999999").await;
         assert_eq!(status, StatusCode::NOT_FOUND);
 
+        // `/` now serves the winner-predictor landing page; the live dashboard moved to /dashboard.
         let (status, body) = get(&state, "/").await;
+        assert_eq!(status, StatusCode::OK);
+        let home = String::from_utf8_lossy(&body);
+        assert!(home.contains("<title>") && home.contains("/api/stage"));
+
+        let (status, body) = get(&state, "/dashboard").await;
         assert_eq!(status, StatusCode::OK);
         assert!(String::from_utf8_lossy(&body).contains("<title>"));
 
@@ -1426,6 +1500,7 @@ mod tests {
             "/api/ratings",
             "/api/predict?home=Brazil&away=Japan",
             "/api/simulate?iters=2000",
+            "/api/stage?stage=quarter-final&iters=2000",
             "/api/sensitivity?iters=2000",
         ] {
             let (status, _) = get(&state, uri).await;
@@ -1493,6 +1568,28 @@ mod tests {
             .sum();
         assert!((mass - 1.0).abs() < 0.05, "champion mass ~1: {mass}");
 
+        // Stage-conditioned forecast: the real quarter-final field (8 teams), title odds ~1,
+        // real matchups + actual outcome attached; an uncovered stage is a 404.
+        let (status, body) = get(&state, "/api/stage?stage=quarter-final&iters=2000").await;
+        assert_eq!(status, StatusCode::OK);
+        let sf = json(&body);
+        assert_eq!(sf["stage"], "quarter-final");
+        assert_eq!(sf["teams"].as_array().unwrap().len(), 8);
+        assert_eq!(sf["matchups"].as_array().unwrap().len(), 4);
+        assert_eq!(sf["actual"]["champion"], "Spain");
+        let stage_mass: f64 = sf["teams"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["p_champion"].as_f64().unwrap())
+            .sum();
+        assert!(
+            (stage_mass - 1.0).abs() < 1e-6,
+            "stage champion mass ~1: {stage_mass}"
+        );
+        let (status, _) = get(&state, "/api/stage?stage=group").await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+
         // Backtest: a settled bankroll run plus a model-vs-market skill comparison.
         let (status, body) = get(&state, "/api/backtest?seed=101&matches=300").await;
         assert_eq!(status, StatusCode::OK);
@@ -1528,6 +1625,16 @@ mod tests {
         assert!(inplay["back_odds"].is_number() && inplay["report"]["trades"].is_number());
         assert!(!inplay["sample_path"].as_array().unwrap().is_empty());
         let (status, _) = get(&state, "/api/inplay?home=Brazil&away=Atlantis").await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+
+        // Derivatives: a full board with a handicap ladder and a correct-score board.
+        let (status, body) = get(&state, "/api/derivatives?home=Brazil&away=Japan").await;
+        assert_eq!(status, StatusCode::OK);
+        let board = json(&body);
+        assert!(!board["handicap"].as_array().unwrap().is_empty());
+        assert!(board["totals"]["expected"].is_number());
+        assert!(!board["correct_score"]["top"].as_array().unwrap().is_empty());
+        let (status, _) = get(&state, "/api/derivatives?home=Brazil&away=Atlantis").await;
         assert_eq!(status, StatusCode::NOT_FOUND);
 
         // Sensitivity: nine signals, each a valid total-variation distance, ranked descending.
