@@ -11,9 +11,10 @@
 
 use oracle_derivatives::DerivativesBoard;
 use oracle_domain::{
-    Confederation, MatchId, MatchStatus, Outcome, Probabilities, ScoreGrid, Scoreline, TeamId,
-    Tournament,
+    Confederation, MatchId, MatchStatus, Outcome, Probabilities, ScoreGrid, Scoreline, Stage,
+    TeamForecast, TeamId, Tournament,
 };
+use oracle_ingest::actual_2026;
 use oracle_ingest::data::{self, Position, SignalMask, VenueAdj};
 use oracle_live::{self, InPlayConfig, InPlayReport, MatchState, PathPoint, Rng};
 use oracle_market::{
@@ -559,6 +560,128 @@ impl Explorer {
             seed,
             teams,
         }
+    }
+
+    /// A **stage-conditioned** forecast: take the *real* 2026 teams still alive at `stage` (from
+    /// [`oracle_ingest::actual_2026`]) and run the full Monte-Carlo forward over just that field,
+    /// reporting each survivor's odds to reach each remaining round and to lift the trophy. This is
+    /// the engine behind the landing page's stage selector ("who wins from the quarter-finals?").
+    ///
+    /// The real field is fed to the simulator as a fresh knockout bracket, so no earlier result is
+    /// re-simulated - the forecast is a clean forward run over the teams that actually survived.
+    /// Returns `None` for a stage the verified dataset does not cover (group stage, Round of 32).
+    pub fn stage_forecast(&self, stage: Stage, iters: u64, seed: u64) -> Option<StageForecast> {
+        let tournament = actual_2026::stage_tournament(stage)?;
+        let results = actual_2026::stage_results(stage)?;
+        let iters = iters.clamp(1000, SIM_MAX_ITERS);
+
+        // Give any real team the offline fit never saw (e.g. Cape Verde) a weak floor rating, so it
+        // is not silently treated as league-average.
+        let mut model = self.model.clone();
+        let (weak_atk, weak_def) = model.weakest_coefficients();
+        for team in &tournament.teams {
+            if !model.contains_team(team.id) {
+                model.set_team_coefficients(team.id, weak_atk, weak_def);
+            }
+        }
+
+        // Knockout-relevant context (shootout skill, knockout pedigree); venue/travel is a
+        // group-stage notion and is left neutral for these hypothetical forward runs.
+        let inputs = LiveInputs {
+            shootout_rating: self.shootout_rating.clone(),
+            knockout_pedigree: self.knockout_pedigree.clone(),
+            ..Default::default()
+        };
+        let forecast = simulate_with_live(
+            &tournament,
+            &model,
+            SimConfig {
+                iterations: iters,
+                seed,
+                ..SimConfig::default()
+            },
+            &inputs,
+            LiveConfig::default(),
+        );
+        let n = forecast.iterations.max(1) as f64;
+
+        let name_in = |id: TeamId| -> String {
+            tournament
+                .teams
+                .iter()
+                .find(|t| t.id == id)
+                .map(|t| t.name.clone())
+                .unwrap_or_else(|| id.to_string())
+        };
+        let code_in = |id: TeamId| -> String {
+            tournament
+                .teams
+                .iter()
+                .find(|t| t.id == id)
+                .map(|t| t.code.clone())
+                .unwrap_or_default()
+        };
+        // Full names from FIFA codes, resolvable even for teams not in this stage's field
+        // (e.g. the fourth-placed team when the selected stage is the Final).
+        let name_of = |code: &str| -> String {
+            actual_2026::resolve_code(code)
+                .map(|t| t.name)
+                .unwrap_or_else(|| code.to_string())
+        };
+
+        let teams: Vec<StageTeam> = forecast
+            .ranked()
+            .iter()
+            .map(|tf| StageTeam {
+                team: name_in(tf.team),
+                code: code_in(tf.team),
+                p_champion: tf.p_champion,
+                champion_stderr: (tf.p_champion * (1.0 - tf.p_champion) / n).sqrt(),
+                path: downstream_path(stage, tf),
+            })
+            .collect();
+
+        let matchups: Vec<StageMatchup> = results
+            .iter()
+            .map(|r| StageMatchup {
+                home: name_of(r.home),
+                home_code: r.home.to_string(),
+                away: name_of(r.away),
+                away_code: r.away.to_string(),
+                home_score: r.home_score,
+                away_score: r.away_score,
+                note: r.note.to_string(),
+                winner: name_of(r.winner()),
+            })
+            .collect();
+
+        let o = actual_2026::actual_outcome();
+        Some(StageForecast {
+            stage: actual_2026::stage_slug(stage).to_string(),
+            stage_label: stage.to_string(),
+            iterations: forecast.iterations,
+            seed,
+            confidence: "real 2026 results (verified, Round of 16 onward)".to_string(),
+            teams,
+            matchups,
+            actual: ActualOutcomeView {
+                champion: name_of(o.champion),
+                runner_up: name_of(o.runner_up),
+                third: name_of(o.third),
+                fourth: name_of(o.fourth),
+            },
+        })
+    }
+
+    /// Convenience for the HTTP/CLI layers: parse a stage slug (`"round-of-16"`, `"qf"`, ...) and
+    /// forecast from it. `None` for an unrecognized or uncovered stage.
+    pub fn stage_forecast_by_slug(
+        &self,
+        slug: &str,
+        iters: u64,
+        seed: u64,
+    ) -> Option<StageForecast> {
+        self.stage_forecast(actual_2026::parse_stage(slug)?, iters, seed)
     }
 
     /// Per-team champion probabilities from a Monte-Carlo run on a given tournament state (which
@@ -1225,6 +1348,97 @@ pub struct SimForecast {
     pub teams: Vec<SimRow>,
 }
 
+/// A survivor's probability of reaching one downstream round of a stage-conditioned forecast.
+#[derive(Debug, Clone, Serialize)]
+pub struct StageProb {
+    /// Round label, e.g. "Semi-final" or "Champion".
+    pub stage: String,
+    /// Probability the team reaches (or, for "Champion", wins) that round.
+    pub reached: f64,
+}
+
+/// One survivor in a [`StageForecast`], with its title odds and the path ahead.
+#[derive(Debug, Clone, Serialize)]
+pub struct StageTeam {
+    pub team: String,
+    pub code: String,
+    pub p_champion: f64,
+    pub champion_stderr: f64,
+    /// Probability of reaching each remaining round (quarter-final .. champion), correctly
+    /// labelled for the selected entry stage.
+    pub path: Vec<StageProb>,
+}
+
+/// One real tie at the selected stage, with the actual result (for the "what happened" reveal).
+#[derive(Debug, Clone, Serialize)]
+pub struct StageMatchup {
+    pub home: String,
+    pub home_code: String,
+    pub away: String,
+    pub away_code: String,
+    pub home_score: u8,
+    pub away_score: u8,
+    /// "a.e.t." / shootout note, empty if decided in regulation.
+    pub note: String,
+    pub winner: String,
+}
+
+/// How the real tournament actually finished (full names).
+#[derive(Debug, Clone, Serialize)]
+pub struct ActualOutcomeView {
+    pub champion: String,
+    pub runner_up: String,
+    pub third: String,
+    pub fourth: String,
+}
+
+/// A stage-conditioned forecast: the real teams still alive at a stage, the model's odds over that
+/// field, the real ties at that stage, and how the tournament actually ended.
+#[derive(Debug, Clone, Serialize)]
+pub struct StageForecast {
+    /// URL slug, e.g. "quarter-final".
+    pub stage: String,
+    /// Display label, e.g. "Quarter-final".
+    pub stage_label: String,
+    pub iterations: u64,
+    pub seed: u64,
+    /// Human-readable provenance/confidence note for the field.
+    pub confidence: String,
+    /// Survivors ranked by championship probability, descending.
+    pub teams: Vec<StageTeam>,
+    /// The real ties contested at this stage, in bracket order.
+    pub matchups: Vec<StageMatchup>,
+    pub actual: ActualOutcomeView,
+}
+
+/// The remaining-round "reach" probabilities for a survivor, labelled for the entry `stage`.
+///
+/// The forecast's per-stage fields are cumulative "reach round R" probabilities; the simulator
+/// derives the bracket depth from the entry field size, so for an entry at `stage` only the rounds
+/// strictly after it are meaningful (earlier columns saturate at 1). We surface exactly those, plus
+/// the championship. See [`oracle_ingest::actual_2026::stage_tournament`] for why the columns line
+/// up with the real rounds.
+fn downstream_path(stage: Stage, tf: &TeamForecast) -> Vec<StageProb> {
+    let rounds = [
+        (Stage::QuarterFinal, tf.p_quarter_final),
+        (Stage::SemiFinal, tf.p_semi_final),
+        (Stage::Final, tf.p_final),
+    ];
+    let mut path: Vec<StageProb> = rounds
+        .into_iter()
+        .filter(|(round, _)| round.order() > stage.order())
+        .map(|(round, reached)| StageProb {
+            stage: round.to_string(),
+            reached,
+        })
+        .collect();
+    path.push(StageProb {
+        stage: "Champion".to_string(),
+        reached: tf.p_champion,
+    });
+    path
+}
+
 /// One rooting-interest row: how a group rival's match result would swing the team's title odds.
 #[derive(Debug, Clone, Serialize)]
 pub struct KingmakerRow {
@@ -1611,5 +1825,54 @@ mod tests {
             assert!((0.0..=1.0).contains(&sig.title_shift));
             assert!(sig.movers.len() <= 3);
         }
+    }
+
+    #[test]
+    fn stage_forecast_conditions_on_the_real_field() {
+        let ex = Explorer::new();
+
+        // Each covered stage returns exactly its real field, and the title odds normalize.
+        for (stage, size) in [
+            (Stage::RoundOf16, 16),
+            (Stage::QuarterFinal, 8),
+            (Stage::SemiFinal, 4),
+            (Stage::Final, 2),
+        ] {
+            let f = ex.stage_forecast(stage, 5000, 42).expect("covered stage");
+            assert_eq!(f.teams.len(), size, "{stage} field size");
+            // Ranked by title odds, descending, and they sum to ~1 over the survivors.
+            for w in f.teams.windows(2) {
+                assert!(w[0].p_champion >= w[1].p_champion);
+            }
+            let total: f64 = f.teams.iter().map(|t| t.p_champion).sum();
+            assert!(
+                (total - 1.0).abs() < 1e-6,
+                "{stage} champion odds sum to {total}"
+            );
+            // The path has one entry per remaining round plus the championship.
+            let expected_path = match stage {
+                Stage::RoundOf16 => 4,
+                Stage::QuarterFinal => 3,
+                Stage::SemiFinal => 2,
+                Stage::Final => 1,
+                _ => unreachable!(),
+            };
+            assert_eq!(f.teams[0].path.len(), expected_path);
+            assert_eq!(f.teams[0].path.last().unwrap().stage, "Champion");
+        }
+
+        // Uncovered stages are absent (no fabricated early-round field).
+        assert!(ex.stage_forecast(Stage::RoundOf32, 5000, 42).is_none());
+
+        // From the semi-finals, the four real semi-finalists are exactly the reported field.
+        let sf = ex.stage_forecast(Stage::SemiFinal, 20_000, 42).unwrap();
+        let codes: std::collections::HashSet<&str> =
+            sf.teams.iter().map(|t| t.code.as_str()).collect();
+        assert_eq!(codes, ["ESP", "ARG", "FRA", "ENG"].into_iter().collect());
+        // Argentina is the highest-rated survivor, so the model makes it favourite - even though
+        // Spain actually won the tournament (a deliberate model-vs-reality contrast the UI shows).
+        assert_eq!(sf.teams[0].code, "ARG");
+        assert_eq!(sf.actual.champion, "Spain");
+        assert_eq!(sf.matchups.len(), 2);
     }
 }

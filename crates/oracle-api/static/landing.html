@@ -1,0 +1,284 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>worldcup-oracle</title>
+<style>
+  :root {
+    --bg: #0b0d12; --surface: #141821; --surface-2: #1b212e; --track: #0f131b;
+    --border: #262d3a; --border-strong: #333d4e;
+    --text: #e7eaf0; --muted: #96a0b2; --faint: #6b7688;
+    --accent: #4f8cff; --accent-weak: rgba(79, 140, 255, .14);
+    --good: #46b98a; --mark: #d9a441;
+    --radius: 10px; --radius-sm: 7px;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font: 15px/1.55 ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    -webkit-font-smoothing: antialiased;
+  }
+  a { color: var(--accent); text-decoration: none; }
+  a:hover { text-decoration: underline; }
+
+  .topnav {
+    display: flex; align-items: center; gap: 20px;
+    padding: 0 24px; height: 56px; border-bottom: 1px solid var(--border); background: var(--surface);
+    position: sticky; top: 0; z-index: 10;
+  }
+  .wordmark { font-weight: 650; letter-spacing: -.01em; font-size: 15px; }
+  .wordmark .dim { color: var(--faint); font-weight: 500; }
+  .topnav .grow { flex: 1; }
+  .topnav a { color: var(--muted); font-size: 14px; font-weight: 500; }
+  .topnav a:hover { color: var(--text); text-decoration: none; }
+
+  main { max-width: 940px; margin: 0 auto; padding: 40px 24px 56px; }
+
+  .hero h1 { font-size: 30px; line-height: 1.15; letter-spacing: -.02em; margin: 0 0 10px; font-weight: 680; }
+  .hero p { color: var(--muted); margin: 0; max-width: 68ch; font-size: 15px; }
+
+  .toolbar { display: flex; align-items: center; gap: 18px; flex-wrap: wrap; margin: 28px 0 8px; }
+  .segmented {
+    display: inline-flex; padding: 3px; gap: 2px; background: var(--surface); border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+  }
+  .segmented button {
+    font: inherit; font-size: 14px; font-weight: 550; cursor: pointer; border: 0; background: transparent;
+    color: var(--muted); padding: 7px 15px; border-radius: 5px; white-space: nowrap;
+  }
+  .segmented button:hover { color: var(--text); }
+  .segmented button.active { background: var(--surface-2); color: var(--text); box-shadow: inset 0 0 0 1px var(--border-strong); }
+
+  .opts { display: flex; align-items: center; gap: 14px; color: var(--muted); font-size: 13px; }
+  .opts label { display: inline-flex; align-items: center; gap: 7px; }
+  .opts select, .opts input {
+    font: inherit; font-size: 13px; background: var(--surface); color: var(--text);
+    border: 1px solid var(--border); border-radius: 6px; padding: 5px 8px;
+  }
+  .opts input { width: 76px; }
+  .prov { color: var(--faint); font-size: 12.5px; margin: 2px 0 22px; font-variant-numeric: tabular-nums; }
+
+  .card { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); padding: 18px 20px; margin-bottom: 16px; }
+  .eyebrow { font-size: 11px; text-transform: uppercase; letter-spacing: .09em; color: var(--faint); font-weight: 600; margin: 0 0 3px; }
+  .card h2 { font-size: 16px; font-weight: 620; letter-spacing: -.01em; margin: 0 0 14px; }
+  .note { color: var(--muted); font-size: 13px; margin: 14px 0 0; }
+
+  .banner { display: flex; align-items: flex-start; gap: 12px; background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); padding: 15px 18px; margin-bottom: 16px; }
+  .dot { flex: none; width: 9px; height: 9px; border-radius: 50%; margin-top: 6px; background: var(--faint); }
+  .dot.good { background: var(--good); } .dot.diff { background: var(--mark); }
+  .banner .line { font-size: 14.5px; }
+  .banner b { font-weight: 620; }
+  .banner .sub { color: var(--muted); font-size: 13px; margin-top: 2px; }
+
+  .chips { display: flex; flex-wrap: wrap; gap: 8px; }
+  .chip { display: inline-flex; align-items: center; gap: 8px; background: var(--surface-2); border: 1px solid var(--border); border-radius: 999px; padding: 5px 12px 5px 13px; font-size: 13.5px; }
+  .badge { font-size: 10.5px; font-weight: 700; letter-spacing: .03em; color: var(--muted); background: var(--track); border: 1px solid var(--border); padding: 1px 6px; border-radius: 4px; }
+
+  .lb { display: block; }
+  .lbrow { display: grid; grid-template-columns: 22px minmax(128px, 1.25fr) 1.8fr 82px; align-items: center; gap: 14px; padding: 9px 0; border-top: 1px solid var(--border); }
+  .lbrow:first-child { border-top: 0; }
+  .lbrow .rk { color: var(--faint); text-align: right; font-variant-numeric: tabular-nums; font-size: 13px; }
+  .lbrow .tm { display: flex; align-items: center; flex-wrap: wrap; gap: 4px 8px; font-weight: 560; min-width: 0; }
+  .lbrow .tm .nm { flex: 1 1 auto; min-width: 56px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .tag { font-size: 10px; font-weight: 700; letter-spacing: .04em; text-transform: uppercase; color: var(--mark); border: 1px solid rgba(217,164,65,.4); border-radius: 4px; padding: 1px 5px; }
+  .track { background: var(--track); border-radius: 5px; height: 8px; overflow: hidden; }
+  .track > span { display: block; height: 100%; background: var(--accent); border-radius: 5px; transition: width .45s ease; }
+  .lbrow.lead .track > span { background: var(--accent); }
+  .lbrow.champ .track > span { background: var(--mark); }
+  .lbrow .od { text-align: right; font-variant-numeric: tabular-nums; font-weight: 620; }
+  .lbrow .od small { display: block; color: var(--faint); font-weight: 400; font-size: 11px; }
+  .pathrow { grid-column: 2 / -1; display: flex; flex-wrap: wrap; gap: 4px 16px; padding: 0 0 9px; color: var(--faint); font-size: 12px; }
+  .pathrow b { color: var(--muted); font-weight: 600; font-variant-numeric: tabular-nums; }
+
+  .btn { font: inherit; font-size: 14px; font-weight: 560; cursor: pointer; background: var(--surface-2); color: var(--text); border: 1px solid var(--border-strong); border-radius: var(--radius-sm); padding: 8px 15px; }
+  .btn:hover { border-color: var(--accent); }
+  .hidden { display: none; }
+  .divider { height: 1px; background: var(--border); border: 0; margin: 16px 0; }
+
+  .tie { display: flex; align-items: baseline; gap: 10px; padding: 8px 0; border-top: 1px solid var(--border); font-size: 14px; }
+  .tie:first-child { border-top: 0; }
+  .tie .sc { font-variant-numeric: tabular-nums; color: var(--muted); font-weight: 620; }
+  .tie .w { font-weight: 600; }
+  .tie .meta { color: var(--faint); font-size: 12px; }
+  .final4 { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 10px; margin-top: 14px; }
+  .f4 { background: var(--surface-2); border: 1px solid var(--border); border-radius: var(--radius-sm); padding: 10px 13px; }
+  .f4 .lbl { font-size: 10.5px; text-transform: uppercase; letter-spacing: .06em; color: var(--faint); font-weight: 600; }
+  .f4 .who { font-weight: 600; margin-top: 2px; }
+  .f4.first { border-color: var(--border-strong); }
+
+  .state { color: var(--muted); padding: 40px 0; text-align: center; font-size: 14px; }
+  .state.err { color: #e0736a; }
+  footer { color: var(--faint); font-size: 12.5px; margin-top: 28px; line-height: 1.7; }
+</style>
+</head>
+<body>
+  <nav class="topnav">
+    <span class="wordmark">worldcup-oracle <span class="dim">/ 2026</span></span>
+    <span class="grow"></span>
+    <a href="/dashboard">Live dashboard</a>
+    <a href="/explore">Model explorer</a>
+  </nav>
+
+  <main>
+    <header class="hero">
+      <h1>Who wins the 2026 World Cup?</h1>
+      <p>
+        Choose a round of the real 2026 tournament. The model takes the teams that were still alive
+        at that round and simulates the rest of the bracket thousands of times to estimate each
+        team's chance of winning the title. You can then compare its pick against the real result.
+      </p>
+    </header>
+
+    <div class="toolbar">
+      <div class="segmented" id="stages"></div>
+      <div class="opts">
+        <label>Simulations
+          <select id="iters">
+            <option value="5000">5,000</option>
+            <option value="20000" selected>20,000</option>
+            <option value="50000">50,000</option>
+          </select>
+        </label>
+        <label>Seed <input id="seed" type="number" value="42" min="0" /></label>
+      </div>
+    </div>
+    <div class="prov" id="prov"></div>
+
+    <div id="content"><div class="state">Loading.</div></div>
+
+    <footer>
+      The field for each round is the real 2026 result (Round of 16 onward, from public match
+      reports). The probabilities are this project's model, not a betting product.
+      See the full model at <a href="/explore">/explore</a> or the live view at
+      <a href="/dashboard">/dashboard</a>.
+    </footer>
+  </main>
+
+<script>
+const STAGES = [
+  { slug: "round-of-16", label: "Round of 16" },
+  { slug: "quarter-final", label: "Quarter-finals" },
+  { slug: "semi-final", label: "Semi-finals" },
+  { slug: "final", label: "Final" },
+];
+let current = "quarter-final";
+
+const $ = (id) => document.getElementById(id);
+const pct = (p) => (p * 100).toFixed(1) + "%";
+const esc = (s) => String(s).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+
+function buildStages() {
+  $("stages").innerHTML = STAGES.map(
+    (s) => `<button data-slug="${s.slug}" class="${s.slug === current ? "active" : ""}">${s.label}</button>`
+  ).join("");
+  $("stages").querySelectorAll("button").forEach((b) =>
+    b.addEventListener("click", () => { current = b.dataset.slug; buildStages(); run(); })
+  );
+}
+
+async function run() {
+  const iters = $("iters").value, seed = $("seed").value || "42";
+  $("prov").textContent = "";
+  $("content").innerHTML = `<div class="state">Simulating ${Number(iters).toLocaleString()} tournaments.</div>`;
+  try {
+    const res = await fetch(`/api/stage?stage=${current}&iters=${iters}&seed=${seed}`);
+    if (res.status === 503) {
+      $("content").innerHTML = `<div class="state">The model is fitting its baseline on first start. Retrying.</div>`;
+      setTimeout(run, 1500);
+      return;
+    }
+    if (!res.ok) throw new Error(`request failed (${res.status})`);
+    render(await res.json());
+  } catch (e) {
+    $("content").innerHTML = `<div class="state err">Could not load the forecast: ${esc(e.message)}.</div>`;
+  }
+}
+
+function render(d) {
+  $("prov").textContent = `${d.iterations.toLocaleString()} simulations, seed ${d.seed}. Field: real 2026 results, Round of 16 onward.`;
+  const fav = d.teams[0];
+  const agree = fav && fav.team === d.actual.champion;
+
+  const banner = `
+    <div class="banner">
+      <span class="dot ${agree ? "good" : "diff"}"></span>
+      <div>
+        <div class="line">Model's pick from the ${esc(d.stage_label.toLowerCase())}: <b>${esc(fav.team)}</b> at <b>${pct(fav.p_champion)}</b> to win the title.</div>
+        <div class="sub">The team that actually won the 2026 tournament was ${esc(d.actual.champion)}${agree ? ", so the model agreed." : "."}</div>
+      </div>
+    </div>`;
+
+  const chips = d.matchups
+    .flatMap((m) => [[m.home, m.home_code], [m.away, m.away_code]])
+    .map(([n, c]) => `<span class="chip">${esc(n)}<span class="badge">${esc(c)}</span></span>`)
+    .join("");
+
+  const max = Math.max(...d.teams.map((t) => t.p_champion), 1e-9);
+  const rows = d.teams.map((t, i) => {
+    const isChamp = t.team === d.actual.champion;
+    const cls = isChamp ? "champ" : (i === 0 ? "lead" : "");
+    const path = t.path.map((p) => `${esc(p.stage)} <b>${pct(p.reached)}</b>`).join("&nbsp;&nbsp; ");
+    return `
+      <div class="lbrow ${cls}">
+        <div class="rk">${i + 1}</div>
+        <div class="tm"><span class="nm">${esc(t.team)}</span><span class="badge">${esc(t.code)}</span>${isChamp ? '<span class="tag" title="Won the 2026 tournament">Champion</span>' : ""}</div>
+        <div class="track"><span style="width:${Math.max((t.p_champion / max) * 100, 1.5)}%"></span></div>
+        <div class="od">${pct(t.p_champion)}<small>&plusmn;${(t.champion_stderr * 100).toFixed(2)}</small></div>
+      </div>
+      ${i < 4 ? `<div class="pathrow">${path}</div>` : ""}`;
+  }).join("");
+
+  const ties = d.matchups.map((m) => {
+    const home = `<span class="${m.winner === m.home ? "w" : ""}">${esc(m.home)}</span>`;
+    const away = `<span class="${m.winner === m.away ? "w" : ""}">${esc(m.away)}</span>`;
+    return `<div class="tie">${home} <span class="sc">${m.home_score}-${m.away_score}</span> ${away}
+      ${m.note ? `<span class="meta">(${esc(m.note)})</span>` : ""}</div>`;
+  }).join("");
+  const a = d.actual;
+  const final4 = `
+    <div class="final4">
+      <div class="f4 first"><div class="lbl">Champion</div><div class="who">${esc(a.champion)}</div></div>
+      <div class="f4"><div class="lbl">Runner-up</div><div class="who">${esc(a.runner_up)}</div></div>
+      <div class="f4"><div class="lbl">Third</div><div class="who">${esc(a.third)}</div></div>
+      <div class="f4"><div class="lbl">Fourth</div><div class="who">${esc(a.fourth)}</div></div>
+    </div>`;
+
+  $("content").innerHTML = `
+    ${banner}
+    <section class="card">
+      <p class="eyebrow">Still in contention</p>
+      <h2>${d.teams.length} teams remain at the ${esc(d.stage_label.toLowerCase())}</h2>
+      <div class="chips">${chips}</div>
+    </section>
+    <section class="card">
+      <p class="eyebrow">Forecast</p>
+      <h2>Title odds from the ${esc(d.stage_label.toLowerCase())}</h2>
+      <div class="lb">${rows}</div>
+      <p class="note">Each bar is a team's simulated chance of winning the tournament. The top four also show their odds of reaching each later round. The team that actually won is labelled.</p>
+    </section>
+    <section class="card">
+      <p class="eyebrow">Result</p>
+      <h2>What actually happened</h2>
+      <button class="btn" id="revealBtn">Show the real results</button>
+      <div id="reveal" class="hidden">
+        <hr class="divider" />
+        ${ties}
+        ${final4}
+      </div>
+    </section>`;
+
+  $("revealBtn").addEventListener("click", () => {
+    const r = $("reveal");
+    r.classList.toggle("hidden");
+    $("revealBtn").textContent = r.classList.contains("hidden") ? "Show the real results" : "Hide the real results";
+  });
+}
+
+buildStages();
+$("iters").addEventListener("change", run);
+$("seed").addEventListener("change", run);
+run();
+</script>
+</body>
+</html>
