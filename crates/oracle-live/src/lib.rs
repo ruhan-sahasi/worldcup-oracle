@@ -310,6 +310,10 @@ pub struct InPlayReport {
 /// by [`trade_match`]; the same bet held to settlement is tracked alongside as a baseline. Because
 /// the odds are fair, neither approach has an edge, so the honest comparison is about the shape of
 /// the P&L (drawdown, cash-out frequency), not its mean. Reproducible from the seed.
+///
+/// # Panics
+/// If [`simulate_match`] ever returns an empty timeline. It cannot: every timeline is bracketed by
+/// a kickoff state and a minute-90 state, so the final state this reads always exists.
 pub fn inplay_backtest(lambda_home: f64, lambda_away: f64, config: &InPlayConfig) -> InPlayReport {
     let pre_match = win_probabilities(MatchState::kickoff(), lambda_home, lambda_away);
     let backed = favourite(pre_match);

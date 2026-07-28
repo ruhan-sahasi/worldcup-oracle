@@ -22,6 +22,10 @@ unsafe_code = "forbid"
 # Debugging leftovers, which CI's `-D warnings` then turns into a hard stop.
 dbg_macro = "warn"
 todo = "warn"
+# A public function that can panic has to say so. Most panics here are internal invariants that
+# cannot fire from outside; documenting them is how a reader tells those apart from the ones a
+# caller can actually trigger.
+missing_panics_doc = "warn"
 
 [workspace.dependencies]
 # ---- internal crates ----

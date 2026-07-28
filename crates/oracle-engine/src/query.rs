@@ -715,6 +715,10 @@ impl Explorer {
     /// championship odds. Conditions the tournament on each result (a representative scoreline) and
     /// re-simulates, diffing the team's champion probability against the baseline. All runs share
     /// the seed, so a swing reflects the result rather than Monte-Carlo noise.
+    ///
+    /// # Panics
+    /// If a candidate match id is absent from the tournament. It cannot: the candidates are
+    /// selected out of `self.tournament.matches` in the first place.
     pub fn kingmaker(&self, team: TeamId, iters: u64, seed: u64) -> KingmakerReport {
         let iters = iters.clamp(2000, KINGMAKER_MAX_ITERS);
         let base_champion = self

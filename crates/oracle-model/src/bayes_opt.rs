@@ -38,6 +38,10 @@ pub struct BoResult {
 /// Minimize `objective` over the box `bounds` (`[(lo, hi); d]`) by Bayesian optimization with a
 /// Gaussian-process surrogate and Expected-Improvement acquisition. The objective is treated as a
 /// black box (only its values are used), so it can be a noisy, expensive model-fit-and-score.
+///
+/// # Panics
+/// If no point was ever evaluated. It cannot happen: the initial design is `cfg.n_init.max(2)`
+/// points, so at least two objective values exist before the best is selected.
 pub fn minimize<F: FnMut(&[f64]) -> f64>(
     bounds: &[(f64, f64)],
     cfg: BoConfig,
