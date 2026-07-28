@@ -9,4 +9,5 @@ rust-version.workspace = true
 description = "Player-level goalscorer markets and a Golden Boot race for worldcup-oracle"
 
 [dependencies]
+oracle-numeric.workspace = true
 serde.workspace = true

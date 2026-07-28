@@ -1316,6 +1316,7 @@ version = "0.1.0"
 name = "oracle-players"
 version = "0.1.0"
 dependencies = [
+ "oracle-numeric",
  "serde",
 ]
 
