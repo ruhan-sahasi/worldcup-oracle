@@ -1288,6 +1288,7 @@ name = "oracle-live"
 version = "0.1.0"
 dependencies = [
  "oracle-domain",
+ "oracle-numeric",
  "serde",
 ]
 
@@ -1304,13 +1305,19 @@ name = "oracle-model"
 version = "0.1.0"
 dependencies = [
  "oracle-domain",
+ "oracle-numeric",
  "serde",
 ]
+
+[[package]]
+name = "oracle-numeric"
+version = "0.1.0"
 
 [[package]]
 name = "oracle-players"
 version = "0.1.0"
 dependencies = [
+ "oracle-numeric",
  "serde",
 ]
 
@@ -1319,6 +1326,7 @@ name = "oracle-ratings"
 version = "0.1.0"
 dependencies = [
  "oracle-domain",
+ "oracle-numeric",
  "serde",
 ]
 

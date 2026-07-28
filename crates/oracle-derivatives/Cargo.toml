@@ -11,3 +11,6 @@ description = "Match derivative markets (totals, Asian handicap, correct score) 
 [dependencies]
 oracle-domain.workspace = true
 serde.workspace = true
+
+[lints]
+workspace = true

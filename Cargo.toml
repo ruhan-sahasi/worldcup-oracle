@@ -11,8 +11,25 @@ repository = "https://github.com/ruhan-sahasi/worldcup-oracle"
 rust-version = "1.80"
 description = "A live, ensemble World Cup prediction engine in Rust"
 
+# Lints are declared once here and inherited by every member via `[lints] workspace = true`, which
+# (unlike a `#![forbid(..)]` in each lib.rs) also covers binary and benchmark crate roots.
+[workspace.lints.rust]
+# Nothing in this workspace needs `unsafe`. Forbid rather than deny, so a local `#[allow]` cannot
+# quietly reopen it.
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+# Debugging leftovers, which CI's `-D warnings` then turns into a hard stop.
+dbg_macro = "warn"
+todo = "warn"
+# A public function that can panic has to say so. Most panics here are internal invariants that
+# cannot fire from outside; documenting them is how a reader tells those apart from the ones a
+# caller can actually trigger.
+missing_panics_doc = "warn"
+
 [workspace.dependencies]
 # ---- internal crates ----
+oracle-numeric = { path = "crates/oracle-numeric", version = "0.1.0" }
 oracle-domain = { path = "crates/oracle-domain", version = "0.1.0" }
 oracle-ratings = { path = "crates/oracle-ratings", version = "0.1.0" }
 oracle-model = { path = "crates/oracle-model", version = "0.1.0" }
@@ -37,7 +54,6 @@ anyhow = "1"
 # ---- async runtime / web ----
 tokio = { version = "1", features = ["full"] }
 tokio-util = "0.7"
-tokio-stream = "0.1"
 futures-util = "0.3"
 async-trait = "0.1"
 axum = { version = "0.7", features = ["ws"] }
@@ -56,7 +72,6 @@ rand_distr = "0.4"
 csv = "1"
 rayon = "1"
 arc-swap = "1"
-dashmap = "6"
 
 # ---- observability ----
 tracing = "0.1"

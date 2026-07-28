@@ -13,6 +13,7 @@
 //! against model regressions.
 
 use oracle_domain::{Outcome, Probabilities};
+use oracle_numeric::Rng;
 use serde::{Deserialize, Serialize};
 
 /// Aggregate quality of a set of forecasts against realized outcomes.
@@ -177,10 +178,10 @@ pub struct MetricCi {
 
 /// Bootstrap 95% confidence intervals for Brier, log-loss, and accuracy over a set of
 /// `(prediction, actual)` pairs (e.g. the pooled out-of-fold predictions of a rolling-origin
-/// cross-validation). Resampling with replacement is driven by a seeded SplitMix64 generator, so
-/// the intervals are fully reproducible for a given `(seed, n_boot)` - no `rand` dependency and
-/// no nondeterminism. Non-overlapping intervals between two models are evidence the skill gap is
-/// real rather than a single-split fluke.
+/// cross-validation). Resampling with replacement is driven by `oracle-numeric`'s seeded generator,
+/// so the intervals are fully reproducible for a given `(seed, n_boot)` - no nondeterminism.
+/// Non-overlapping intervals between two models are evidence the skill gap is real rather than a
+/// single-split fluke.
 pub fn bootstrap_score_ci(
     predictions: &[(Probabilities, Outcome)],
     n_boot: usize,
@@ -197,16 +198,7 @@ pub fn bootstrap_score_ci(
         return (z, z, z);
     }
 
-    // SplitMix64: a tiny, well-distributed seeded PRNG (no external dependency).
-    let mut state = seed.wrapping_add(0x9E37_79B9_7F4A_7C15);
-    let mut next_u64 = || {
-        state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
-        let mut z = state;
-        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-        z ^ (z >> 31)
-    };
-
+    let mut rng = Rng::new(seed);
     let (mut briers, mut losses, mut accs) = (
         Vec::with_capacity(n_boot),
         Vec::with_capacity(n_boot),
@@ -216,8 +208,7 @@ pub fn bootstrap_score_ci(
     for _ in 0..n_boot {
         sample.clear();
         for _ in 0..n {
-            let idx = (next_u64() % n as u64) as usize;
-            sample.push(predictions[idx]);
+            sample.push(predictions[rng.index_below(n)]);
         }
         let r = score(&sample);
         briers.push(r.brier);

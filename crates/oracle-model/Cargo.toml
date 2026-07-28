@@ -9,8 +9,12 @@ rust-version.workspace = true
 description = "Dixon-Coles goal model, Bayesian in-match updating, and ensemble blending"
 
 [dependencies]
+oracle-numeric.workspace = true
 oracle-domain.workspace = true
 serde.workspace = true
 
 [dev-dependencies]
 # (statistical tests use only std + domain)
+
+[lints]
+workspace = true

@@ -13,7 +13,6 @@
 //!
 //! This first layer is the shared vocabulary: the joint grid's **marginal** goal distributions (how
 //! many each side scores) and its total mass, the primitives the market modules are built from.
-#![forbid(unsafe_code)]
 
 use oracle_domain::{Probabilities, ScoreGrid};
 use serde::{Deserialize, Serialize};

@@ -715,6 +715,10 @@ impl Explorer {
     /// championship odds. Conditions the tournament on each result (a representative scoreline) and
     /// re-simulates, diffing the team's champion probability against the baseline. All runs share
     /// the seed, so a swing reflects the result rather than Monte-Carlo noise.
+    ///
+    /// # Panics
+    /// If a candidate match id is absent from the tournament. It cannot: the candidates are
+    /// selected out of `self.tournament.matches` in the first place.
     pub fn kingmaker(&self, team: TeamId, iters: u64, seed: u64) -> KingmakerReport {
         let iters = iters.clamp(2000, KINGMAKER_MAX_ITERS);
         let base_champion = self
@@ -1233,26 +1237,16 @@ pub(crate) fn champion_odds_from_layer(
     v
 }
 
+/// The `n` most likely scorelines in the API's wire shape.
 fn top_scorelines(grid: &ScoreGrid, n: usize) -> Vec<ScoreLine> {
-    let mut cells: Vec<ScoreLine> = grid
-        .grid
-        .iter()
-        .enumerate()
-        .flat_map(|(h, row)| {
-            row.iter().enumerate().map(move |(a, &p)| ScoreLine {
-                home: h as u8,
-                away: a as u8,
-                prob: p,
-            })
+    grid.top_scorelines(n)
+        .into_iter()
+        .map(|(home, away, prob)| ScoreLine {
+            home: home as u8,
+            away: away as u8,
+            prob,
         })
-        .collect();
-    cells.sort_by(|a, b| {
-        b.prob
-            .partial_cmp(&a.prob)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
-    cells.truncate(n);
-    cells
+        .collect()
 }
 
 // ----- serializable result types (the API forwards these as JSON) -----

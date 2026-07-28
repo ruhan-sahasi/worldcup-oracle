@@ -16,7 +16,6 @@
 //!    probability, so [`RatingStore::win_probabilities`] models the draw mass as a
 //!    Gaussian in the rating gap and splits `E` into home/draw/away while preserving
 //!    `E = P(home) + ½·P(draw)`.
-#![forbid(unsafe_code)]
 
 pub mod massey;
 pub mod state_space;

@@ -18,8 +18,6 @@
 //! subscribing to the broadcast channel (push). Expensive Monte-Carlo forecasts are
 //! recomputed on a throttle and whenever a result lands, not on every tick.
 
-#![forbid(unsafe_code)]
-
 pub mod event_log;
 pub mod presets;
 pub mod query;

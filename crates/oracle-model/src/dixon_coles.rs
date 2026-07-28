@@ -244,6 +244,10 @@ impl GoalModel {
     ///   systematic over/under-performance a confederation shows against outsiders.
     ///
     /// An empty `confederations` map reduces exactly to [`fit`](Self::fit).
+    ///
+    /// # Panics
+    /// If an observation names a team missing from the fitted team universe. It cannot: that
+    /// universe is collected from these same observations, so every `home` and `away` is a key.
     pub fn fit_with_confederations(
         observations: &[Observation],
         config: DixonColesConfig,

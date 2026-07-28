@@ -52,7 +52,6 @@
 //! | GET | `/api/derivatives?home=&away=` | full derivative board: totals, Asian handicap, correct score, and more |
 //! | GET | `/metrics` | Prometheus metrics |
 //! | GET | `/live` | WebSocket: pushes a compact live view on every update |
-#![forbid(unsafe_code)]
 
 use axum::{
     extract::{

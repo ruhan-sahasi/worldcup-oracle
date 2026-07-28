@@ -15,7 +15,6 @@
 //! - [`probability`] - outcomes, win/draw/win probabilities, exact-score grids
 //! - [`tournament`] - groups, the tournament container, and forecast outputs
 //! - [`bracket`] - the fixed 2026 knockout bracket template
-#![forbid(unsafe_code)]
 
 pub mod bracket;
 pub mod event;

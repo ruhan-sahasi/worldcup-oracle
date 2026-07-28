@@ -11,3 +11,6 @@ description = "Betting-market math and a paper-trading backtest for worldcup-ora
 [dependencies]
 oracle-domain.workspace = true
 serde.workspace = true
+
+[lints]
+workspace = true

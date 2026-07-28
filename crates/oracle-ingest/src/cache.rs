@@ -25,6 +25,11 @@ impl<K: Eq + Hash + Clone, V: Clone> TtlCache<K, V> {
     }
 
     /// Return a live (unexpired) value, or `None` if absent/stale.
+    ///
+    /// # Panics
+    /// If the internal mutex is poisoned, i.e. a previous caller panicked while holding it. The
+    /// guarded section is a `HashMap` lookup that cannot panic on its own, so in practice this
+    /// only propagates a panic that already happened.
     pub fn get(&self, key: &K) -> Option<V> {
         let map = self.map.lock().expect("cache mutex poisoned");
         map.get(key).and_then(|(stored, v)| {
@@ -37,6 +42,9 @@ impl<K: Eq + Hash + Clone, V: Clone> TtlCache<K, V> {
     }
 
     /// Insert/replace a value, stamping it with the current time.
+    ///
+    /// # Panics
+    /// If the internal mutex is poisoned; see [`get`](Self::get).
     pub fn put(&self, key: K, value: V) {
         let mut map = self.map.lock().expect("cache mutex poisoned");
         map.insert(key, (Instant::now(), value));

@@ -9,5 +9,9 @@ rust-version.workspace = true
 description = "In-play win probability and live trading (hedging, cash-out) for worldcup-oracle"
 
 [dependencies]
+oracle-numeric.workspace = true
 oracle-domain.workspace = true
 serde.workspace = true
+
+[lints]
+workspace = true

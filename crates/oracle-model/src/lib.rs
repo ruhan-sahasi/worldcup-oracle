@@ -11,7 +11,6 @@
 //!
 //! [`calibration`] provides the proper scoring rules (Brier, log loss) used to tune
 //! and regression-test all of the above.
-#![forbid(unsafe_code)]
 
 pub mod bayes_opt;
 pub mod bradley_terry;

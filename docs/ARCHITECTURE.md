@@ -1,13 +1,15 @@
 # Architecture
 
-`worldcup-oracle` is a Cargo **workspace** of twelve focused crates. Dependencies flow
-strictly downhill from a zero-I/O domain core, so the prediction math, the data
-sources, and the transport layers can each change without disturbing the others.
+`worldcup-oracle` is a Cargo **workspace** of thirteen focused crates. Dependencies flow
+strictly downhill from a zero-dependency numerics floor and a zero-I/O domain core, so the
+prediction math, the data sources, and the transport layers can each change without
+disturbing the others.
 
 ## Crate graph
 
 ```mermaid
 graph TD
+    numeric[oracle-numeric<br/>seeded RNG · Poisson · normal]
     domain[oracle-domain<br/>pure types]
     ratings[oracle-ratings<br/>Elo]
     model[oracle-model<br/>Dixon-Coles · Bayesian · ensemble]
@@ -21,14 +23,17 @@ graph TD
     api[oracle-api<br/>axum REST + WS]
     cli[oracle-cli<br/>wc-oracle + TUI]
 
+    ratings --> numeric
     ratings --> domain
+    model --> numeric
     model --> domain
     sim --> domain
     sim --> model
     ingest --> domain
     ingest --> model
     market --> domain
-    players --> domain
+    players --> numeric
+    live --> numeric
     live --> domain
     derivatives --> domain
     engine --> domain
@@ -49,8 +54,24 @@ graph TD
     cli --> market
 ```
 
-`oracle-domain` depends on nothing but `serde`/`chrono`. Everything points *at* it;
-it points at nothing. That inversion is what keeps the core stable.
+There are two roots. `oracle-domain` depends on nothing but `serde`/`chrono`, and
+`oracle-numeric` depends on nothing at all - not even `serde`. Everything points *at* them;
+they point at nothing. That inversion is what keeps the core stable.
+
+The split between the two roots is by *kind* of stability. `oracle-domain` holds what the
+project is about (teams, matches, probabilities) and changes when the football does.
+`oracle-numeric` holds mathematics that does not change at all: a Poisson mass is a Poisson
+mass regardless of what the tournament looks like. Keeping them apart means a crate like
+`oracle-players`, which needs a generator and a Poisson but has no use for a `TeamId`, can
+take the floor without taking the domain - and its `Cargo.toml` then documents that honestly.
+
+The absence of dependencies in `oracle-numeric` is what makes it affordable for everyone to
+depend on. That matters, because the alternative is what this workspace actually did for a
+while: five copies of the same SplitMix64 generator, three Poisson mass functions, and two
+byte-identical `erf` approximations, each inlined because taking a dependency looked more
+expensive than retyping thirty lines. Duplicated numerics are worse than duplicated ordinary
+code - each copy is a place a tolerance can drift out of step with the test that guards it,
+and a bug fixed in one is silently still live in the rest.
 
 ## Runtime data flow (live, event-driven)
 

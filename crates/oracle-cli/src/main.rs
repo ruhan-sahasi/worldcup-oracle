@@ -16,12 +16,11 @@
 //! wc-oracle watch      # live terminal dashboard (TUI)
 //! wc-oracle sensitivity # ablation: how much each unconventional signal moves the title odds
 //! ```
-#![forbid(unsafe_code)]
 
 mod watch;
 
 use clap::{Parser, Subcommand};
-use oracle_domain::{Outcome, Probabilities, ScoreGrid, Team, TeamId};
+use oracle_domain::{Outcome, Probabilities, Team, TeamId};
 use oracle_engine::Explorer;
 use oracle_ingest::{actual_2026, data};
 use oracle_market::BetPolicy;
@@ -802,7 +801,7 @@ fn cmd_predict(
         grid.prob_btts() * 100.0,
     );
     println!("\n  Top scorelines:");
-    for (h, a, p) in top_scorelines(&grid, 5) {
+    for (h, a, p) in grid.top_scorelines(5) {
         println!("    {h}–{a}   {:>5.1}%", p * 100.0);
     }
 
@@ -868,18 +867,6 @@ fn cmd_predict(
     }
     println!();
     Ok(())
-}
-
-fn top_scorelines(grid: &ScoreGrid, n: usize) -> Vec<(usize, usize, f64)> {
-    let mut cells: Vec<(usize, usize, f64)> = grid
-        .grid
-        .iter()
-        .enumerate()
-        .flat_map(|(h, row)| row.iter().enumerate().map(move |(a, &p)| (h, a, p)))
-        .collect();
-    cells.sort_by(|x, y| y.2.partial_cmp(&x.2).unwrap_or(std::cmp::Ordering::Equal));
-    cells.truncate(n);
-    cells
 }
 
 fn cmd_backtest(
@@ -1442,8 +1429,7 @@ async fn cmd_serve(addr: SocketAddr, event_log: Option<std::path::PathBuf>) -> a
 
 #[cfg(test)]
 mod tests {
-    use super::{resolve_team, top_scorelines};
-    use oracle_domain::ScoreGrid;
+    use super::resolve_team;
     use oracle_ingest::data;
 
     #[test]
@@ -1461,16 +1447,5 @@ mod tests {
         let usa = resolve_team("United States", &teams);
         assert_eq!(resolve_team("United", &teams), usa, "substring match");
         assert_eq!(resolve_team("Atlantis", &teams), None, "unknown team");
-    }
-
-    #[test]
-    fn top_scorelines_are_ranked_and_truncated() {
-        // A grid whose single most likely cell is 2-1.
-        let grid = ScoreGrid::from_fn(4, |h, a| if (h, a) == (2, 1) { 10.0 } else { 1.0 });
-        let top = top_scorelines(&grid, 3);
-        assert_eq!(top.len(), 3, "truncated to n");
-        assert_eq!((top[0].0, top[0].1), (2, 1), "modal scoreline first");
-        // Sorted by probability, descending.
-        assert!(top[0].2 >= top[1].2 && top[1].2 >= top[2].2);
     }
 }

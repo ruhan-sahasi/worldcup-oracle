@@ -31,6 +31,12 @@ impl EventLog {
     }
 
     /// Append one event as a JSON line and flush.
+    ///
+    /// # Panics
+    /// If the writer mutex is poisoned, i.e. a previous caller panicked mid-append. Failing loudly
+    /// is deliberate here: the log is the engine's recovery record, and continuing to append after
+    /// a torn write would silently produce a log that cannot be replayed. I/O failures, by
+    /// contrast, are returned as `Err` for the caller to handle.
     pub fn append(&self, event: &MatchEvent) -> io::Result<()> {
         let line = serde_json::to_string(event)?;
         let mut w = self.writer.lock().expect("event-log mutex poisoned");
