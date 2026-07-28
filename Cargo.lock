@@ -1304,6 +1304,7 @@ name = "oracle-model"
 version = "0.1.0"
 dependencies = [
  "oracle-domain",
+ "oracle-numeric",
  "serde",
 ]
 

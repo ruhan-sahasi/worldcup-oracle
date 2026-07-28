@@ -19,8 +19,11 @@
 //!
 //! ## Module map
 //! - [`rng`] - the seeded SplitMix64 generator ([`Rng`]) with uniform, normal, and Poisson draws
+//! - [`dist`] - discrete probability masses and the log-space special functions behind them
 #![forbid(unsafe_code)]
 
+pub mod dist;
 pub mod rng;
 
+pub use dist::{ln_factorial, ln_gamma, poisson_pmf, safe_ln};
 pub use rng::Rng;
