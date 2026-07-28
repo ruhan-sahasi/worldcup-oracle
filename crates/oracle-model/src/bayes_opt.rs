@@ -8,12 +8,13 @@
 //! cannot reach.
 //!
 //! This is a compact, dependency-free implementation: an RBF-kernel GP solved by Cholesky, EI
-//! over randomly sampled candidates, and a seeded SplitMix64 generator so a run is fully
+//! over randomly sampled candidates, and `oracle-numeric`'s seeded generator so a run is fully
 //! reproducible. It powers `wc-oracle tune`, replacing the hand-specified grid.
 // Explicit index loops read more naturally than iterators for the small matrix routines here.
 #![allow(clippy::needless_range_loop)]
 
 use oracle_numeric::normal::{normal_cdf, normal_pdf};
+use oracle_numeric::Rng;
 
 /// Tuning for a Bayesian-optimization run.
 #[derive(Debug, Clone, Copy)]
@@ -43,7 +44,7 @@ pub fn minimize<F: FnMut(&[f64]) -> f64>(
     mut objective: F,
 ) -> BoResult {
     let d = bounds.len();
-    let mut rng = SplitMix::new(cfg.seed);
+    let mut rng = Rng::new(cfg.seed);
     // The GP works in the unit cube; map a normalized point back to the real box for evaluation.
     let to_box = |u: &[f64]| -> Vec<f64> {
         (0..d)
@@ -221,25 +222,6 @@ fn expected_improvement(y_best: f64, mean: f64, sd: f64) -> f64 {
     improvement * normal_cdf(z) + sd * normal_pdf(z)
 }
 
-/// A tiny seeded SplitMix64 generator (reproducible, no external dependency).
-struct SplitMix(u64);
-impl SplitMix {
-    fn new(seed: u64) -> Self {
-        Self(seed)
-    }
-    fn next_u64(&mut self) -> u64 {
-        self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
-        let mut z = self.0;
-        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-        z ^ (z >> 31)
-    }
-    /// A uniform draw in `[0, 1)`.
-    fn unit(&mut self) -> f64 {
-        (self.next_u64() >> 11) as f64 / (1u64 << 53) as f64
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -281,7 +263,7 @@ mod tests {
             },
             f,
         );
-        let mut rng = SplitMix::new(7);
+        let mut rng = Rng::new(7);
         let mut rand_best = f64::INFINITY;
         for _ in 0..25 {
             let x = [rng.unit(), rng.unit()];
