@@ -13,7 +13,6 @@
 //! This first layer is the vocabulary and the Monte-Carlo's random source: a [`MatchState`] (the
 //! score at a minute) and [`oracle_numeric`]'s seeded generator, so a simulated match is
 //! reproducible from a seed.
-#![forbid(unsafe_code)]
 
 use oracle_domain::{Outcome, Probabilities};
 use oracle_numeric::poisson_pmf;

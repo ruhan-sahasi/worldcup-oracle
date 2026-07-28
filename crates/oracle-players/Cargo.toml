@@ -11,3 +11,6 @@ description = "Player-level goalscorer markets and a Golden Boot race for worldc
 [dependencies]
 oracle-numeric.workspace = true
 serde.workspace = true
+
+[lints]
+workspace = true

@@ -12,3 +12,6 @@ description = "In-play win probability and live trading (hedging, cash-out) for 
 oracle-numeric.workspace = true
 oracle-domain.workspace = true
 serde.workspace = true
+
+[lints]
+workspace = true

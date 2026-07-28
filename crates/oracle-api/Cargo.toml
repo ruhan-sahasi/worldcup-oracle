@@ -31,3 +31,6 @@ tower = { workspace = true, features = ["util"] }
 [[bin]]
 name = "oracle-server"
 path = "src/bin/server.rs"
+
+[lints]
+workspace = true

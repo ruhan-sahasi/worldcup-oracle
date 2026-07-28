@@ -16,7 +16,6 @@
 //! wc-oracle watch      # live terminal dashboard (TUI)
 //! wc-oracle sensitivity # ablation: how much each unconventional signal moves the title odds
 //! ```
-#![forbid(unsafe_code)]
 
 mod watch;
 

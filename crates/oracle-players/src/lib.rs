@@ -13,7 +13,6 @@
 //!
 //! The Monte-Carlo draws and the Poisson masses both come from [`oracle_numeric`], so a Golden Boot
 //! race is fully reproducible from its seed.
-#![forbid(unsafe_code)]
 
 use oracle_numeric::poisson_pmf;
 use serde::{Deserialize, Serialize};

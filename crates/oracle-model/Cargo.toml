@@ -15,3 +15,6 @@ serde.workspace = true
 
 [dev-dependencies]
 # (statistical tests use only std + domain)
+
+[lints]
+workspace = true

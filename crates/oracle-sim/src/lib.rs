@@ -38,7 +38,6 @@
 //! deterministic rule rather than FIFA's full 495-row lookup table, the team draw is synthetic,
 //! and a finished knockout tie level on the scoreline (decided on penalties, which the domain does
 //! not record) is resolved to the home side.
-#![forbid(unsafe_code)]
 
 use oracle_domain::bracket::{resolve_slot, FIXED_R32};
 use oracle_domain::{

@@ -11,3 +11,6 @@ description = "Core domain types for the worldcup-oracle prediction engine (pure
 [dependencies]
 serde.workspace = true
 chrono.workspace = true
+
+[lints]
+workspace = true

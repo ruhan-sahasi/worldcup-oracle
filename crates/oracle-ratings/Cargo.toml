@@ -12,3 +12,6 @@ description = "Elo rating system (home advantage + margin-of-victory) for worldc
 oracle-numeric.workspace = true
 oracle-domain.workspace = true
 serde.workspace = true
+
+[lints]
+workspace = true

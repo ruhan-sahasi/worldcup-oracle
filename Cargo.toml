@@ -11,6 +11,18 @@ repository = "https://github.com/ruhan-sahasi/worldcup-oracle"
 rust-version = "1.80"
 description = "A live, ensemble World Cup prediction engine in Rust"
 
+# Lints are declared once here and inherited by every member via `[lints] workspace = true`, which
+# (unlike a `#![forbid(..)]` in each lib.rs) also covers binary and benchmark crate roots.
+[workspace.lints.rust]
+# Nothing in this workspace needs `unsafe`. Forbid rather than deny, so a local `#[allow]` cannot
+# quietly reopen it.
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+# Debugging leftovers, which CI's `-D warnings` then turns into a hard stop.
+dbg_macro = "warn"
+todo = "warn"
+
 [workspace.dependencies]
 # ---- internal crates ----
 oracle-numeric = { path = "crates/oracle-numeric", version = "0.1.0" }

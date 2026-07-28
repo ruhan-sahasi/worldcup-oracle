@@ -9,3 +9,6 @@ rust-version.workspace = true
 description = "Deterministic pseudo-random generation and the statistical special functions the oracle's models share"
 
 [dependencies]
+
+[lints]
+workspace = true

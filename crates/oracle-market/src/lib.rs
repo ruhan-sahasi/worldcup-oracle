@@ -14,7 +14,6 @@
 //! probability is `1 / d`, and because a book prices in a margin those raw implied probabilities
 //! sum to `1 + overround` rather than to one (removing that margin is [`devig`](crate) territory,
 //! the next layer up).
-#![forbid(unsafe_code)]
 
 use oracle_domain::{Outcome, Probabilities};
 use serde::{Deserialize, Serialize};
