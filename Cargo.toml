@@ -38,7 +38,6 @@ anyhow = "1"
 # ---- async runtime / web ----
 tokio = { version = "1", features = ["full"] }
 tokio-util = "0.7"
-tokio-stream = "0.1"
 futures-util = "0.3"
 async-trait = "0.1"
 axum = { version = "0.7", features = ["ws"] }
@@ -57,7 +56,6 @@ rand_distr = "0.4"
 csv = "1"
 rayon = "1"
 arc-swap = "1"
-dashmap = "6"
 
 # ---- observability ----
 tracing = "0.1"
