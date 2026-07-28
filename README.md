@@ -106,11 +106,16 @@ flowchart LR
 
 | Crate | Responsibility |
 |-------|----------------|
+| `oracle-numeric` | seeded generator + Poisson / gamma / normal primitives; no dependencies |
 | `oracle-domain` | pure types (teams, matches, events, probabilities); no I/O |
 | `oracle-ratings` | Elo + state-space (Kalman) rating systems |
 | `oracle-model` | Dixon-Coles, Bayesian live model, ensemble, calibration |
 | `oracle-sim` | parallel Monte-Carlo tournament simulator |
 | `oracle-ingest` | `DataProvider` trait + sim / replay / live adapters, rate-limit + cache |
+| `oracle-market` | decimal odds, de-vigging, Kelly staking, paper-trading backtest |
+| `oracle-players` | goalscorer markets (anytime / brace / hat-trick / first) + Golden Boot race |
+| `oracle-live` | in-play win probability, hedging and cash-out trading |
+| `oracle-derivatives` | totals, Asian handicap, correct score priced off the score grid |
 | `oracle-engine` | event-driven orchestrator, pub/sub, snapshot cache, metrics |
 | `oracle-api` | axum REST + WebSocket server (`oracle-server`) |
 | `oracle-cli` | `wc-oracle`: CLI commands + live TUI |
