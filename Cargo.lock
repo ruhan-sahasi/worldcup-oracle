@@ -1308,6 +1308,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "oracle-numeric"
+version = "0.1.0"
+
+[[package]]
 name = "oracle-players"
 version = "0.1.0"
 dependencies = [

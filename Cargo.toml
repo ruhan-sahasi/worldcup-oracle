@@ -13,6 +13,7 @@ description = "A live, ensemble World Cup prediction engine in Rust"
 
 [workspace.dependencies]
 # ---- internal crates ----
+oracle-numeric = { path = "crates/oracle-numeric", version = "0.1.0" }
 oracle-domain = { path = "crates/oracle-domain", version = "0.1.0" }
 oracle-ratings = { path = "crates/oracle-ratings", version = "0.1.0" }
 oracle-model = { path = "crates/oracle-model", version = "0.1.0" }
