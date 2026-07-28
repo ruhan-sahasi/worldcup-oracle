@@ -14,6 +14,7 @@
 //! its spread by, so a thinly-observed team is correctly treated as less certain.
 
 use oracle_domain::{Probabilities, Scoreline, TeamId};
+use oracle_numeric::normal_cdf;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -214,24 +215,6 @@ impl StateSpaceRatings {
     }
 }
 
-/// Standard normal CDF via the Abramowitz-Stegun `erf` approximation (max abs error ~1.5e-7),
-/// avoiding a heavyweight stats dependency.
-fn normal_cdf(x: f64) -> f64 {
-    0.5 * (1.0 + erf(x / std::f64::consts::SQRT_2))
-}
-
-fn erf(x: f64) -> f64 {
-    let sign = if x < 0.0 { -1.0 } else { 1.0 };
-    let x = x.abs();
-    let t = 1.0 / (1.0 + 0.327_591_1 * x);
-    let y = 1.0
-        - (((((1.061_405_429 * t - 1.453_152_027) * t) + 1.421_413_741) * t - 0.284_496_736) * t
-            + 0.254_829_592)
-            * t
-            * (-x * x).exp();
-    sign * y
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -320,11 +303,5 @@ mod tests {
             "repeated big wins should raise the rating"
         );
         assert!(r.mean(t(2)) < 0.0, "the beaten team's rating should fall");
-    }
-
-    #[test]
-    fn normal_cdf_is_sane() {
-        assert!((normal_cdf(0.0) - 0.5).abs() < 1e-9);
-        assert!(normal_cdf(3.0) > 0.99 && normal_cdf(-3.0) < 0.01);
     }
 }

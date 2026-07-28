@@ -9,5 +9,6 @@ rust-version.workspace = true
 description = "Elo rating system (home advantage + margin-of-victory) for worldcup-oracle"
 
 [dependencies]
+oracle-numeric.workspace = true
 oracle-domain.workspace = true
 serde.workspace = true
