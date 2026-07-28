@@ -163,6 +163,25 @@ impl ScoreGrid {
         best
     }
 
+    /// The `n` most likely exact scorelines as `(home_goals, away_goals, probability)`, most likely
+    /// first. Fewer than `n` are returned only if the grid holds fewer cells than that.
+    ///
+    /// This is [`most_likely_score`](Self::most_likely_score) generalized to a ranking - the usual
+    /// way a forecast is actually presented, since "2-1 at 9%" alone hides that 1-1 was 8.7%. Ties
+    /// break towards the lower scoreline in row-major order (the sort is stable), so the ranking is
+    /// deterministic for a given grid rather than dependent on the sort's internals.
+    pub fn top_scorelines(&self, n: usize) -> Vec<(usize, usize, f64)> {
+        let mut cells: Vec<(usize, usize, f64)> = self
+            .grid
+            .iter()
+            .enumerate()
+            .flat_map(|(h, row)| row.iter().enumerate().map(move |(a, &p)| (h, a, p)))
+            .collect();
+        cells.sort_by(|x, y| y.2.partial_cmp(&x.2).unwrap_or(std::cmp::Ordering::Equal));
+        cells.truncate(n);
+        cells
+    }
+
     /// P(total goals strictly greater than `line`), e.g. `line = 2.5` → over 2.5.
     pub fn prob_over(&self, line: f64) -> f64 {
         let mut p = 0.0;
@@ -227,5 +246,47 @@ mod tests {
         let p = g.outcome_probabilities();
         assert!((p.sum() - 1.0).abs() < 1e-9);
         assert!((p.home_win - p.away_win).abs() < 1e-9);
+    }
+
+    #[test]
+    fn top_scorelines_are_ranked_and_truncated() {
+        // A grid whose single most likely cell is 2-1.
+        let g = ScoreGrid::from_fn(4, |h, a| if (h, a) == (2, 1) { 10.0 } else { 1.0 });
+        let top = g.top_scorelines(3);
+        assert_eq!(top.len(), 3, "truncated to n");
+        assert_eq!((top[0].0, top[0].1), (2, 1), "modal scoreline first");
+        assert!(top[0].2 >= top[1].2 && top[1].2 >= top[2].2, "descending");
+    }
+
+    #[test]
+    fn top_scorelines_agrees_with_most_likely_score() {
+        let g = ScoreGrid::from_fn(6, |h, a| 1.0 / ((1 + 2 * h + 3 * a) as f64));
+        let (h, a, p) = g.most_likely_score();
+        let top = g.top_scorelines(1);
+        assert_eq!((top[0].0, top[0].1), (h as usize, a as usize));
+        assert!((top[0].2 - p).abs() < 1e-15);
+    }
+
+    #[test]
+    fn top_scorelines_breaks_ties_towards_the_lower_scoreline() {
+        // A flat grid: every cell is equally likely, so only the tie-break orders them.
+        let g = ScoreGrid::from_fn(3, |_, _| 1.0);
+        let top = g.top_scorelines(3);
+        assert_eq!(
+            [
+                (top[0].0, top[0].1),
+                (top[1].0, top[1].1),
+                (top[2].0, top[2].1)
+            ],
+            [(0, 0), (0, 1), (0, 2)],
+            "ties keep row-major order"
+        );
+    }
+
+    #[test]
+    fn asking_for_more_scorelines_than_exist_returns_them_all() {
+        let g = ScoreGrid::from_fn(2, |_, _| 1.0);
+        assert_eq!(g.top_scorelines(500).len(), 9, "a 3x3 grid has nine cells");
+        assert!(g.top_scorelines(0).is_empty());
     }
 }
