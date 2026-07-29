@@ -366,6 +366,10 @@ struct GroupSim {
 /// xG for a not-yet-started match, or the *remaining* rates for an in-progress one), and
 /// `current` is the score already on the board (0-0 unless in progress).
 struct RemainingMatch {
+    /// The fixture's own identity, used to address its goal-draw stream. Keying on the match id
+    /// rather than on its position in the fixture list is what makes the stream stable when a
+    /// scenario removes some *other* match from the remaining set.
+    id: MatchId,
     home_ix: usize,
     away_ix: usize,
     rates: (f64, f64),
@@ -377,6 +381,7 @@ struct RemainingMatch {
 mod stream_kind {
     pub const ITERATION: u32 = 0;
     pub const TEAM_STRENGTH: u32 = 1;
+    pub const GROUP_MATCH: u32 = 2;
     /// Draws not yet addressed by label; consumed sequentially, as the whole simulation once was.
     pub const SEQUENTIAL: u32 = 9;
 }
@@ -414,6 +419,15 @@ impl Streams {
             self.iteration_seed,
             stream_kind::TEAM_STRENGTH,
             team_ix as u64,
+        )
+    }
+
+    /// The stream for one group fixture's goal draws this iteration.
+    fn group_match(&self, id: MatchId) -> Rng {
+        Rng::stream(
+            self.iteration_seed,
+            stream_kind::GROUP_MATCH,
+            u64::from(id.0),
         )
     }
 
@@ -505,6 +519,7 @@ impl Prepared {
                             None => ((base_l, base_m), Scoreline::new(0, 0)),
                         };
                         Some(RemainingMatch {
+                            id: m.id,
                             home_ix: h,
                             away_ix: a,
                             rates,
@@ -930,8 +945,11 @@ impl Prepared {
                     let rate_h = rm.rates.0 * (att[rm.home_ix] - def[rm.away_ix]).exp();
                     let rate_a = rm.rates.1 * (att[rm.away_ix] - def[rm.home_ix]).exp();
                     // Final goals = already scored (0 unless in progress) + sampled remainder.
-                    let gh = i32::from(rm.current.home) + self.sample_goals(rng, rate_h);
-                    let ga = i32::from(rm.current.away) + self.sample_goals(rng, rate_a);
+                    // Each fixture draws its goals from its own stream, so conditioning some other
+                    // match cannot shift this one's scoreline.
+                    let mut mrng = streams.group_match(rm.id);
+                    let gh = i32::from(rm.current.home) + self.sample_goals(&mut mrng, rate_h);
+                    let ga = i32::from(rm.current.away) + self.sample_goals(&mut mrng, rate_a);
                     apply_result_at(&mut standings, pos[&rm.home_ix], pos[&rm.away_ix], gh, ga);
                 }
                 for (i, (_, s)) in table.iter_mut().enumerate() {
