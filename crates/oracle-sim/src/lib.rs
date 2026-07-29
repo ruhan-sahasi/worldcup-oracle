@@ -200,22 +200,108 @@ pub fn simulate_with_live<S: MatchSampler>(
     let prep = Prepared::build(tournament, sampler, config, inputs, live_config);
     let n = prep.teams.len();
 
-    // Fan out over iterations; each rayon task folds into its own tally, then we
-    // reduce the per-thread tallies into one.
-    let tally = (0..config.iterations)
+    tally_iterations(&prep, config.seed, 0..config.iterations, n)
+        .into_forecast(&prep.teams, config.iterations)
+}
+
+/// Simulate the given half-open range of iteration indices and tally the outcomes.
+///
+/// Fans out over iterations; each rayon task folds into its own tally and the per-thread tallies
+/// reduce into one. Iterations are addressed by their *global* index, so a run assembled from
+/// several batches draws exactly the randomness a single run of the same total length would - which
+/// is what lets [`simulate_to_precision`] extend a run without invalidating what it already has.
+fn tally_iterations(
+    prep: &Prepared,
+    seed: u64,
+    range: std::ops::Range<u64>,
+    n_teams: usize,
+) -> Tally {
+    range
         .into_par_iter()
         .fold(
-            || Tally::new(n, prep.required),
+            || Tally::new(n_teams, prep.required),
             |mut acc, i| {
-                let streams = Streams::new(config.seed, i);
-                let wins = prep.simulate_once(&streams);
-                acc.add(&wins);
+                acc.add(&prep.simulate_once(&Streams::new(seed, i)));
                 acc
             },
         )
-        .reduce(|| Tally::new(n, prep.required), Tally::merge);
+        .reduce(|| Tally::new(n_teams, prep.required), Tally::merge)
+}
 
-    tally.into_forecast(&prep.teams, config.iterations)
+/// How precisely a forecast needs to pin its champion probabilities, instead of how long it should
+/// run for.
+#[derive(Debug, Clone, Copy)]
+pub struct PrecisionTarget {
+    /// Stop once no team's champion probability has a standard error above this.
+    pub champion_std_error: f64,
+    /// Iterations per batch. The target is checked between batches, so this trades how far the run
+    /// can overshoot against how often it pays for a check.
+    pub batch: u64,
+    /// Hard ceiling, so an unreachable target terminates. A target near zero is unreachable at any
+    /// finite cost, since the standard error falls only as 1/sqrt(n).
+    pub max_iterations: u64,
+}
+
+impl Default for PrecisionTarget {
+    fn default() -> Self {
+        Self {
+            champion_std_error: 0.002,
+            batch: 5_000,
+            max_iterations: 500_000,
+        }
+    }
+}
+
+/// A forecast together with what it actually achieved.
+#[derive(Debug, Clone)]
+pub struct PreciseForecast {
+    pub forecast: TournamentForecast,
+    /// The largest champion-probability standard error across teams when the run stopped.
+    pub worst_champion_std_error: f64,
+    /// Whether the target was reached, as opposed to the iteration ceiling.
+    pub target_met: bool,
+}
+
+/// Simulate until the champion probabilities are pinned to `target`, rather than for a fixed number
+/// of iterations.
+///
+/// A fixed iteration count is a guess about how hard the question is. It over-spends on a field with
+/// a runaway favourite and under-spends on an open one, and it never reports which happened. This
+/// runs in batches and stops when the worst team's standard error clears the target, so the caller
+/// asks for the precision it needs and finds out what it cost.
+///
+/// One honest caveat: stopping on an observed standard error is a sequential decision, and the
+/// stopped estimate carries a slight optimistic bias - the run is more likely to halt on a batch
+/// where the sample happened to look settled. The effect is small next to the target itself at these
+/// batch sizes, and reporting the achieved error rather than the target keeps it visible.
+pub fn simulate_to_precision<S: MatchSampler>(
+    tournament: &Tournament,
+    sampler: &S,
+    config: SimConfig,
+    inputs: &LiveInputs,
+    live_config: LiveConfig,
+    target: PrecisionTarget,
+) -> PreciseForecast {
+    let prep = Prepared::build(tournament, sampler, config, inputs, live_config);
+    let n = prep.teams.len();
+    let batch = target.batch.max(1);
+    let ceiling = target.max_iterations.max(batch);
+
+    let mut tally = Tally::new(n, prep.required);
+    let mut done = 0u64;
+    loop {
+        let next = (done + batch).min(ceiling);
+        tally = tally.merge(tally_iterations(&prep, config.seed, done..next, n));
+        done = next;
+        let worst = tally.worst_champion_std_error(done);
+        if worst <= target.champion_std_error || done >= ceiling {
+            return PreciseForecast {
+                forecast: tally.into_forecast(&prep.teams, done),
+                worst_champion_std_error: worst,
+                target_met: worst <= target.champion_std_error,
+            };
+        }
+    }
 }
 
 /// Whether `team` was champion in each simulated tournament, one entry per iteration in iteration
@@ -1272,6 +1358,35 @@ impl Tally {
         self
     }
 
+    /// The largest standard error on any team's champion probability after `n` iterations.
+    ///
+    /// Each champion count is a binomial over `n` trials. The obvious estimate of its standard
+    /// error, `sqrt(p(1-p)/n)` with `p` the observed share, is unusable as a *stopping rule*: it
+    /// returns exactly zero for any team that has not yet won a single iteration. Since most of a
+    /// 48-team field never wins one, and after one iteration every team has a share of exactly 0 or
+    /// 1, a run could halt claiming perfect precision having learned almost nothing.
+    ///
+    /// So the share is shrunk by the Agresti-Coull "plus four" adjustment - two notional wins and
+    /// two notional losses - before the error is computed. A team on zero wins then carries a small
+    /// non-zero error that shrinks properly with `n`, which is the honest statement: never having
+    /// seen an event is not the same as knowing it cannot happen.
+    ///
+    /// The maximum over teams is the run's binding constraint, since a mid-probability contender is
+    /// far harder to pin down than a no-hoper.
+    fn worst_champion_std_error(&self, n: u64) -> f64 {
+        if n == 0 {
+            return f64::INFINITY;
+        }
+        let adjusted = n as f64 + 4.0;
+        self.counts
+            .iter()
+            .map(|c| {
+                let p = (c[5] as f64 + 2.0) / adjusted;
+                (p * (1.0 - p) / adjusted).sqrt()
+            })
+            .fold(0.0, f64::max)
+    }
+
     fn into_forecast(self, teams: &[TeamId], iterations: u64) -> TournamentForecast {
         let denom = iterations.max(1) as f64;
         let team_forecasts = teams
@@ -1667,6 +1782,182 @@ mod tests {
             .map(|&t| (p(&c, t) - p(&b, t)).abs())
             .sum::<f64>()
             / others.len() as f64
+    }
+
+    #[test]
+    fn batching_a_run_matches_running_it_whole() {
+        // The property the precision loop rests on: iterations are addressed by global index, so a
+        // run assembled from batches must be bit-identical to one run straight through. If this
+        // fails, extending a run silently rerandomises what it already had.
+        let t = full_tournament();
+        let cfg = SimConfig {
+            iterations: 4000,
+            seed: 5,
+            ..Default::default()
+        };
+        let whole = simulate(&t, &RankSampler, cfg);
+
+        let prep = Prepared::build(
+            &t,
+            &RankSampler,
+            cfg,
+            &LiveInputs::default(),
+            LiveConfig::default(),
+        );
+        let n = prep.teams.len();
+        let batched = tally_iterations(&prep, cfg.seed, 0..1500, n)
+            .merge(tally_iterations(&prep, cfg.seed, 1500..4000, n))
+            .into_forecast(&prep.teams, 4000);
+        assert_eq!(whole.teams, batched.teams, "batching changed the forecast");
+    }
+
+    #[test]
+    fn a_precision_run_reaches_its_target_and_reports_the_cost() {
+        let t = full_tournament();
+        let target = PrecisionTarget {
+            champion_std_error: 0.004,
+            batch: 2_000,
+            max_iterations: 200_000,
+        };
+        let out = simulate_to_precision(
+            &t,
+            &RankSampler,
+            SimConfig {
+                seed: 9,
+                ..Default::default()
+            },
+            &LiveInputs::default(),
+            LiveConfig::default(),
+            target,
+        );
+        assert!(out.target_met, "target should be reachable");
+        assert!(
+            out.worst_champion_std_error <= 0.004,
+            "achieved {}",
+            out.worst_champion_std_error
+        );
+        // It should stop as soon as the target is met, not run to the ceiling.
+        assert!(out.forecast.iterations < 200_000);
+        assert_eq!(
+            out.forecast.iterations % 2_000,
+            0,
+            "stops on a batch boundary"
+        );
+        // The forecast itself must still be coherent.
+        let total: f64 = out.forecast.teams.iter().map(|f| f.p_champion).sum();
+        assert!((total - 1.0).abs() < 1e-9, "champion mass {total}");
+    }
+
+    #[test]
+    fn a_tighter_target_costs_more_iterations() {
+        let t = full_tournament();
+        let run = |se: f64| {
+            simulate_to_precision(
+                &t,
+                &RankSampler,
+                SimConfig {
+                    seed: 3,
+                    ..Default::default()
+                },
+                &LiveInputs::default(),
+                LiveConfig::default(),
+                PrecisionTarget {
+                    champion_std_error: se,
+                    batch: 2_000,
+                    max_iterations: 200_000,
+                },
+            )
+            .forecast
+            .iterations
+        };
+        // The standard error falls as 1/sqrt(n), so halving it should cost roughly four times as
+        // many iterations. Assert only the direction, which is what the feature promises.
+        assert!(run(0.003) > run(0.006), "a tighter target must cost more");
+    }
+
+    #[test]
+    fn an_unreachable_target_stops_at_the_ceiling_and_says_so() {
+        let t = full_tournament();
+        let out = simulate_to_precision(
+            &t,
+            &RankSampler,
+            SimConfig::default(),
+            &LiveInputs::default(),
+            LiveConfig::default(),
+            PrecisionTarget {
+                // No finite run achieves this; the error falls only as 1/sqrt(n).
+                champion_std_error: 1e-9,
+                batch: 1_000,
+                max_iterations: 3_000,
+            },
+        );
+        assert!(!out.target_met, "must not claim an unmet target");
+        assert_eq!(out.forecast.iterations, 3_000, "stops at the ceiling");
+        assert!(out.worst_champion_std_error > 1e-9);
+    }
+
+    #[test]
+    fn a_degenerate_precision_target_still_terminates() {
+        let t = full_tournament();
+        let out = simulate_to_precision(
+            &t,
+            &RankSampler,
+            SimConfig::default(),
+            &LiveInputs::default(),
+            LiveConfig::default(),
+            // A zero batch and a ceiling below it: both are clamped rather than looping forever.
+            PrecisionTarget {
+                champion_std_error: 0.0,
+                batch: 0,
+                max_iterations: 0,
+            },
+        );
+        assert_eq!(out.forecast.iterations, 1, "one clamped iteration");
+        // A single iteration must not be mistaken for perfect precision. The unshrunk binomial
+        // error would be exactly zero here, since every team's share is 0 or 1 after one trial.
+        assert!(
+            !out.target_met,
+            "must not claim a met target after one trial"
+        );
+        assert!(
+            out.worst_champion_std_error > 0.1,
+            "one iteration should look very uncertain, got {}",
+            out.worst_champion_std_error
+        );
+    }
+
+    #[test]
+    fn a_team_with_no_wins_still_carries_uncertainty() {
+        // The stopping statistic must not read zero error off an unobserved event. In this field the
+        // weakest teams never win a single iteration, so the unshrunk formula would give them
+        // exactly zero - and with a small enough run, drag the worst-case error to zero with them.
+        let t = full_tournament();
+        let out = simulate_to_precision(
+            &t,
+            &RankSampler,
+            SimConfig {
+                seed: 4,
+                ..Default::default()
+            },
+            &LiveInputs::default(),
+            LiveConfig::default(),
+            PrecisionTarget {
+                champion_std_error: 0.01,
+                batch: 500,
+                max_iterations: 10_000,
+            },
+        );
+        let never_won = out
+            .forecast
+            .teams
+            .iter()
+            .filter(|f| f.p_champion == 0.0)
+            .count();
+        assert!(never_won > 0, "this field should have teams on zero");
+        assert!(
+            out.worst_champion_std_error > 0.0,
+            "a run containing unobserved events cannot have zero error"
+        );
     }
 
     #[test]
