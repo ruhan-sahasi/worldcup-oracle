@@ -90,6 +90,47 @@ impl Rng {
         (-2.0 * u1.ln()).sqrt() * (2.0 * std::f64::consts::PI * u2).cos()
     }
 
+    /// A Gamma-distributed draw with shape `k` and scale `theta` (mean `k * theta`, variance
+    /// `k * theta^2`). A non-positive shape or scale yields `0.0`.
+    ///
+    /// Uses the Marsaglia-Tsang squeeze method, which is rejection sampling on a cube-root
+    /// transform of the Gamma density: it needs one normal and one uniform per attempt and accepts
+    /// the great majority of the time, so the expected cost is near-constant in the shape.
+    ///
+    /// The method requires `k >= 1`. A smaller shape is handled by the standard boost identity -
+    /// draw at `k + 1` and scale by `u^(1/k)` - so the sub-one shapes the overdispersed goal model
+    /// uses (a dispersion below one means very fat tails) are sampled exactly rather than clamped.
+    pub fn gamma(&mut self, k: f64, theta: f64) -> f64 {
+        if k <= 0.0 || theta <= 0.0 {
+            return 0.0;
+        }
+        if k < 1.0 {
+            // Boost: if G ~ Gamma(k+1) and U ~ Uniform(0,1) then G * U^(1/k) ~ Gamma(k).
+            let g = self.gamma(k + 1.0, theta);
+            // Nudge off zero so that u.ln() is finite.
+            let u = (self.unit() + 1e-300).min(1.0);
+            return g * u.powf(1.0 / k);
+        }
+        let d = k - 1.0 / 3.0;
+        let c = 1.0 / (9.0 * d).sqrt();
+        loop {
+            let x = self.normal();
+            let v = 1.0 + c * x;
+            if v <= 0.0 {
+                continue;
+            }
+            let v3 = v * v * v;
+            let u = self.unit();
+            // The squeeze: a cheap polynomial test that accepts most draws without a logarithm.
+            if u < 1.0 - 0.033_1 * x * x * x * x {
+                return d * v3 * theta;
+            }
+            if u.ln() < 0.5 * x * x + d * (1.0 - v3 + v3.ln()) {
+                return d * v3 * theta;
+            }
+        }
+    }
+
     /// A Poisson-distributed count with mean `lambda` (`0` for a non-positive `lambda`), by Knuth's
     /// multiplication method.
     ///
@@ -241,6 +282,112 @@ mod tests {
         let var = xs.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / N as f64;
         assert!(mean.abs() < 0.01, "mean was {mean}");
         assert!((var - 1.0).abs() < 0.02, "variance was {var}");
+    }
+
+    /// Sample mean and (population) variance of `n` draws.
+    fn moments(rng: &mut Rng, n: usize, mut draw: impl FnMut(&mut Rng) -> f64) -> (f64, f64) {
+        let xs: Vec<f64> = (0..n).map(|_| draw(rng)).collect();
+        let mean = xs.iter().sum::<f64>() / n as f64;
+        let var = xs.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / n as f64;
+        (mean, var)
+    }
+
+    #[test]
+    fn gamma_recovers_its_moments_for_shapes_above_one() {
+        // Mean = k*theta, variance = k*theta^2.
+        for (k, theta) in [(1.0, 1.0), (2.5, 0.4), (9.0, 0.5)] {
+            let mut rng = Rng::new(31);
+            let (mean, var) = moments(&mut rng, 200_000, |r| r.gamma(k, theta));
+            assert!(
+                (mean - k * theta).abs() < 0.03 * k * theta,
+                "k={k} theta={theta}: mean {mean} vs {}",
+                k * theta
+            );
+            assert!(
+                (var - k * theta * theta).abs() < 0.06 * k * theta * theta,
+                "k={k} theta={theta}: var {var} vs {}",
+                k * theta * theta
+            );
+        }
+    }
+
+    #[test]
+    fn gamma_recovers_its_moments_for_shapes_below_one() {
+        // The boost branch. A sub-one shape is where the overdispersed goal model lives.
+        for (k, theta) in [(0.2, 2.0), (0.5, 1.0), (0.9, 0.7)] {
+            let mut rng = Rng::new(32);
+            let (mean, var) = moments(&mut rng, 200_000, |r| r.gamma(k, theta));
+            assert!(
+                (mean - k * theta).abs() < 0.04 * k * theta,
+                "k={k}: mean {mean} vs {}",
+                k * theta
+            );
+            assert!(
+                (var - k * theta * theta).abs() < 0.10 * k * theta * theta,
+                "k={k}: var {var} vs {}",
+                k * theta * theta
+            );
+        }
+    }
+
+    #[test]
+    fn gamma_draws_are_positive_and_finite() {
+        let mut rng = Rng::new(33);
+        for k in [0.1, 0.5, 1.0, 3.0, 50.0] {
+            for _ in 0..2_000 {
+                let x = rng.gamma(k, 1.5);
+                assert!(x > 0.0 && x.is_finite(), "gamma({k}, 1.5) returned {x}");
+            }
+        }
+    }
+
+    #[test]
+    fn gamma_at_shape_one_is_exponential() {
+        // Gamma(1, theta) is Exponential(mean theta): P(X > theta) should be 1/e.
+        let mut rng = Rng::new(34);
+        const N: usize = 100_000;
+        let theta = 2.0;
+        let over = (0..N).filter(|_| rng.gamma(1.0, theta) > theta).count();
+        let share = over as f64 / N as f64;
+        let want = std::f64::consts::E.recip();
+        assert!((share - want).abs() < 0.01, "P(X>theta) was {share}");
+    }
+
+    #[test]
+    fn a_non_positive_gamma_parameter_yields_zero() {
+        let mut rng = Rng::new(35);
+        assert_eq!(rng.gamma(0.0, 1.0), 0.0);
+        assert_eq!(rng.gamma(-1.0, 1.0), 0.0);
+        assert_eq!(rng.gamma(1.0, 0.0), 0.0);
+        assert_eq!(rng.gamma(1.0, -2.0), 0.0);
+    }
+
+    #[test]
+    fn a_gamma_poisson_mixture_is_overdispersed() {
+        // The composition oracle-sim actually uses: draw the rate from a Gamma, then a Poisson
+        // count from that rate. The mean is preserved; the variance must exceed the Poisson's.
+        let lambda = 1.5;
+        let size = 4.0;
+        let mut rng = Rng::new(36);
+        let (mixed_mean, mixed_var) = moments(&mut rng, 200_000, |r| {
+            let rate = r.gamma(size, lambda / size);
+            f64::from(r.poisson(rate))
+        });
+        let mut rng = Rng::new(37);
+        let (plain_mean, plain_var) = moments(&mut rng, 200_000, |r| f64::from(r.poisson(lambda)));
+
+        assert!((mixed_mean - lambda).abs() < 0.02, "mean {mixed_mean}");
+        assert!((plain_mean - lambda).abs() < 0.02, "mean {plain_mean}");
+        // Var = mean + mean^2/size = 1.5 + 0.5625 for the mixture, against ~1.5 for the Poisson.
+        assert!(
+            mixed_var > plain_var + 0.3,
+            "mixture var {mixed_var} should exceed Poisson var {plain_var}"
+        );
+        assert!(
+            (mixed_var - (lambda + lambda * lambda / size)).abs() < 0.1,
+            "mixture var {mixed_var} vs analytic {}",
+            lambda + lambda * lambda / size
+        );
     }
 
     #[test]
