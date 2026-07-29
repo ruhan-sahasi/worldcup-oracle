@@ -329,9 +329,41 @@ offline - real: historical shootout conversion and knockout history - and feed i
 `LiveInputs`). And because the bracket is played round by round, a side whose tie goes to **extra
 time** carries a one-round **fatigue** penalty into the next round - a genuinely dynamic
 within-tournament state the per-tie sampling tracks. Iterations are independent, so it fans out
-over `rayon`; per-iteration RNG seeds make
-a given `(seed, iterations)` perfectly reproducible. Each probability carries a Monte-Carlo
-standard error `sqrt(p(1-p)/N)`, surfaced by `simulate`.
+over `rayon`. Each probability carries a Monte-Carlo standard error `sqrt(p(1-p)/N)`, surfaced by
+`simulate`.
+
+**Randomness is addressed, not sequenced.** Within an iteration, every draw comes from a substream
+named by what it belongs to - a team's strength perturbation by team index, a group fixture's goals
+by its `MatchId`, a knockout tie by its `(round, slot)` bracket position - rather than from one
+stream consumed in order. A given `(seed, iterations)` is still perfectly reproducible, but the
+stronger property is that a draw no longer depends on *how many draws came before it*.
+
+That matters for the difference estimators (`kingmaker`, `collision`, `sensitivity`), which report
+what changes between two runs. Under a single sequential stream, conditioning one match shifts every
+draw after it, so two runs differing in one result share no randomness downstream and the difference
+carries the full noise of both. With labelled streams, an entity the change does not touch draws
+identical numbers either way. Measured: conditioning one group result leaves the other eleven groups'
+qualification probabilities drifting by ~0.0017 rather than ~0.0100, a 6x reduction.
+
+The gain is real where it applies and absent where it does not, which is worth stating plainly. It
+does **not** reduce the noise in `kingmaker`'s champion-probability swings, because conditioning a
+result changes how often a team tops its group, so it enters a different bracket slot and its whole
+knockout path is legitimately different randomness. That path change *is* the effect being measured.
+So each swing is reported as a `PairedDifference` - mean, standard error of the difference, and
+iteration count - computed from the per-iteration differences rather than from two aggregate
+probabilities, which is the only correct way when the runs are correlated. `is_significant()` answers
+the question a reader actually has: can the simulation resolve this swing at all?
+
+**Precision targeting.** `simulate_to_precision` inverts the control: instead of a fixed iteration
+count, it batches until no team's champion standard error exceeds a target, then reports the error it
+achieved and whether the target was met (`--precision 0.002`, `?precision=0.002`). Iterations are
+addressed by global index, so a run assembled from batches draws exactly what one straight run of the
+same length would. The stopping statistic shrinks each champion share by the Agresti-Coull "plus
+four" adjustment first, because the plain `sqrt(p(1-p)/N)` is exactly zero for a team that has not yet
+won an iteration - and most of a 48-team field never does, which would let a run halt claiming perfect
+precision. Two caveats kept visible rather than buried: stopping on an observed error is a sequential
+decision and so mildly optimistic, and a target near zero is unreachable at any finite cost since the
+error falls only as `1/sqrt(N)`.
 
 The knockout uses the **fixed 2026 bracket** (`oracle_domain::bracket::FIXED_R32`, shared with
 the ingest layer) when the tournament has the real shape - 12 groups of four, top two plus the
@@ -406,9 +438,8 @@ that a calibrated model still does not beat the price once the margin is priced 
 ### Goalscorer markets and the Golden Boot (`oracle-players` + `oracle-engine::query`)
 The player-level layer, a pure leaf crate. It shares a team's expected goals across its players by
 attacking weight, reads off the Poisson scorer markets (anytime, brace, hat-trick, first goal), and
-runs a seeded Monte-Carlo Golden Boot race over expected tournament goals, with its own SplitMix64
-generator and Knuth Poisson sampler so it carries no `rand` dependency and every layer is unit-tested
-in isolation. `Explorer::scorer_market` and `Explorer::golden_boot` feed it the squad model's attack
+runs a seeded Monte-Carlo Golden Boot race over expected tournament goals, drawing from
+`oracle-numeric`'s shared generator and Poisson sampler so every layer is unit-testable in isolation. `Explorer::scorer_market` and `Explorer::golden_boot` feed it the squad model's attack
 weights and the goal model's expected goals, and it is surfaced on `/api/scorers`, `/api/golden-boot`,
 the explorer's Players tab, and `wc-oracle scorers` / `golden-boot`. The player weights are the squad
 model's own scores, so nothing is invented; the tournament expected-goals estimate is a labelled

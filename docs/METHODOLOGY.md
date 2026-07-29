@@ -97,6 +97,29 @@ The goal-model parameters progressed deliberately:
 Hyperparameters (`ξ`, ridge, score model) are chosen by **Bayesian optimization** (a Gaussian-process
 surrogate + Expected Improvement) over a continuous space, not a hand-specified grid.
 
+## Monte-Carlo error as a first-class quantity
+
+A simulated forecast is an estimate, and an estimate without an error bar invites a reader to trust
+digits that are not there. Three choices follow from taking that seriously.
+
+**Ask for precision, not iterations.** An iteration count is a guess about how hard the question is:
+it over-spends on a field with a runaway favourite, under-spends on an open one, and never says which
+happened. `--precision` states what the answer needs to be worth and lets the simulator decide the
+cost, reporting the error it achieved and whether the target was met. A tight target costs roughly
+four times what a target twice as loose does, because the error falls as `1/sqrt(N)` - which is also
+why no finite run reaches a target of zero.
+
+**Report the error of the quantity being read, not of its parts.** The rooting-interest analysis
+reports *differences* in championship odds. The error of a difference is not the error of the two
+probabilities behind it, and treating them as independent overstates it whenever the two runs share
+randomness. So the differences are taken one iteration at a time and their spread is the error.
+
+**Do not let an unobserved event look certain.** The obvious error estimate for a probability,
+`sqrt(p(1-p)/N)`, is exactly zero when `p` is zero. Most of a 48-team field never wins a single
+simulated tournament, so as a stopping rule this would happily halt claiming perfection. Shrinking
+each share by two notional wins and two notional losses (Agresti-Coull) keeps the honest statement:
+never having seen an event is not the same as knowing it cannot happen.
+
 ## A second model: Bradley-Terry-Davidson
 
 The Dixon-Coles model above reasons about *goals*. As a tournament fills up with real results, a

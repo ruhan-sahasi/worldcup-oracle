@@ -133,6 +133,9 @@ cargo build --release
 
 # 2. Champion odds for the 2026 World Cup (reproducible with --seed):
 cargo run --release -p oracle-cli -- simulate --iters 50000
+
+# ...or ask for the accuracy you need and let it decide how long to run:
+cargo run --release -p oracle-cli -- simulate --precision 0.002
 # ...or condition on the REAL 2026 field still alive at a stage and forecast forward from it:
 cargo run --release -p oracle-cli -- simulate --stage quarter-final   # or round-of-16 | semi-final | final
 ```
