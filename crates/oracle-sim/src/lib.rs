@@ -44,9 +44,7 @@ use oracle_domain::{
     MatchId, MatchStatus, Scoreline, Stage, TeamForecast, TeamId, Tournament, TournamentForecast,
 };
 use oracle_model::{remaining_rates, LiveConfig, LiveState};
-use rand::rngs::StdRng;
-use rand::{Rng, SeedableRng};
-use rand_distr::{Distribution, Gamma, Normal, Poisson};
+use oracle_numeric::Rng;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -209,7 +207,7 @@ pub fn simulate_with_live<S: MatchSampler>(
         .fold(
             || Tally::new(n, prep.required),
             |mut acc, i| {
-                let mut rng = StdRng::seed_from_u64(config.seed.wrapping_add(i).wrapping_add(1));
+                let mut rng = Rng::new(config.seed.wrapping_add(i).wrapping_add(1));
                 let wins = prep.simulate_once(&mut rng);
                 acc.add(&wins);
                 acc
@@ -271,7 +269,7 @@ pub fn meeting_probabilities<S: MatchSampler>(
         .fold(
             || [0u64; ROUNDS],
             |mut acc, i| {
-                let mut rng = StdRng::seed_from_u64(config.seed.wrapping_add(i).wrapping_add(1));
+                let mut rng = Rng::new(config.seed.wrapping_add(i).wrapping_add(1));
                 let mut met: Option<u8> = None;
                 prep.simulate_once_with(&mut rng, |round, x, y| {
                     if met.is_none() && ((x == a_ix && y == b_ix) || (x == b_ix && y == a_ix)) {
@@ -632,23 +630,17 @@ impl Prepared {
     /// Gamma (the negative-binomial / Gamma-Poisson mixture), so a team's effective rate varies
     /// match to match and scorelines get the fatter tails real football shows; dispersion 0 is a
     /// plain Poisson(λ).
-    fn sample_goals(&self, rng: &mut StdRng, lambda: f64) -> i32 {
+    fn sample_goals(&self, rng: &mut Rng, lambda: f64) -> i32 {
         if lambda <= 1e-9 {
             return 0;
         }
         let rate = if self.dispersion > 0.0 {
             let r = self.dispersion;
-            Gamma::new(r, lambda / r)
-                .map(|g| g.sample(rng))
-                .unwrap_or(lambda)
-                .max(1e-9)
+            rng.gamma(r, lambda / r).max(1e-9)
         } else {
             lambda
         };
-        match Poisson::new(rate) {
-            Ok(dist) => (dist.sample(rng) as i32).min(20),
-            Err(_) => 0,
-        }
+        (rng.poisson(rate) as i32).min(20)
     }
 
     /// Sample the winner's team-index of a knockout tie: 90 minutes, then 30 of extra time
@@ -657,7 +649,7 @@ impl Prepared {
     /// from a previous round's extra time.
     fn sample_knockout(
         &self,
-        rng: &mut StdRng,
+        rng: &mut Rng,
         a: usize,
         b: usize,
         att: &[f64],
@@ -695,7 +687,7 @@ impl Prepared {
                     + self.shootout_skill * (la - ma)
                     + SHOOTOUT_RATING_SCALE * (self.shootout_rating[a] - self.shootout_rating[b]))
                     .clamp(0.35, 0.65);
-                if rng.gen::<f64>() < p {
+                if rng.chance(p) {
                     a
                 } else {
                     b
@@ -712,7 +704,7 @@ impl Prepared {
     /// course is unknown), so it carries no fatigue forward.
     fn play_ko_tie(
         &self,
-        rng: &mut StdRng,
+        rng: &mut Rng,
         a: usize,
         b: usize,
         att: &[f64],
@@ -752,7 +744,7 @@ impl Prepared {
     /// Returns `(winner, went_to_extra_time)`. `fatigue` is `(home, away)` log-attack penalties.
     fn sample_live_ko(
         &self,
-        rng: &mut StdRng,
+        rng: &mut Rng,
         (home_ix, away_ix): (usize, usize),
         rem_rates: (f64, f64),
         current: Scoreline,
@@ -785,7 +777,7 @@ impl Prepared {
                     + SHOOTOUT_RATING_SCALE
                         * (self.shootout_rating[home_ix] - self.shootout_rating[away_ix]))
                     .clamp(0.35, 0.65);
-                if rng.gen::<f64>() < p {
+                if rng.chance(p) {
                     home_ix
                 } else {
                     away_ix
@@ -797,28 +789,21 @@ impl Prepared {
 
     /// Draw this iteration's per-team log-space `(attack, defense)` strength shifts from each
     /// team's uncertainty. Returns all-zero vectors when no uncertainty is configured.
-    fn draw_strength_shifts(&self, rng: &mut StdRng) -> (Vec<f64>, Vec<f64>) {
+    fn draw_strength_shifts(&self, rng: &mut Rng) -> (Vec<f64>, Vec<f64>) {
         if !self.has_uncertainty {
             return (vec![0.0; self.n], vec![0.0; self.n]);
         }
-        let std_normal = Normal::new(0.0, 1.0).expect("valid normal");
-        let draw = |rng: &mut StdRng| -> Vec<f64> {
+        let draw = |rng: &mut Rng| -> Vec<f64> {
             self.team_sigma
                 .iter()
-                .map(|&s| {
-                    if s > 0.0 {
-                        s * std_normal.sample(rng)
-                    } else {
-                        0.0
-                    }
-                })
+                .map(|&s| if s > 0.0 { s * rng.normal() } else { 0.0 })
                 .collect()
         };
         (draw(rng), draw(rng))
     }
 
     /// Play one full tournament (the normal forecast path).
-    fn simulate_once(&self, rng: &mut StdRng) -> Vec<i64> {
+    fn simulate_once(&self, rng: &mut Rng) -> Vec<i64> {
         self.simulate_once_with(rng, |_, _, _| {})
     }
 
@@ -829,7 +814,7 @@ impl Prepared {
     /// meeting analysis records the pairings.
     fn simulate_once_with<F: FnMut(u8, usize, usize)>(
         &self,
-        rng: &mut StdRng,
+        rng: &mut Rng,
         mut on_tie: F,
     ) -> Vec<i64> {
         let mut wins = vec![-1i64; self.n];
@@ -1173,7 +1158,7 @@ mod tests {
             &inputs,
             LiveConfig::default(),
         );
-        let mut rng = StdRng::seed_from_u64(11);
+        let mut rng = Rng::new(11);
         let z = vec![0.0; prep.n];
         let trials = 30_000;
         let wins = (0..trials)
@@ -1200,7 +1185,7 @@ mod tests {
             &inputs,
             LiveConfig::default(),
         );
-        let mut rng = StdRng::seed_from_u64(5);
+        let mut rng = Rng::new(5);
         let z = vec![0.0; prep.n];
         let trials = 30_000;
         let wins = (0..trials)
@@ -1227,7 +1212,7 @@ mod tests {
         let trials = 40_000;
 
         // Even ties reach extra time a non-trivial share of the time (so fatigue can be carried).
-        let mut rng = StdRng::seed_from_u64(3);
+        let mut rng = Rng::new(3);
         let et = (0..trials)
             .filter(|_| prep.sample_knockout(&mut rng, 0, 1, &z, &z, (0.0, 0.0)).1)
             .count();
@@ -1238,7 +1223,7 @@ mod tests {
 
         // A side carrying extra-time fatigue wins fewer ties than when fresh (same RNG stream).
         let win = |fatigue: (f64, f64), seed: u64| -> f64 {
-            let mut r = StdRng::seed_from_u64(seed);
+            let mut r = Rng::new(seed);
             (0..trials)
                 .filter(|_| prep.sample_knockout(&mut r, 0, 1, &z, &z, fatigue).0 == 0)
                 .count() as f64
@@ -1303,7 +1288,7 @@ mod tests {
                 &LiveInputs::default(),
                 LiveConfig::default(),
             );
-            let mut rng = StdRng::seed_from_u64(1);
+            let mut rng = Rng::new(1);
             let n = 20_000;
             let xs: Vec<f64> = (0..n)
                 .map(|_| prep.sample_goals(&mut rng, 1.4) as f64)
@@ -1340,7 +1325,7 @@ mod tests {
             &LiveInputs::default(),
             LiveConfig::default(),
         );
-        let mut rng = StdRng::seed_from_u64(99);
+        let mut rng = Rng::new(99);
         let z = vec![0.0; prep.n];
         let trials = 20_000;
         let a_wins = (0..trials)
@@ -1365,7 +1350,7 @@ mod tests {
             &LiveInputs::default(),
             LiveConfig::default(),
         );
-        let mut rng = StdRng::seed_from_u64(7);
+        let mut rng = Rng::new(7);
         let z = vec![0.0; prep.n];
         let trials = 20_000;
         let strong_wins = (0..trials)
