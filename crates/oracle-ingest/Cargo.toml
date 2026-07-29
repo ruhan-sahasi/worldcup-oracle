@@ -21,8 +21,6 @@ async-trait.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
 reqwest.workspace = true
-rand.workspace = true
-rand_distr.workspace = true
 csv.workspace = true
 tracing.workspace = true
 

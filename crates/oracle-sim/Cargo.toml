@@ -12,8 +12,6 @@ description = "Parallel Monte-Carlo tournament simulator (group + knockout) for 
 oracle-numeric.workspace = true
 oracle-domain.workspace = true
 oracle-model.workspace = true
-rand.workspace = true
-rand_distr.workspace = true
 rayon.workspace = true
 serde.workspace = true
 
