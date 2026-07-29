@@ -379,6 +379,9 @@ async fn api_posterior(
 struct SimParams {
     iters: Option<u64>,
     seed: Option<u64>,
+    /// Target champion-probability standard error. When present the run decides its own length and
+    /// `iters` is ignored, so a caller asks for the precision it needs rather than guessing a count.
+    precision: Option<f64>,
 }
 
 async fn api_simulate(
@@ -390,10 +393,17 @@ async fn api_simulate(
     }
     let iters = p.iters.unwrap_or(20_000);
     let seed = p.seed.unwrap_or(42);
-    tokio::task::spawn_blocking(move || explorer.get().unwrap().simulate(iters, seed))
-        .await
-        .map(Json)
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+    let precision = p.precision;
+    tokio::task::spawn_blocking(move || {
+        let ex = explorer.get().unwrap();
+        match precision {
+            Some(target) => ex.simulate_to_precision(target, seed),
+            None => ex.simulate(iters, seed),
+        }
+    })
+    .await
+    .map(Json)
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
 }
 
 #[derive(Deserialize)]

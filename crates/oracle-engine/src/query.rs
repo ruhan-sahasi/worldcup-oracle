@@ -31,7 +31,7 @@ use oracle_players::{
 use oracle_ratings::{RatingStore, StateSpaceRatings};
 use oracle_sim::{
     champion_indicators, meeting_probabilities, simulate_with_live, LiveInputs, PairedDifference,
-    SimConfig,
+    PrecisionTarget, SimConfig,
 };
 use serde::Serialize;
 use std::collections::HashMap;
@@ -65,6 +65,9 @@ pub struct BacktestReport {
 
 /// Hard ceilings so a single request cannot tie the server up indefinitely.
 const SIM_MAX_ITERS: u64 = 100_000;
+/// Iterations per batch in a precision-targeted run. Large enough that the between-batch check is a
+/// rounding error on the batch itself, small enough to avoid overshooting an easy target badly.
+const PRECISION_BATCH: u64 = 5_000;
 const POSTERIOR_MAX_SAMPLES: usize = 1500;
 /// The sensitivity analysis runs ten simulations, so cap its per-variant iterations lower.
 const SENSITIVITY_MAX_ITERS: u64 = 50_000;
@@ -521,12 +524,6 @@ impl Explorer {
     /// live forecast uses) and return the ranked champion-odds table with Monte-Carlo error bars.
     pub fn simulate(&self, iters: u64, seed: u64) -> SimForecast {
         let iters = iters.clamp(1000, SIM_MAX_ITERS);
-        let inputs = LiveInputs {
-            venue: data::matchup_adjustments(&self.tournament),
-            shootout_rating: self.shootout_rating.clone(),
-            knockout_pedigree: self.knockout_pedigree.clone(),
-            ..Default::default()
-        };
         let forecast = simulate_with_live(
             &self.tournament,
             &self.model,
@@ -535,9 +532,64 @@ impl Explorer {
                 seed,
                 ..SimConfig::default()
             },
-            &inputs,
+            &self.sim_inputs(),
             LiveConfig::default(),
         );
+        self.assemble_sim_forecast(forecast, seed, None)
+    }
+
+    /// The same forecast, but run to a **precision target** rather than a fixed iteration count:
+    /// keep simulating until no team's champion probability has a standard error above
+    /// `champion_std_error`, then report how many iterations that took.
+    ///
+    /// This is the honest way to ask the question. An iteration count is a guess about how hard the
+    /// field is to resolve; a precision target says what the answer needs to be worth and lets the
+    /// simulator decide the cost. The returned [`SimForecast::precision`] records whether the target
+    /// was reached and what error was actually achieved.
+    pub fn simulate_to_precision(&self, champion_std_error: f64, seed: u64) -> SimForecast {
+        // A target below this cannot be reached inside SIM_MAX_ITERS; clamping keeps a caller from
+        // silently paying the ceiling for an impossible request.
+        let target = PrecisionTarget {
+            champion_std_error: champion_std_error.clamp(1e-4, 0.5),
+            batch: PRECISION_BATCH,
+            max_iterations: SIM_MAX_ITERS,
+        };
+        let out = oracle_sim::simulate_to_precision(
+            &self.tournament,
+            &self.model,
+            SimConfig {
+                seed,
+                ..SimConfig::default()
+            },
+            &self.sim_inputs(),
+            LiveConfig::default(),
+            target,
+        );
+        let achieved = PrecisionReport {
+            requested_champion_std_error: target.champion_std_error,
+            achieved_champion_std_error: out.worst_champion_std_error,
+            target_met: out.target_met,
+        };
+        self.assemble_sim_forecast(out.forecast, seed, Some(achieved))
+    }
+
+    /// The live inputs every full-tournament simulation runs with.
+    fn sim_inputs(&self) -> LiveInputs {
+        LiveInputs {
+            venue: data::matchup_adjustments(&self.tournament),
+            shootout_rating: self.shootout_rating.clone(),
+            knockout_pedigree: self.knockout_pedigree.clone(),
+            ..Default::default()
+        }
+    }
+
+    /// Rank a raw forecast into the reported champion-odds table with per-team error bars.
+    fn assemble_sim_forecast(
+        &self,
+        forecast: oracle_domain::TournamentForecast,
+        seed: u64,
+        precision: Option<PrecisionReport>,
+    ) -> SimForecast {
         let n = forecast.iterations.max(1) as f64;
         let mut teams: Vec<SimRow> = forecast
             .teams
@@ -562,6 +614,7 @@ impl Explorer {
             iterations: forecast.iterations,
             seed,
             teams,
+            precision,
         }
     }
 
@@ -1356,6 +1409,20 @@ pub struct SimForecast {
     pub iterations: u64,
     pub seed: u64,
     pub teams: Vec<SimRow>,
+    /// Present when the run targeted a precision rather than an iteration count.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub precision: Option<PrecisionReport>,
+}
+
+/// What a precision-targeted run asked for and what it actually delivered.
+#[derive(Debug, Clone, Copy, Serialize)]
+pub struct PrecisionReport {
+    /// The target, after clamping to a reachable range.
+    pub requested_champion_std_error: f64,
+    /// The worst team's achieved champion-probability standard error when the run stopped.
+    pub achieved_champion_std_error: f64,
+    /// False if the run stopped at the iteration ceiling with the target unmet.
+    pub target_met: bool,
 }
 
 /// A survivor's probability of reaching one downstream round of a stage-conditioned forecast.
@@ -1748,6 +1815,46 @@ mod tests {
         let em = ex.explain(a, b, true, Some((1.2, 7.0, 12.0)));
         assert_eq!(em.members.len(), 4);
         assert_eq!(em.members[3].name, "Market");
+    }
+
+    #[test]
+    fn a_precision_targeted_forecast_reports_what_it_achieved() {
+        let ex = Explorer::new();
+        let f = ex.simulate_to_precision(0.006, 42);
+        let p = f.precision.expect("a precision run reports its precision");
+        assert!(p.target_met, "0.006 should be reachable inside the ceiling");
+        assert!(p.achieved_champion_std_error <= 0.006);
+        assert!((p.requested_champion_std_error - 0.006).abs() < 1e-12);
+        // It should stop early rather than burn the ceiling.
+        assert!(f.iterations >= 1 && f.iterations < 100_000);
+        // And still be a coherent, ranked forecast.
+        assert!(f
+            .teams
+            .windows(2)
+            .all(|w| w[0].p_champion >= w[1].p_champion));
+        let total: f64 = f.teams.iter().map(|t| t.p_champion).sum();
+        assert!((total - 1.0).abs() < 1e-9, "champion mass {total}");
+    }
+
+    #[test]
+    fn a_fixed_iteration_forecast_reports_no_precision_block() {
+        let f = Explorer::new().simulate(2000, 42);
+        assert!(
+            f.precision.is_none(),
+            "only precision-targeted runs carry the report"
+        );
+    }
+
+    #[test]
+    fn an_impossible_precision_request_is_clamped_not_run_forever() {
+        // Asking for zero error would otherwise pay the full ceiling for an unreachable target.
+        let f = Explorer::new().simulate_to_precision(0.0, 7);
+        let p = f.precision.expect("precision report");
+        assert!(
+            p.requested_champion_std_error >= 1e-4,
+            "clamped to a reachable target, got {}",
+            p.requested_champion_std_error
+        );
     }
 
     #[test]
