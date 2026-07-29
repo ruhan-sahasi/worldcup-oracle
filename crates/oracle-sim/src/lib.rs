@@ -382,8 +382,7 @@ mod stream_kind {
     pub const ITERATION: u32 = 0;
     pub const TEAM_STRENGTH: u32 = 1;
     pub const GROUP_MATCH: u32 = 2;
-    /// Draws not yet addressed by label; consumed sequentially, as the whole simulation once was.
-    pub const SEQUENTIAL: u32 = 9;
+    pub const KO_TIE: u32 = 3;
 }
 
 /// The random draws of one simulated tournament, addressed by *what they belong to* rather than by
@@ -431,9 +430,20 @@ impl Streams {
         )
     }
 
-    /// The transitional catch-all stream, for draws not yet addressed by label.
-    fn sequential(&self) -> Rng {
-        Rng::stream(self.iteration_seed, stream_kind::SEQUENTIAL, 0)
+    /// The stream for the knockout tie at a given bracket position this iteration.
+    ///
+    /// Addressed by *position*, not by the pair who reach it. Who plays a quarter-final is
+    /// precisely what a scenario changes, so keying on the pairing would give the tie fresh
+    /// randomness whenever the scenario altered who got there - reintroducing the noise this is
+    /// meant to remove. Keying on the slot means the tie's luck (its scorelines, whether it goes to
+    /// extra time, which way a shootout falls) is a property of the bracket position, and swapping
+    /// the occupants changes the result only through their strengths.
+    fn ko_tie(&self, round: u8, slot: usize) -> Rng {
+        Rng::stream(
+            self.iteration_seed,
+            stream_kind::KO_TIE,
+            (u64::from(round) << 32) | slot as u64,
+        )
     }
 }
 
@@ -890,9 +900,6 @@ impl Prepared {
         streams: &Streams,
         mut on_tie: F,
     ) -> Vec<i64> {
-        // Draws still consumed in order; later commits address these by label too.
-        let mut sequential = streams.sequential();
-        let rng = &mut sequential;
         let mut wins = vec![-1i64; self.n];
         // Per-team log-attack penalty carried into a team's *next* knockout tie when its last tie
         // went to extra time (reset to 0 after a tie settled in regulation).
@@ -913,11 +920,13 @@ impl Prepared {
             // group stage is not re-simulated, so finished knockout results stay fixed.
             self.ko_r32
                 .iter()
-                .map(|&(a, b)| {
+                .enumerate()
+                .map(|(slot, &(a, b))| {
                     wins[a] = 0;
                     wins[b] = 0;
                     on_tie(0, a, b);
-                    let (w, et) = self.play_ko_tie(rng, a, b, &att, &def, (0.0, 0.0));
+                    let mut rng = streams.ko_tie(0, slot);
+                    let (w, et) = self.play_ko_tie(&mut rng, a, b, &att, &def, (0.0, 0.0));
                     wins[w] += 1;
                     fatigue[w] = if et { self.ko_fatigue_penalty } else { 0.0 };
                     w
@@ -982,13 +991,15 @@ impl Prepared {
             if self.fixed_bracket {
                 FIXED_R32
                     .iter()
-                    .map(|(top, bottom)| {
+                    .enumerate()
+                    .map(|(slot, (top, bottom))| {
                         let a = resolve_slot(top, &winners, &runners, &qualified_thirds);
                         let b = resolve_slot(bottom, &winners, &runners, &qualified_thirds);
                         wins[a] = 0;
                         wins[b] = 0;
                         on_tie(0, a, b);
-                        let (w, et) = self.sample_knockout(rng, a, b, &att, &def, (0.0, 0.0));
+                        let mut rng = streams.ko_tie(0, slot);
+                        let (w, et) = self.sample_knockout(&mut rng, a, b, &att, &def, (0.0, 0.0));
                         wins[w] += 1;
                         fatigue[w] = if et { self.ko_fatigue_penalty } else { 0.0 };
                         w
@@ -1012,7 +1023,8 @@ impl Prepared {
                         if a != BYE && b != BYE {
                             on_tie(0, a, b);
                         }
-                        let (w, et) = self.sample_knockout(rng, a, b, &att, &def, (0.0, 0.0));
+                        let mut rng = streams.ko_tie(0, i);
+                        let (w, et) = self.sample_knockout(&mut rng, a, b, &att, &def, (0.0, 0.0));
                         if w != BYE {
                             wins[w] += 1;
                             fatigue[w] = if et { self.ko_fatigue_penalty } else { 0.0 };
@@ -1038,7 +1050,8 @@ impl Prepared {
                     if a == BYE { 0.0 } else { fatigue[a] },
                     if b == BYE { 0.0 } else { fatigue[b] },
                 );
-                let (w, et) = self.play_ko_tie(rng, a, b, &att, &def, fat);
+                let mut rng = streams.ko_tie(round, k / 2);
+                let (w, et) = self.play_ko_tie(&mut rng, a, b, &att, &def, fat);
                 if w != BYE {
                     wins[w] += 1;
                     fatigue[w] = if et { self.ko_fatigue_penalty } else { 0.0 };
