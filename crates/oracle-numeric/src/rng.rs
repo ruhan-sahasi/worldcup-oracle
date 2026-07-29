@@ -96,6 +96,22 @@ impl Rng {
         lo + self.unit() * (hi - lo)
     }
 
+    /// `true` with probability `p`. A `p <= 0` is always `false`, a `p >= 1` always `true`.
+    ///
+    /// Clamping at the ends rather than trusting the caller matters here: the probabilities fed to
+    /// this are computed (a per-minute goal rate is `lambda / 90`), so a rate that overshoots one
+    /// should mean "certain", not a silently rare `false` from a comparison against a uniform that
+    /// can never reach it.
+    pub fn chance(&mut self, p: f64) -> bool {
+        if p <= 0.0 {
+            return false;
+        }
+        if p >= 1.0 {
+            return true;
+        }
+        self.unit() < p
+    }
+
     /// A uniform integer in `[lo, hi]`, both ends included. `hi <= lo` yields `lo`.
     ///
     /// Inclusive because the ranges this replaces are inclusive by nature - a match minute is
@@ -263,6 +279,29 @@ mod tests {
         let mut rng = Rng::new(23);
         assert_eq!(rng.range(1.5, 1.5), 1.5);
         assert_eq!(rng.range(4.0, 2.0), 4.0, "reversed bounds do not wrap");
+    }
+
+    #[test]
+    fn chance_fires_at_its_stated_rate() {
+        let mut rng = Rng::new(27);
+        const N: usize = 100_000;
+        for p in [0.03, 0.25, 0.5, 0.95] {
+            let hits = (0..N).filter(|_| rng.chance(p)).count();
+            let share = hits as f64 / N as f64;
+            // Standard error is at most 0.5/sqrt(N) ~ 0.0016.
+            assert!((share - p).abs() < 0.01, "p={p} fired at {share}");
+        }
+    }
+
+    #[test]
+    fn chance_saturates_outside_the_unit_interval() {
+        let mut rng = Rng::new(28);
+        for _ in 0..100 {
+            assert!(!rng.chance(0.0), "p=0 must never fire");
+            assert!(!rng.chance(-0.5), "a negative p must never fire");
+            assert!(rng.chance(1.0), "p=1 must always fire");
+            assert!(rng.chance(1.5), "an overshooting p must always fire");
+        }
     }
 
     #[test]
