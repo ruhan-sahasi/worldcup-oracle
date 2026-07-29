@@ -1271,6 +1271,7 @@ dependencies = [
  "csv",
  "oracle-domain",
  "oracle-model",
+ "oracle-numeric",
  "oracle-ratings",
  "rand 0.8.6",
  "rand_distr",

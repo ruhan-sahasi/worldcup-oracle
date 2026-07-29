@@ -10,8 +10,7 @@ use crate::error::{IngestError, Result};
 use crate::provider::DataProvider;
 use async_trait::async_trait;
 use oracle_domain::{EventKind, Match, MatchEvent, MatchId, Stage, Tournament};
-use rand::rngs::StdRng;
-use rand::{Rng, SeedableRng};
+use oracle_numeric::Rng;
 use std::time::Duration;
 use tokio::sync::mpsc::Sender;
 use tokio::time::sleep;
@@ -44,15 +43,15 @@ impl ReplayProvider {
         tx: &Sender<MatchEvent>,
         cancel: &CancellationToken,
     ) -> Result<()> {
-        let mut rng = StdRng::seed_from_u64(self.seed ^ u64::from(m.id.0));
+        let mut rng = Rng::new(self.seed ^ u64::from(m.id.0));
 
         // Assign each real goal a distinct-ish minute, then replay in order.
         let mut goals: Vec<(u16, bool)> = Vec::new(); // (minute, is_home)
         for _ in 0..m.score.home {
-            goals.push((rng.gen_range(1..=90), true));
+            goals.push((rng.int_inclusive(1, 90) as u16, true));
         }
         for _ in 0..m.score.away {
-            goals.push((rng.gen_range(1..=90), false));
+            goals.push((rng.int_inclusive(1, 90) as u16, false));
         }
         goals.sort_by_key(|(minute, _)| *minute);
 
