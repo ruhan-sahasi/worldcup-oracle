@@ -207,8 +207,8 @@ pub fn simulate_with_live<S: MatchSampler>(
         .fold(
             || Tally::new(n, prep.required),
             |mut acc, i| {
-                let mut rng = Rng::new(config.seed.wrapping_add(i).wrapping_add(1));
-                let wins = prep.simulate_once(&mut rng);
+                let streams = Streams::new(config.seed, i);
+                let wins = prep.simulate_once(&streams);
                 acc.add(&wins);
                 acc
             },
@@ -269,9 +269,9 @@ pub fn meeting_probabilities<S: MatchSampler>(
         .fold(
             || [0u64; ROUNDS],
             |mut acc, i| {
-                let mut rng = Rng::new(config.seed.wrapping_add(i).wrapping_add(1));
+                let streams = Streams::new(config.seed, i);
                 let mut met: Option<u8> = None;
-                prep.simulate_once_with(&mut rng, |round, x, y| {
+                prep.simulate_once_with(&streams, |round, x, y| {
                     if met.is_none() && ((x == a_ix && y == b_ix) || (x == b_ix && y == a_ix)) {
                         met = Some(round);
                     }
@@ -370,6 +370,57 @@ struct RemainingMatch {
     away_ix: usize,
     rates: (f64, f64),
     current: Scoreline,
+}
+
+/// Which *kind* of draw a substream carries, so streams serving different purposes can never
+/// collide even when their entity indices coincide (team 3 and bracket slot 3 are unrelated).
+mod stream_kind {
+    pub const ITERATION: u32 = 0;
+    pub const TEAM_STRENGTH: u32 = 1;
+    /// Draws not yet addressed by label; consumed sequentially, as the whole simulation once was.
+    pub const SEQUENTIAL: u32 = 9;
+}
+
+/// The random draws of one simulated tournament, addressed by *what they belong to* rather than by
+/// the order in which they happen.
+///
+/// A sequential generator makes every draw depend on how many draws preceded it, so a change early
+/// in a tournament shifts all the randomness after it. Two runs that differ in one match then share
+/// no randomness downstream, and a *difference* between them carries the full noise of both. Since
+/// the difference is exactly what the kingmaker, collision and sensitivity analyses report, that
+/// noise is the thing worth engineering away: giving each entity its own labelled stream means an
+/// entity the change does not touch draws identical numbers in both runs.
+///
+/// Streams are derived, not stored - `Rng::stream` is a few multiplications, so addressing one per
+/// team or per match inside the innermost loop is affordable.
+#[derive(Clone, Copy)]
+struct Streams {
+    /// This iteration's root seed. Folding the iteration in once here means every entity stream
+    /// below is automatically distinct across iterations without the iteration appearing in each
+    /// address.
+    iteration_seed: u64,
+}
+
+impl Streams {
+    fn new(seed: u64, iteration: u64) -> Self {
+        Self {
+            iteration_seed: Rng::stream(seed, stream_kind::ITERATION, iteration).next_u64(),
+        }
+    }
+
+    /// The stream for one team's strength perturbation this iteration.
+    fn team_strength(&self, team_ix: usize) -> Rng {
+        Rng::stream(
+            self.iteration_seed,
+            stream_kind::TEAM_STRENGTH,
+            team_ix as u64,
+        )
+    }
+
+    /// The transitional catch-all stream, for draws not yet addressed by label.
+    fn sequential(&self) -> Rng {
+        Rng::stream(self.iteration_seed, stream_kind::SEQUENTIAL, 0)
+    }
 }
 
 impl Prepared {
@@ -789,22 +840,29 @@ impl Prepared {
 
     /// Draw this iteration's per-team log-space `(attack, defense)` strength shifts from each
     /// team's uncertainty. Returns all-zero vectors when no uncertainty is configured.
-    fn draw_strength_shifts(&self, rng: &mut Rng) -> (Vec<f64>, Vec<f64>) {
+    /// Each team draws from its own stream, so a team's luck this iteration depends only on the
+    /// team and the iteration - not on how many other teams were drawn first. Both of its shifts
+    /// come from that one stream, which keeps attack and defence perturbations together where they
+    /// belong.
+    fn draw_strength_shifts(&self, streams: &Streams) -> (Vec<f64>, Vec<f64>) {
         if !self.has_uncertainty {
             return (vec![0.0; self.n], vec![0.0; self.n]);
         }
-        let draw = |rng: &mut Rng| -> Vec<f64> {
-            self.team_sigma
-                .iter()
-                .map(|&s| if s > 0.0 { s * rng.normal() } else { 0.0 })
-                .collect()
-        };
-        (draw(rng), draw(rng))
+        let mut att = vec![0.0; self.n];
+        let mut def = vec![0.0; self.n];
+        for (i, &sigma) in self.team_sigma.iter().enumerate() {
+            if sigma > 0.0 {
+                let mut rng = streams.team_strength(i);
+                att[i] = sigma * rng.normal();
+                def[i] = sigma * rng.normal();
+            }
+        }
+        (att, def)
     }
 
     /// Play one full tournament (the normal forecast path).
-    fn simulate_once(&self, rng: &mut Rng) -> Vec<i64> {
-        self.simulate_once_with(rng, |_, _, _| {})
+    fn simulate_once(&self, streams: &Streams) -> Vec<i64> {
+        self.simulate_once_with(streams, |_, _, _| {})
     }
 
     /// Play one full tournament, invoking `on_tie(round, home_ix, away_ix)` for every knockout tie
@@ -814,9 +872,12 @@ impl Prepared {
     /// meeting analysis records the pairings.
     fn simulate_once_with<F: FnMut(u8, usize, usize)>(
         &self,
-        rng: &mut Rng,
+        streams: &Streams,
         mut on_tie: F,
     ) -> Vec<i64> {
+        // Draws still consumed in order; later commits address these by label too.
+        let mut sequential = streams.sequential();
+        let rng = &mut sequential;
         let mut wins = vec![-1i64; self.n];
         // Per-team log-attack penalty carried into a team's *next* knockout tie when its last tie
         // went to extra time (reset to 0 after a tie settled in regulation).
@@ -826,7 +887,7 @@ impl Prepared {
         // defense shifts). Held fixed across all of the team's matches this iteration, so a
         // team that turns out stronger than its point estimate is stronger everywhere. All
         // zero when no uncertainty is configured, reproducing the deterministic forecast.
-        let (att, def) = self.draw_strength_shifts(rng);
+        let (att, def) = self.draw_strength_shifts(streams);
 
         // `survivors` holds the 16 first-round winners in bracket order; the fold below plays
         // out R16 -> Final by repeatedly pairing adjacent survivors.
