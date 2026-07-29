@@ -27,10 +27,8 @@ use oracle_model::{
     context_adjustment, implied_probabilities, style_adjustment, BradleyTerry, BradleyTerryConfig,
     DixonColesConfig, Ensemble, GoalModel, Host, MatchContext, Observation, StyleProfile,
 };
+use oracle_numeric::Rng;
 use oracle_ratings::{RatingStore, StateSpaceRatings};
-use rand::rngs::StdRng;
-use rand::{Rng, SeedableRng};
-use rand_distr::{Distribution, Gamma, Poisson};
 use std::collections::HashMap;
 use std::path::Path;
 
@@ -169,7 +167,7 @@ const STARTING_XI: usize = 11;
 pub fn squad(team: TeamId) -> Vec<Player> {
     let rating = TEAMS.get(team.0 as usize).map(|t| t.3).unwrap_or(1500.0);
     let base = ((rating - 1500.0) / 400.0).clamp(0.1, 1.6);
-    let mut rng = StdRng::seed_from_u64(0xF1FA_2026 ^ u64::from(team.0));
+    let mut rng = Rng::new(0xF1FA_2026 ^ u64::from(team.0));
 
     // Names must be unique within a squad: lineups are matched by name, so a duplicate
     // would let one present player count twice in `lineup_adjustment`.
@@ -188,10 +186,10 @@ pub fn squad(team: TeamId) -> Vec<Player> {
             Position::Mid => (0.65, 0.55),
             Position::Fwd => (0.95, 0.25),
         };
-        let skill = (base + rng.gen_range(-0.30..0.30)).max(0.05);
+        let skill = (base + rng.range(-0.30, 0.30)).max(0.05);
         let name = loop {
-            let initial = (b'A' + rng.gen_range(0..26u8)) as char;
-            let surname = SURNAMES[rng.gen_range(0..SURNAMES.len())];
+            let initial = (b'A' + rng.index_below(26) as u8) as char;
+            let surname = SURNAMES[rng.index_below(SURNAMES.len())];
             let candidate = format!("{initial}. {surname}");
             if used.insert(candidate.clone()) {
                 break candidate;
@@ -507,16 +505,10 @@ fn cmp_group_row(a: &(TeamId, i32, i32, i32), b: &(TeamId, i32, i32, i32)) -> st
 const SYNTHETIC_DISPERSION: f64 = 8.0;
 
 /// Sample a goal count from a Gamma-Poisson (negative binomial) with the given mean, capped at 12.
-fn sample_goals_overdispersed(rng: &mut StdRng, lambda: f64) -> u8 {
+fn sample_goals_overdispersed(rng: &mut Rng, lambda: f64) -> u8 {
     let r = SYNTHETIC_DISPERSION;
-    let rate = Gamma::new(r, lambda / r)
-        .ok()
-        .map(|g| g.sample(rng))
-        .unwrap_or(lambda)
-        .max(1e-9);
-    Poisson::new(rate)
-        .map(|d| (d.sample(rng) as u32).min(12) as u8)
-        .unwrap_or(0)
+    let rate = rng.gamma(r, lambda / r).max(1e-9);
+    rng.poisson(rate).min(12) as u8
 }
 
 /// Expected goals between two strengths (neutral venue) under a simple log-linear map.
@@ -533,14 +525,14 @@ fn rating_to_xg(home: f64, away: f64) -> (f64, f64) {
 pub fn synthetic_history(n_matches: usize, seed: u64) -> Vec<Observation> {
     let strengths = team_strengths();
     let n = strengths.len();
-    let mut rng = StdRng::seed_from_u64(seed);
+    let mut rng = Rng::new(seed);
     let mut out = Vec::with_capacity(n_matches);
 
     for k in 0..n_matches {
-        let i = rng.gen_range(0..n);
-        let mut j = rng.gen_range(0..n);
+        let i = rng.index_below(n);
+        let mut j = rng.index_below(n);
         while j == i {
-            j = rng.gen_range(0..n);
+            j = rng.index_below(n);
         }
         let (lambda, mu) = rating_to_xg(strengths[i].1, strengths[j].1);
         let score = Scoreline::new(
@@ -549,8 +541,8 @@ pub fn synthetic_history(n_matches: usize, seed: u64) -> Vec<Observation> {
         );
         // xG is a noisy estimate of the true rate, but much less noisy than the
         // Poisson-sampled scoreline, so fitting on it sharpens the model.
-        let home_xg = (lambda * (1.0 + rng.gen_range(-0.15..0.15))).max(0.05);
-        let away_xg = (mu * (1.0 + rng.gen_range(-0.15..0.15))).max(0.05);
+        let home_xg = (lambda * (1.0 + rng.range(-0.15, 0.15))).max(0.05);
+        let away_xg = (mu * (1.0 + rng.range(-0.15, 0.15))).max(0.05);
         // Spread matches over ~1100 days, oldest first.
         let age_days = 1100.0 * (1.0 - k as f64 / n_matches as f64);
         out.push(Observation::with_xg(
@@ -614,22 +606,22 @@ pub fn market_line(home: TeamId, away: TeamId) -> (f64, f64, f64) {
 pub fn synthetic_history_with_market(n_matches: usize, seed: u64) -> Vec<MatchRecord> {
     let strengths = team_strengths();
     let n = strengths.len();
-    let mut rng = StdRng::seed_from_u64(seed ^ 0xB00C);
+    let mut rng = Rng::new(seed ^ 0xB00C);
 
     (0..n_matches)
         .map(|k| {
-            let i = rng.gen_range(0..n);
-            let mut j = rng.gen_range(0..n);
+            let i = rng.index_below(n);
+            let mut j = rng.index_below(n);
             while j == i {
-                j = rng.gen_range(0..n);
+                j = rng.index_below(n);
             }
             let (lambda, mu) = rating_to_xg(strengths[i].1, strengths[j].1);
             let score = Scoreline::new(
                 sample_goals_overdispersed(&mut rng, lambda),
                 sample_goals_overdispersed(&mut rng, mu),
             );
-            let home_xg = (lambda * (1.0 + rng.gen_range(-0.15..0.15))).max(0.05);
-            let away_xg = (mu * (1.0 + rng.gen_range(-0.15..0.15))).max(0.05);
+            let home_xg = (lambda * (1.0 + rng.range(-0.15, 0.15))).max(0.05);
+            let away_xg = (mu * (1.0 + rng.range(-0.15, 0.15))).max(0.05);
             let age_days = 1100.0 * (1.0 - k as f64 / n_matches as f64);
             let obs = Observation::with_xg(
                 strengths[i].0,
@@ -641,7 +633,7 @@ pub fn synthetic_history_with_market(n_matches: usize, seed: u64) -> Vec<MatchRe
             );
 
             let truth = outcome_probs_from_rates(lambda, mu);
-            let mut noisy = |p: f64| p * (1.0 + rng.gen_range(-0.04..0.04));
+            let mut noisy = |p: f64| p * (1.0 + rng.range(-0.04, 0.04));
             let market = Probabilities::new(
                 noisy(truth.home_win),
                 noisy(truth.draw),
@@ -936,8 +928,8 @@ fn style_profile(team: TeamId) -> StyleProfile {
         Ofc => 5.0,
     };
     let conf_angle = conf_index * std::f64::consts::TAU / 6.0;
-    let mut rng = StdRng::seed_from_u64(0x5713_2026 ^ u64::from(team.0));
-    let theta = conf_angle + rng.gen_range(-0.6..0.6);
+    let mut rng = Rng::new(0x5713_2026 ^ u64::from(team.0));
+    let theta = conf_angle + rng.range(-0.6, 0.6);
     StyleProfile::new([theta.cos(), theta.sin()])
 }
 
@@ -969,8 +961,8 @@ pub fn style_adjustments(tournament: &Tournament) -> HashMap<MatchId, VenueAdj> 
 pub fn shootout_ratings() -> HashMap<TeamId, f64> {
     (0..TEAMS.len() as u32)
         .map(|i| {
-            let mut rng = StdRng::seed_from_u64(0x5400_7E07 ^ u64::from(i));
-            (TeamId(i), rng.gen_range(-1.0..1.0))
+            let mut rng = Rng::new(0x5400_7E07 ^ u64::from(i));
+            (TeamId(i), rng.range(-1.0, 1.0))
         })
         .collect()
 }
@@ -987,8 +979,8 @@ pub fn knockout_pedigree() -> HashMap<TeamId, f64> {
         .enumerate()
         .map(|(i, &(_, _, _, rating))| {
             let strength_part = ((rating - 1800.0) / 350.0).clamp(-1.0, 1.0);
-            let mut rng = StdRng::seed_from_u64(0x9ED1_6EE5 ^ i as u64);
-            let independent = rng.gen_range(-0.8..0.8);
+            let mut rng = Rng::new(0x9ED1_6EE5 ^ i as u64);
+            let independent = rng.range(-0.8, 0.8);
             (
                 TeamId(i as u32),
                 (0.4 * strength_part + independent).clamp(-1.2, 1.2),

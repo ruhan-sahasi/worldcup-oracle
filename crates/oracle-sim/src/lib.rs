@@ -44,9 +44,7 @@ use oracle_domain::{
     MatchId, MatchStatus, Scoreline, Stage, TeamForecast, TeamId, Tournament, TournamentForecast,
 };
 use oracle_model::{remaining_rates, LiveConfig, LiveState};
-use rand::rngs::StdRng;
-use rand::{Rng, SeedableRng};
-use rand_distr::{Distribution, Gamma, Normal, Poisson};
+use oracle_numeric::Rng;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -202,22 +200,203 @@ pub fn simulate_with_live<S: MatchSampler>(
     let prep = Prepared::build(tournament, sampler, config, inputs, live_config);
     let n = prep.teams.len();
 
-    // Fan out over iterations; each rayon task folds into its own tally, then we
-    // reduce the per-thread tallies into one.
-    let tally = (0..config.iterations)
+    tally_iterations(&prep, config.seed, 0..config.iterations, n)
+        .into_forecast(&prep.teams, config.iterations)
+}
+
+/// Simulate the given half-open range of iteration indices and tally the outcomes.
+///
+/// Fans out over iterations; each rayon task folds into its own tally and the per-thread tallies
+/// reduce into one. Iterations are addressed by their *global* index, so a run assembled from
+/// several batches draws exactly the randomness a single run of the same total length would - which
+/// is what lets [`simulate_to_precision`] extend a run without invalidating what it already has.
+fn tally_iterations(
+    prep: &Prepared,
+    seed: u64,
+    range: std::ops::Range<u64>,
+    n_teams: usize,
+) -> Tally {
+    range
         .into_par_iter()
         .fold(
-            || Tally::new(n, prep.required),
+            || Tally::new(n_teams, prep.required),
             |mut acc, i| {
-                let mut rng = StdRng::seed_from_u64(config.seed.wrapping_add(i).wrapping_add(1));
-                let wins = prep.simulate_once(&mut rng);
-                acc.add(&wins);
+                acc.add(&prep.simulate_once(&Streams::new(seed, i)));
                 acc
             },
         )
-        .reduce(|| Tally::new(n, prep.required), Tally::merge);
+        .reduce(|| Tally::new(n_teams, prep.required), Tally::merge)
+}
 
-    tally.into_forecast(&prep.teams, config.iterations)
+/// How precisely a forecast needs to pin its champion probabilities, instead of how long it should
+/// run for.
+#[derive(Debug, Clone, Copy)]
+pub struct PrecisionTarget {
+    /// Stop once no team's champion probability has a standard error above this.
+    pub champion_std_error: f64,
+    /// Iterations per batch. The target is checked between batches, so this trades how far the run
+    /// can overshoot against how often it pays for a check.
+    pub batch: u64,
+    /// Hard ceiling, so an unreachable target terminates. A target near zero is unreachable at any
+    /// finite cost, since the standard error falls only as 1/sqrt(n).
+    pub max_iterations: u64,
+}
+
+impl Default for PrecisionTarget {
+    fn default() -> Self {
+        Self {
+            champion_std_error: 0.002,
+            batch: 5_000,
+            max_iterations: 500_000,
+        }
+    }
+}
+
+/// A forecast together with what it actually achieved.
+#[derive(Debug, Clone)]
+pub struct PreciseForecast {
+    pub forecast: TournamentForecast,
+    /// The largest champion-probability standard error across teams when the run stopped.
+    pub worst_champion_std_error: f64,
+    /// Whether the target was reached, as opposed to the iteration ceiling.
+    pub target_met: bool,
+}
+
+/// Simulate until the champion probabilities are pinned to `target`, rather than for a fixed number
+/// of iterations.
+///
+/// A fixed iteration count is a guess about how hard the question is. It over-spends on a field with
+/// a runaway favourite and under-spends on an open one, and it never reports which happened. This
+/// runs in batches and stops when the worst team's standard error clears the target, so the caller
+/// asks for the precision it needs and finds out what it cost.
+///
+/// One honest caveat: stopping on an observed standard error is a sequential decision, and the
+/// stopped estimate carries a slight optimistic bias - the run is more likely to halt on a batch
+/// where the sample happened to look settled. The effect is small next to the target itself at these
+/// batch sizes, and reporting the achieved error rather than the target keeps it visible.
+pub fn simulate_to_precision<S: MatchSampler>(
+    tournament: &Tournament,
+    sampler: &S,
+    config: SimConfig,
+    inputs: &LiveInputs,
+    live_config: LiveConfig,
+    target: PrecisionTarget,
+) -> PreciseForecast {
+    let prep = Prepared::build(tournament, sampler, config, inputs, live_config);
+    let n = prep.teams.len();
+    let batch = target.batch.max(1);
+    let ceiling = target.max_iterations.max(batch);
+
+    let mut tally = Tally::new(n, prep.required);
+    let mut done = 0u64;
+    loop {
+        let next = (done + batch).min(ceiling);
+        tally = tally.merge(tally_iterations(&prep, config.seed, done..next, n));
+        done = next;
+        let worst = tally.worst_champion_std_error(done);
+        if worst <= target.champion_std_error || done >= ceiling {
+            return PreciseForecast {
+                forecast: tally.into_forecast(&prep.teams, done),
+                worst_champion_std_error: worst,
+                target_met: worst <= target.champion_std_error,
+            };
+        }
+    }
+}
+
+/// Whether `team` was champion in each simulated tournament, one entry per iteration in iteration
+/// order.
+///
+/// The order is the point. Two calls with the same `config.seed` draw from the same labelled
+/// streams, so entry `i` of each describes the *same* simulated universe under two different
+/// premises - which is what lets [`PairedDifference`] difference them iteration by iteration
+/// instead of comparing two aggregate probabilities.
+pub fn champion_indicators<S: MatchSampler>(
+    tournament: &Tournament,
+    sampler: &S,
+    config: SimConfig,
+    inputs: &LiveInputs,
+    live_config: LiveConfig,
+    team: TeamId,
+) -> Vec<bool> {
+    let prep = Prepared::build(tournament, sampler, config, inputs, live_config);
+    let Some(ix) = prep.teams.iter().position(|&t| t == team) else {
+        return vec![false; config.iterations as usize];
+    };
+    let need = prep.required[5];
+    (0..config.iterations)
+        .into_par_iter()
+        .map(|i| prep.simulate_once(&Streams::new(config.seed, i))[ix] >= need)
+        .collect()
+}
+
+/// A difference between two coupled simulations, with the uncertainty of the *difference*.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct PairedDifference {
+    /// The mean difference (scenario minus baseline).
+    pub mean: f64,
+    /// The standard error of that mean, from the spread of the per-iteration differences.
+    pub std_error: f64,
+    pub iterations: u64,
+}
+
+impl PairedDifference {
+    /// Difference two per-iteration series that were drawn from the same streams.
+    ///
+    /// The standard error comes from the variance of the per-iteration differences, which is the
+    /// only way to get it right when the two series are correlated. Treating the two aggregate
+    /// probabilities as independent and adding their variances would overstate the error wherever
+    /// the coupling bites - and understate nothing, but a forecast that reports pessimistic error
+    /// bars on a real effect is as misleading as one that reports none.
+    ///
+    /// Series are compared up to their common length; a mismatch means one run was configured with
+    /// fewer iterations, and the extra tail has no partner to pair with.
+    pub fn from_indicators(scenario: &[bool], baseline: &[bool]) -> Self {
+        let n = scenario.len().min(baseline.len());
+        if n == 0 {
+            return Self {
+                mean: 0.0,
+                std_error: 0.0,
+                iterations: 0,
+            };
+        }
+        // Each difference is one of -1, 0, +1.
+        let diffs = scenario
+            .iter()
+            .zip(baseline)
+            .take(n)
+            .map(|(&s, &b)| f64::from(i8::from(s) - i8::from(b)));
+        let mut sum = 0.0;
+        let mut sum_sq = 0.0;
+        for d in diffs {
+            sum += d;
+            sum_sq += d * d;
+        }
+        let nf = n as f64;
+        let mean = sum / nf;
+        // Sample variance with Bessel's correction, then the standard error of the mean.
+        let var = if n > 1 {
+            (sum_sq - nf * mean * mean) / (nf - 1.0)
+        } else {
+            0.0
+        };
+        Self {
+            mean,
+            std_error: (var.max(0.0) / nf).sqrt(),
+            iterations: n as u64,
+        }
+    }
+
+    /// The half-width of an approximate 95% interval around [`mean`](Self::mean).
+    pub fn margin_95(&self) -> f64 {
+        1.96 * self.std_error
+    }
+
+    /// Whether the difference is distinguishable from zero at ~95% confidence. A swing that fails
+    /// this is a swing the Monte-Carlo cannot actually resolve, however large it looks.
+    pub fn is_significant(&self) -> bool {
+        self.mean.abs() > self.margin_95()
+    }
 }
 
 /// The knockout rounds two teams can meet at, in order (the 2026 shape).
@@ -271,9 +450,9 @@ pub fn meeting_probabilities<S: MatchSampler>(
         .fold(
             || [0u64; ROUNDS],
             |mut acc, i| {
-                let mut rng = StdRng::seed_from_u64(config.seed.wrapping_add(i).wrapping_add(1));
+                let streams = Streams::new(config.seed, i);
                 let mut met: Option<u8> = None;
-                prep.simulate_once_with(&mut rng, |round, x, y| {
+                prep.simulate_once_with(&streams, |round, x, y| {
                     if met.is_none() && ((x == a_ix && y == b_ix) || (x == b_ix && y == a_ix)) {
                         met = Some(round);
                     }
@@ -368,10 +547,85 @@ struct GroupSim {
 /// xG for a not-yet-started match, or the *remaining* rates for an in-progress one), and
 /// `current` is the score already on the board (0-0 unless in progress).
 struct RemainingMatch {
+    /// The fixture's own identity, used to address its goal-draw stream. Keying on the match id
+    /// rather than on its position in the fixture list is what makes the stream stable when a
+    /// scenario removes some *other* match from the remaining set.
+    id: MatchId,
     home_ix: usize,
     away_ix: usize,
     rates: (f64, f64),
     current: Scoreline,
+}
+
+/// Which *kind* of draw a substream carries, so streams serving different purposes can never
+/// collide even when their entity indices coincide (team 3 and bracket slot 3 are unrelated).
+mod stream_kind {
+    pub const ITERATION: u32 = 0;
+    pub const TEAM_STRENGTH: u32 = 1;
+    pub const GROUP_MATCH: u32 = 2;
+    pub const KO_TIE: u32 = 3;
+}
+
+/// The random draws of one simulated tournament, addressed by *what they belong to* rather than by
+/// the order in which they happen.
+///
+/// A sequential generator makes every draw depend on how many draws preceded it, so a change early
+/// in a tournament shifts all the randomness after it. Two runs that differ in one match then share
+/// no randomness downstream, and a *difference* between them carries the full noise of both. Since
+/// the difference is exactly what the kingmaker, collision and sensitivity analyses report, that
+/// noise is the thing worth engineering away: giving each entity its own labelled stream means an
+/// entity the change does not touch draws identical numbers in both runs.
+///
+/// Streams are derived, not stored - `Rng::stream` is a few multiplications, so addressing one per
+/// team or per match inside the innermost loop is affordable.
+#[derive(Clone, Copy)]
+struct Streams {
+    /// This iteration's root seed. Folding the iteration in once here means every entity stream
+    /// below is automatically distinct across iterations without the iteration appearing in each
+    /// address.
+    iteration_seed: u64,
+}
+
+impl Streams {
+    fn new(seed: u64, iteration: u64) -> Self {
+        Self {
+            iteration_seed: Rng::stream(seed, stream_kind::ITERATION, iteration).next_u64(),
+        }
+    }
+
+    /// The stream for one team's strength perturbation this iteration.
+    fn team_strength(&self, team_ix: usize) -> Rng {
+        Rng::stream(
+            self.iteration_seed,
+            stream_kind::TEAM_STRENGTH,
+            team_ix as u64,
+        )
+    }
+
+    /// The stream for one group fixture's goal draws this iteration.
+    fn group_match(&self, id: MatchId) -> Rng {
+        Rng::stream(
+            self.iteration_seed,
+            stream_kind::GROUP_MATCH,
+            u64::from(id.0),
+        )
+    }
+
+    /// The stream for the knockout tie at a given bracket position this iteration.
+    ///
+    /// Addressed by *position*, not by the pair who reach it. Who plays a quarter-final is
+    /// precisely what a scenario changes, so keying on the pairing would give the tie fresh
+    /// randomness whenever the scenario altered who got there - reintroducing the noise this is
+    /// meant to remove. Keying on the slot means the tie's luck (its scorelines, whether it goes to
+    /// extra time, which way a shootout falls) is a property of the bracket position, and swapping
+    /// the occupants changes the result only through their strengths.
+    fn ko_tie(&self, round: u8, slot: usize) -> Rng {
+        Rng::stream(
+            self.iteration_seed,
+            stream_kind::KO_TIE,
+            (u64::from(round) << 32) | slot as u64,
+        )
+    }
 }
 
 impl Prepared {
@@ -456,6 +710,7 @@ impl Prepared {
                             None => ((base_l, base_m), Scoreline::new(0, 0)),
                         };
                         Some(RemainingMatch {
+                            id: m.id,
                             home_ix: h,
                             away_ix: a,
                             rates,
@@ -632,23 +887,17 @@ impl Prepared {
     /// Gamma (the negative-binomial / Gamma-Poisson mixture), so a team's effective rate varies
     /// match to match and scorelines get the fatter tails real football shows; dispersion 0 is a
     /// plain Poisson(λ).
-    fn sample_goals(&self, rng: &mut StdRng, lambda: f64) -> i32 {
+    fn sample_goals(&self, rng: &mut Rng, lambda: f64) -> i32 {
         if lambda <= 1e-9 {
             return 0;
         }
         let rate = if self.dispersion > 0.0 {
             let r = self.dispersion;
-            Gamma::new(r, lambda / r)
-                .map(|g| g.sample(rng))
-                .unwrap_or(lambda)
-                .max(1e-9)
+            rng.gamma(r, lambda / r).max(1e-9)
         } else {
             lambda
         };
-        match Poisson::new(rate) {
-            Ok(dist) => (dist.sample(rng) as i32).min(20),
-            Err(_) => 0,
-        }
+        (rng.poisson(rate) as i32).min(20)
     }
 
     /// Sample the winner's team-index of a knockout tie: 90 minutes, then 30 of extra time
@@ -657,7 +906,7 @@ impl Prepared {
     /// from a previous round's extra time.
     fn sample_knockout(
         &self,
-        rng: &mut StdRng,
+        rng: &mut Rng,
         a: usize,
         b: usize,
         att: &[f64],
@@ -695,7 +944,7 @@ impl Prepared {
                     + self.shootout_skill * (la - ma)
                     + SHOOTOUT_RATING_SCALE * (self.shootout_rating[a] - self.shootout_rating[b]))
                     .clamp(0.35, 0.65);
-                if rng.gen::<f64>() < p {
+                if rng.chance(p) {
                     a
                 } else {
                     b
@@ -712,7 +961,7 @@ impl Prepared {
     /// course is unknown), so it carries no fatigue forward.
     fn play_ko_tie(
         &self,
-        rng: &mut StdRng,
+        rng: &mut Rng,
         a: usize,
         b: usize,
         att: &[f64],
@@ -752,7 +1001,7 @@ impl Prepared {
     /// Returns `(winner, went_to_extra_time)`. `fatigue` is `(home, away)` log-attack penalties.
     fn sample_live_ko(
         &self,
-        rng: &mut StdRng,
+        rng: &mut Rng,
         (home_ix, away_ix): (usize, usize),
         rem_rates: (f64, f64),
         current: Scoreline,
@@ -785,7 +1034,7 @@ impl Prepared {
                     + SHOOTOUT_RATING_SCALE
                         * (self.shootout_rating[home_ix] - self.shootout_rating[away_ix]))
                     .clamp(0.35, 0.65);
-                if rng.gen::<f64>() < p {
+                if rng.chance(p) {
                     home_ix
                 } else {
                     away_ix
@@ -797,29 +1046,29 @@ impl Prepared {
 
     /// Draw this iteration's per-team log-space `(attack, defense)` strength shifts from each
     /// team's uncertainty. Returns all-zero vectors when no uncertainty is configured.
-    fn draw_strength_shifts(&self, rng: &mut StdRng) -> (Vec<f64>, Vec<f64>) {
+    /// Each team draws from its own stream, so a team's luck this iteration depends only on the
+    /// team and the iteration - not on how many other teams were drawn first. Both of its shifts
+    /// come from that one stream, which keeps attack and defence perturbations together where they
+    /// belong.
+    fn draw_strength_shifts(&self, streams: &Streams) -> (Vec<f64>, Vec<f64>) {
         if !self.has_uncertainty {
             return (vec![0.0; self.n], vec![0.0; self.n]);
         }
-        let std_normal = Normal::new(0.0, 1.0).expect("valid normal");
-        let draw = |rng: &mut StdRng| -> Vec<f64> {
-            self.team_sigma
-                .iter()
-                .map(|&s| {
-                    if s > 0.0 {
-                        s * std_normal.sample(rng)
-                    } else {
-                        0.0
-                    }
-                })
-                .collect()
-        };
-        (draw(rng), draw(rng))
+        let mut att = vec![0.0; self.n];
+        let mut def = vec![0.0; self.n];
+        for (i, &sigma) in self.team_sigma.iter().enumerate() {
+            if sigma > 0.0 {
+                let mut rng = streams.team_strength(i);
+                att[i] = sigma * rng.normal();
+                def[i] = sigma * rng.normal();
+            }
+        }
+        (att, def)
     }
 
     /// Play one full tournament (the normal forecast path).
-    fn simulate_once(&self, rng: &mut StdRng) -> Vec<i64> {
-        self.simulate_once_with(rng, |_, _, _| {})
+    fn simulate_once(&self, streams: &Streams) -> Vec<i64> {
+        self.simulate_once_with(streams, |_, _, _| {})
     }
 
     /// Play one full tournament, invoking `on_tie(round, home_ix, away_ix)` for every knockout tie
@@ -829,7 +1078,7 @@ impl Prepared {
     /// meeting analysis records the pairings.
     fn simulate_once_with<F: FnMut(u8, usize, usize)>(
         &self,
-        rng: &mut StdRng,
+        streams: &Streams,
         mut on_tie: F,
     ) -> Vec<i64> {
         let mut wins = vec![-1i64; self.n];
@@ -841,7 +1090,7 @@ impl Prepared {
         // defense shifts). Held fixed across all of the team's matches this iteration, so a
         // team that turns out stronger than its point estimate is stronger everywhere. All
         // zero when no uncertainty is configured, reproducing the deterministic forecast.
-        let (att, def) = self.draw_strength_shifts(rng);
+        let (att, def) = self.draw_strength_shifts(streams);
 
         // `survivors` holds the 16 first-round winners in bracket order; the fold below plays
         // out R16 -> Final by repeatedly pairing adjacent survivors.
@@ -852,11 +1101,13 @@ impl Prepared {
             // group stage is not re-simulated, so finished knockout results stay fixed.
             self.ko_r32
                 .iter()
-                .map(|&(a, b)| {
+                .enumerate()
+                .map(|(slot, &(a, b))| {
                     wins[a] = 0;
                     wins[b] = 0;
                     on_tie(0, a, b);
-                    let (w, et) = self.play_ko_tie(rng, a, b, &att, &def, (0.0, 0.0));
+                    let mut rng = streams.ko_tie(0, slot);
+                    let (w, et) = self.play_ko_tie(&mut rng, a, b, &att, &def, (0.0, 0.0));
                     wins[w] += 1;
                     fatigue[w] = if et { self.ko_fatigue_penalty } else { 0.0 };
                     w
@@ -884,8 +1135,11 @@ impl Prepared {
                     let rate_h = rm.rates.0 * (att[rm.home_ix] - def[rm.away_ix]).exp();
                     let rate_a = rm.rates.1 * (att[rm.away_ix] - def[rm.home_ix]).exp();
                     // Final goals = already scored (0 unless in progress) + sampled remainder.
-                    let gh = i32::from(rm.current.home) + self.sample_goals(rng, rate_h);
-                    let ga = i32::from(rm.current.away) + self.sample_goals(rng, rate_a);
+                    // Each fixture draws its goals from its own stream, so conditioning some other
+                    // match cannot shift this one's scoreline.
+                    let mut mrng = streams.group_match(rm.id);
+                    let gh = i32::from(rm.current.home) + self.sample_goals(&mut mrng, rate_h);
+                    let ga = i32::from(rm.current.away) + self.sample_goals(&mut mrng, rate_a);
                     apply_result_at(&mut standings, pos[&rm.home_ix], pos[&rm.away_ix], gh, ga);
                 }
                 for (i, (_, s)) in table.iter_mut().enumerate() {
@@ -918,13 +1172,15 @@ impl Prepared {
             if self.fixed_bracket {
                 FIXED_R32
                     .iter()
-                    .map(|(top, bottom)| {
+                    .enumerate()
+                    .map(|(slot, (top, bottom))| {
                         let a = resolve_slot(top, &winners, &runners, &qualified_thirds);
                         let b = resolve_slot(bottom, &winners, &runners, &qualified_thirds);
                         wins[a] = 0;
                         wins[b] = 0;
                         on_tie(0, a, b);
-                        let (w, et) = self.sample_knockout(rng, a, b, &att, &def, (0.0, 0.0));
+                        let mut rng = streams.ko_tie(0, slot);
+                        let (w, et) = self.sample_knockout(&mut rng, a, b, &att, &def, (0.0, 0.0));
                         wins[w] += 1;
                         fatigue[w] = if et { self.ko_fatigue_penalty } else { 0.0 };
                         w
@@ -948,7 +1204,8 @@ impl Prepared {
                         if a != BYE && b != BYE {
                             on_tie(0, a, b);
                         }
-                        let (w, et) = self.sample_knockout(rng, a, b, &att, &def, (0.0, 0.0));
+                        let mut rng = streams.ko_tie(0, i);
+                        let (w, et) = self.sample_knockout(&mut rng, a, b, &att, &def, (0.0, 0.0));
                         if w != BYE {
                             wins[w] += 1;
                             fatigue[w] = if et { self.ko_fatigue_penalty } else { 0.0 };
@@ -974,7 +1231,8 @@ impl Prepared {
                     if a == BYE { 0.0 } else { fatigue[a] },
                     if b == BYE { 0.0 } else { fatigue[b] },
                 );
-                let (w, et) = self.play_ko_tie(rng, a, b, &att, &def, fat);
+                let mut rng = streams.ko_tie(round, k / 2);
+                let (w, et) = self.play_ko_tie(&mut rng, a, b, &att, &def, fat);
                 if w != BYE {
                     wins[w] += 1;
                     fatigue[w] = if et { self.ko_fatigue_penalty } else { 0.0 };
@@ -1100,6 +1358,35 @@ impl Tally {
         self
     }
 
+    /// The largest standard error on any team's champion probability after `n` iterations.
+    ///
+    /// Each champion count is a binomial over `n` trials. The obvious estimate of its standard
+    /// error, `sqrt(p(1-p)/n)` with `p` the observed share, is unusable as a *stopping rule*: it
+    /// returns exactly zero for any team that has not yet won a single iteration. Since most of a
+    /// 48-team field never wins one, and after one iteration every team has a share of exactly 0 or
+    /// 1, a run could halt claiming perfect precision having learned almost nothing.
+    ///
+    /// So the share is shrunk by the Agresti-Coull "plus four" adjustment - two notional wins and
+    /// two notional losses - before the error is computed. A team on zero wins then carries a small
+    /// non-zero error that shrinks properly with `n`, which is the honest statement: never having
+    /// seen an event is not the same as knowing it cannot happen.
+    ///
+    /// The maximum over teams is the run's binding constraint, since a mid-probability contender is
+    /// far harder to pin down than a no-hoper.
+    fn worst_champion_std_error(&self, n: u64) -> f64 {
+        if n == 0 {
+            return f64::INFINITY;
+        }
+        let adjusted = n as f64 + 4.0;
+        self.counts
+            .iter()
+            .map(|c| {
+                let p = (c[5] as f64 + 2.0) / adjusted;
+                (p * (1.0 - p) / adjusted).sqrt()
+            })
+            .fold(0.0, f64::max)
+    }
+
     fn into_forecast(self, teams: &[TeamId], iterations: u64) -> TournamentForecast {
         let denom = iterations.max(1) as f64;
         let team_forecasts = teams
@@ -1173,7 +1460,7 @@ mod tests {
             &inputs,
             LiveConfig::default(),
         );
-        let mut rng = StdRng::seed_from_u64(11);
+        let mut rng = Rng::new(11);
         let z = vec![0.0; prep.n];
         let trials = 30_000;
         let wins = (0..trials)
@@ -1200,7 +1487,7 @@ mod tests {
             &inputs,
             LiveConfig::default(),
         );
-        let mut rng = StdRng::seed_from_u64(5);
+        let mut rng = Rng::new(5);
         let z = vec![0.0; prep.n];
         let trials = 30_000;
         let wins = (0..trials)
@@ -1227,7 +1514,7 @@ mod tests {
         let trials = 40_000;
 
         // Even ties reach extra time a non-trivial share of the time (so fatigue can be carried).
-        let mut rng = StdRng::seed_from_u64(3);
+        let mut rng = Rng::new(3);
         let et = (0..trials)
             .filter(|_| prep.sample_knockout(&mut rng, 0, 1, &z, &z, (0.0, 0.0)).1)
             .count();
@@ -1238,7 +1525,7 @@ mod tests {
 
         // A side carrying extra-time fatigue wins fewer ties than when fresh (same RNG stream).
         let win = |fatigue: (f64, f64), seed: u64| -> f64 {
-            let mut r = StdRng::seed_from_u64(seed);
+            let mut r = Rng::new(seed);
             (0..trials)
                 .filter(|_| prep.sample_knockout(&mut r, 0, 1, &z, &z, fatigue).0 == 0)
                 .count() as f64
@@ -1303,7 +1590,7 @@ mod tests {
                 &LiveInputs::default(),
                 LiveConfig::default(),
             );
-            let mut rng = StdRng::seed_from_u64(1);
+            let mut rng = Rng::new(1);
             let n = 20_000;
             let xs: Vec<f64> = (0..n)
                 .map(|_| prep.sample_goals(&mut rng, 1.4) as f64)
@@ -1340,7 +1627,7 @@ mod tests {
             &LiveInputs::default(),
             LiveConfig::default(),
         );
-        let mut rng = StdRng::seed_from_u64(99);
+        let mut rng = Rng::new(99);
         let z = vec![0.0; prep.n];
         let trials = 20_000;
         let a_wins = (0..trials)
@@ -1365,7 +1652,7 @@ mod tests {
             &LiveInputs::default(),
             LiveConfig::default(),
         );
-        let mut rng = StdRng::seed_from_u64(7);
+        let mut rng = Rng::new(7);
         let z = vec![0.0; prep.n];
         let trials = 20_000;
         let strong_wins = (0..trials)
@@ -1452,6 +1739,388 @@ mod tests {
             }
         }
         t
+    }
+
+    /// Two forecasts of `tournament` at the given seed, differing only in the conditioned result.
+    /// Returns the mean absolute difference in group-qualification probability across every team
+    /// outside the conditioned group.
+    fn qualification_drift(conditioned_seed: u64, baseline_seed: u64) -> f64 {
+        let base = full_tournament();
+        // Team 0 (the strongest) is handed a heavy win over its group rival team 1. Nothing outside
+        // group A (teams 0-3) is touched by this.
+        let mut cond = base.clone();
+        let m = cond
+            .matches
+            .iter_mut()
+            .find(|m| m.home == TeamId(0) && m.away == TeamId(1))
+            .expect("group A fixture 0 v 1");
+        m.status = MatchStatus::Finished;
+        m.score = Scoreline::new(4, 0);
+
+        let run = |t: &Tournament, seed: u64| {
+            simulate(
+                t,
+                &RankSampler,
+                SimConfig {
+                    iterations: 3000,
+                    seed,
+                    ..Default::default()
+                },
+            )
+            .teams
+        };
+        let (b, c) = (run(&base, baseline_seed), run(&cond, conditioned_seed));
+        let p = |v: &[TeamForecast], t: TeamId| {
+            v.iter()
+                .find(|f| f.team == t)
+                .expect("team in forecast")
+                .p_advance_group
+        };
+        let others: Vec<TeamId> = (4..48u32).map(TeamId).collect();
+        others
+            .iter()
+            .map(|&t| (p(&c, t) - p(&b, t)).abs())
+            .sum::<f64>()
+            / others.len() as f64
+    }
+
+    #[test]
+    fn batching_a_run_matches_running_it_whole() {
+        // The property the precision loop rests on: iterations are addressed by global index, so a
+        // run assembled from batches must be bit-identical to one run straight through. If this
+        // fails, extending a run silently rerandomises what it already had.
+        let t = full_tournament();
+        let cfg = SimConfig {
+            iterations: 4000,
+            seed: 5,
+            ..Default::default()
+        };
+        let whole = simulate(&t, &RankSampler, cfg);
+
+        let prep = Prepared::build(
+            &t,
+            &RankSampler,
+            cfg,
+            &LiveInputs::default(),
+            LiveConfig::default(),
+        );
+        let n = prep.teams.len();
+        let batched = tally_iterations(&prep, cfg.seed, 0..1500, n)
+            .merge(tally_iterations(&prep, cfg.seed, 1500..4000, n))
+            .into_forecast(&prep.teams, 4000);
+        assert_eq!(whole.teams, batched.teams, "batching changed the forecast");
+    }
+
+    #[test]
+    fn a_precision_run_reaches_its_target_and_reports_the_cost() {
+        let t = full_tournament();
+        let target = PrecisionTarget {
+            champion_std_error: 0.004,
+            batch: 2_000,
+            max_iterations: 200_000,
+        };
+        let out = simulate_to_precision(
+            &t,
+            &RankSampler,
+            SimConfig {
+                seed: 9,
+                ..Default::default()
+            },
+            &LiveInputs::default(),
+            LiveConfig::default(),
+            target,
+        );
+        assert!(out.target_met, "target should be reachable");
+        assert!(
+            out.worst_champion_std_error <= 0.004,
+            "achieved {}",
+            out.worst_champion_std_error
+        );
+        // It should stop as soon as the target is met, not run to the ceiling.
+        assert!(out.forecast.iterations < 200_000);
+        assert_eq!(
+            out.forecast.iterations % 2_000,
+            0,
+            "stops on a batch boundary"
+        );
+        // The forecast itself must still be coherent.
+        let total: f64 = out.forecast.teams.iter().map(|f| f.p_champion).sum();
+        assert!((total - 1.0).abs() < 1e-9, "champion mass {total}");
+    }
+
+    #[test]
+    fn a_tighter_target_costs_more_iterations() {
+        let t = full_tournament();
+        let run = |se: f64| {
+            simulate_to_precision(
+                &t,
+                &RankSampler,
+                SimConfig {
+                    seed: 3,
+                    ..Default::default()
+                },
+                &LiveInputs::default(),
+                LiveConfig::default(),
+                PrecisionTarget {
+                    champion_std_error: se,
+                    batch: 2_000,
+                    max_iterations: 200_000,
+                },
+            )
+            .forecast
+            .iterations
+        };
+        // The standard error falls as 1/sqrt(n), so halving it should cost roughly four times as
+        // many iterations. Assert only the direction, which is what the feature promises.
+        assert!(run(0.003) > run(0.006), "a tighter target must cost more");
+    }
+
+    #[test]
+    fn an_unreachable_target_stops_at_the_ceiling_and_says_so() {
+        let t = full_tournament();
+        let out = simulate_to_precision(
+            &t,
+            &RankSampler,
+            SimConfig::default(),
+            &LiveInputs::default(),
+            LiveConfig::default(),
+            PrecisionTarget {
+                // No finite run achieves this; the error falls only as 1/sqrt(n).
+                champion_std_error: 1e-9,
+                batch: 1_000,
+                max_iterations: 3_000,
+            },
+        );
+        assert!(!out.target_met, "must not claim an unmet target");
+        assert_eq!(out.forecast.iterations, 3_000, "stops at the ceiling");
+        assert!(out.worst_champion_std_error > 1e-9);
+    }
+
+    #[test]
+    fn a_degenerate_precision_target_still_terminates() {
+        let t = full_tournament();
+        let out = simulate_to_precision(
+            &t,
+            &RankSampler,
+            SimConfig::default(),
+            &LiveInputs::default(),
+            LiveConfig::default(),
+            // A zero batch and a ceiling below it: both are clamped rather than looping forever.
+            PrecisionTarget {
+                champion_std_error: 0.0,
+                batch: 0,
+                max_iterations: 0,
+            },
+        );
+        assert_eq!(out.forecast.iterations, 1, "one clamped iteration");
+        // A single iteration must not be mistaken for perfect precision. The unshrunk binomial
+        // error would be exactly zero here, since every team's share is 0 or 1 after one trial.
+        assert!(
+            !out.target_met,
+            "must not claim a met target after one trial"
+        );
+        assert!(
+            out.worst_champion_std_error > 0.1,
+            "one iteration should look very uncertain, got {}",
+            out.worst_champion_std_error
+        );
+    }
+
+    #[test]
+    fn a_team_with_no_wins_still_carries_uncertainty() {
+        // The stopping statistic must not read zero error off an unobserved event. In this field the
+        // weakest teams never win a single iteration, so the unshrunk formula would give them
+        // exactly zero - and with a small enough run, drag the worst-case error to zero with them.
+        let t = full_tournament();
+        let out = simulate_to_precision(
+            &t,
+            &RankSampler,
+            SimConfig {
+                seed: 4,
+                ..Default::default()
+            },
+            &LiveInputs::default(),
+            LiveConfig::default(),
+            PrecisionTarget {
+                champion_std_error: 0.01,
+                batch: 500,
+                max_iterations: 10_000,
+            },
+        );
+        let never_won = out
+            .forecast
+            .teams
+            .iter()
+            .filter(|f| f.p_champion == 0.0)
+            .count();
+        assert!(never_won > 0, "this field should have teams on zero");
+        assert!(
+            out.worst_champion_std_error > 0.0,
+            "a run containing unobserved events cannot have zero error"
+        );
+    }
+
+    #[test]
+    fn a_paired_difference_of_identical_series_is_exactly_zero() {
+        // The same premise twice must give a zero swing with zero error - not a small number.
+        let xs = vec![true, false, true, true, false];
+        let d = PairedDifference::from_indicators(&xs, &xs);
+        assert_eq!(d.mean, 0.0);
+        assert_eq!(d.std_error, 0.0);
+        assert_eq!(d.iterations, 5);
+        assert!(!d.is_significant(), "a zero swing cannot be significant");
+    }
+
+    #[test]
+    fn a_paired_difference_reports_a_constant_shift_without_error() {
+        // Scenario wins whenever baseline does not: every per-iteration difference is +1, so the
+        // mean is 1 and there is no spread to be uncertain about.
+        let base = vec![false; 64];
+        let scen = vec![true; 64];
+        let d = PairedDifference::from_indicators(&scen, &base);
+        assert!((d.mean - 1.0).abs() < 1e-12);
+        assert_eq!(d.std_error, 0.0);
+        assert!(d.is_significant());
+    }
+
+    #[test]
+    fn a_paired_difference_prices_disagreement_as_uncertainty() {
+        // Half the iterations swing +1, half -1: the mean is zero but the spread is maximal, so the
+        // estimator must report that it cannot resolve the swing.
+        let n = 400;
+        let base: Vec<bool> = (0..n).map(|i| i % 2 == 0).collect();
+        let scen: Vec<bool> = (0..n).map(|i| i % 2 != 0).collect();
+        let d = PairedDifference::from_indicators(&scen, &base);
+        assert!(d.mean.abs() < 1e-12, "mean {}", d.mean);
+        // Per-iteration differences are +-1, so the SD is 1 and the SE is 1/sqrt(n).
+        assert!(
+            (d.std_error - 1.0 / (n as f64).sqrt()).abs() < 1e-3,
+            "std_error {}",
+            d.std_error
+        );
+        assert!(!d.is_significant());
+    }
+
+    #[test]
+    fn an_empty_or_mismatched_series_pairs_only_what_it_can() {
+        assert_eq!(PairedDifference::from_indicators(&[], &[]).iterations, 0);
+        let d = PairedDifference::from_indicators(&[true, true, true], &[false]);
+        assert_eq!(d.iterations, 1, "pairs up to the common length");
+        assert!((d.mean - 1.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn champion_indicators_agree_with_the_aggregate_forecast() {
+        // The per-iteration series must average to the same champion probability the ordinary
+        // forecast reports, or the paired estimator is measuring something else.
+        let t = full_tournament();
+        let cfg = SimConfig {
+            iterations: 3000,
+            seed: 17,
+            ..Default::default()
+        };
+        let inputs = LiveInputs::default();
+        let flags = champion_indicators(
+            &t,
+            &RankSampler,
+            cfg,
+            &inputs,
+            LiveConfig::default(),
+            TeamId(0),
+        );
+        assert_eq!(flags.len(), 3000);
+        let share = flags.iter().filter(|&&f| f).count() as f64 / 3000.0;
+        let aggregate = simulate(&t, &RankSampler, cfg)
+            .teams
+            .iter()
+            .find(|f| f.team == TeamId(0))
+            .expect("team 0")
+            .p_champion;
+        assert!(
+            (share - aggregate).abs() < 1e-12,
+            "indicator share {share} vs forecast {aggregate}"
+        );
+    }
+
+    #[test]
+    fn an_unknown_team_has_no_champion_iterations() {
+        let t = full_tournament();
+        let flags = champion_indicators(
+            &t,
+            &RankSampler,
+            SimConfig {
+                iterations: 50,
+                ..Default::default()
+            },
+            &LiveInputs::default(),
+            LiveConfig::default(),
+            TeamId(9999),
+        );
+        assert_eq!(flags.len(), 50);
+        assert!(flags.iter().all(|&f| !f));
+    }
+
+    #[test]
+    fn labelled_streams_couple_the_untouched_fixtures() {
+        // Conditioning one group-A result should leave the other eleven groups almost exactly as
+        // they were, because every fixture outside group A draws from a stream addressed by its own
+        // match id and so sees identical randomness in both runs. Sharing only a base seed - the
+        // way a single sequential stream would - does not achieve this: the removed fixture shifts
+        // every draw after it.
+        //
+        // The residual drift is not error. Third place qualifies across groups, so group A's
+        // third-placed record genuinely moves who advances elsewhere.
+        for seed in [1u64, 2, 3] {
+            let coupled = qualification_drift(seed, seed);
+            let independent = qualification_drift(seed, seed + 5000);
+            assert!(
+                coupled < 0.004,
+                "seed {seed}: coupled drift {coupled:.5} is larger than the cross-group effect"
+            );
+            assert!(
+                independent > 3.0 * coupled,
+                "seed {seed}: coupling should cut the drift several-fold, \
+                 got coupled {coupled:.5} vs independent {independent:.5}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_streams_draw_depends_on_its_address_and_nothing_else() {
+        let s = Streams::new(11, 4);
+        let take =
+            |mut r: Rng| -> [u64; 4] { [r.next_u64(), r.next_u64(), r.next_u64(), r.next_u64()] };
+
+        // Same address, same draws - and re-deriving the Streams gives the same answer, so nothing
+        // is carried in hidden state.
+        assert_eq!(
+            take(s.group_match(MatchId(7))),
+            take(s.group_match(MatchId(7)))
+        );
+        assert_eq!(
+            take(s.group_match(MatchId(7))),
+            take(Streams::new(11, 4).group_match(MatchId(7)))
+        );
+
+        // Distinct entities, distinct streams.
+        assert_ne!(
+            take(s.group_match(MatchId(7))),
+            take(s.group_match(MatchId(8)))
+        );
+        assert_ne!(take(s.team_strength(2)), take(s.team_strength(3)));
+        assert_ne!(take(s.ko_tie(1, 0)), take(s.ko_tie(2, 0)), "round matters");
+        assert_ne!(take(s.ko_tie(1, 0)), take(s.ko_tie(1, 1)), "slot matters");
+
+        // Different kinds must not collide on a shared index: team 7, match 7 and slot 7 are
+        // unrelated things.
+        assert_ne!(take(s.group_match(MatchId(7))), take(s.team_strength(7)));
+        assert_ne!(take(s.team_strength(7)), take(s.ko_tie(0, 7)));
+
+        // A different iteration is a different universe.
+        assert_ne!(
+            take(s.group_match(MatchId(7))),
+            take(Streams::new(11, 5).group_match(MatchId(7)))
+        );
     }
 
     #[test]

@@ -60,6 +60,11 @@ enum Command {
         /// synthetic tournament from scratch.
         #[arg(long)]
         stage: Option<String>,
+        /// Target Monte-Carlo precision instead of a fixed iteration count: keep simulating until
+        /// no team's champion probability has a standard error above this (e.g. `0.002` for
+        /// ±0.2 pp). Overrides `--iters`, which becomes the ceiling.
+        #[arg(long)]
+        precision: Option<f64>,
     },
     /// Predict a single matchup (pre-match ensemble + exact-score grid).
     Predict {
@@ -220,7 +225,8 @@ async fn main() -> anyhow::Result<()> {
             seed,
             top,
             stage,
-        } => cmd_simulate(iters, seed, top, stage),
+            precision,
+        } => cmd_simulate(iters, seed, top, stage, precision),
         Command::Predict {
             home,
             away,
@@ -479,7 +485,13 @@ fn cmd_inplay(home: &str, away: &str, iters: u32, seed: u64) -> anyhow::Result<(
     Ok(())
 }
 
-fn cmd_simulate(iters: u64, seed: u64, top: usize, stage: Option<String>) -> anyhow::Result<()> {
+fn cmd_simulate(
+    iters: u64,
+    seed: u64,
+    top: usize,
+    stage: Option<String>,
+    precision: Option<f64>,
+) -> anyhow::Result<()> {
     if let Some(slug) = stage {
         return cmd_simulate_stage(&slug, iters, seed, top);
     }
@@ -491,10 +503,16 @@ fn cmd_simulate(iters: u64, seed: u64, top: usize, stage: Option<String>) -> any
         .map(|t| (t.id, t.name.clone()))
         .collect();
 
-    println!(
-        "Simulating {} - {} iterations (seed {})...\n",
-        tournament.name, iters, seed
-    );
+    match precision {
+        Some(p) => println!(
+            "Simulating {} - to ±{:.3} champion standard error, at most {} iterations (seed {})...\n",
+            tournament.name, p, iters, seed
+        ),
+        None => println!(
+            "Simulating {} - {} iterations (seed {})...\n",
+            tournament.name, iters, seed
+        ),
+    }
     // Apply the full match context (host, crowd, altitude, rest, travel, heat) plus the style
     // matchup to every fixture, and the per-team knockout factors (shootout skill, pedigree).
     let inputs = LiveInputs {
@@ -504,17 +522,36 @@ fn cmd_simulate(iters: u64, seed: u64, top: usize, stage: Option<String>) -> any
         ..Default::default()
     };
     let start = Instant::now();
-    let forecast = simulate_with_live(
-        &tournament,
-        &model,
-        SimConfig {
-            iterations: iters,
-            seed,
-            ..SimConfig::default()
-        },
-        &inputs,
-        LiveConfig::default(),
-    );
+    let config = SimConfig {
+        iterations: iters,
+        seed,
+        ..SimConfig::default()
+    };
+    // With a precision target the run decides its own length, up to `--iters` as the ceiling.
+    let (forecast, achieved) = match precision {
+        Some(p) => {
+            let out = oracle_sim::simulate_to_precision(
+                &tournament,
+                &model,
+                config,
+                &inputs,
+                LiveConfig::default(),
+                oracle_sim::PrecisionTarget {
+                    champion_std_error: p.max(1e-4),
+                    batch: 5_000,
+                    max_iterations: iters,
+                },
+            );
+            (
+                out.forecast,
+                Some((out.worst_champion_std_error, out.target_met)),
+            )
+        }
+        None => (
+            simulate_with_live(&tournament, &model, config, &inputs, LiveConfig::default()),
+            None,
+        ),
+    };
     let elapsed = start.elapsed();
 
     // Monte-Carlo standard error on a probability from N iterations: sqrt(p(1-p)/N).
@@ -540,13 +577,29 @@ fn cmd_simulate(iters: u64, seed: u64, top: usize, stage: Option<String>) -> any
             t.p_round_of_16 * 100.0,
         );
     }
+    let ran = forecast.iterations;
     println!(
         "\n{} simulations in {:.2}s  ({:.0} tournaments/sec); ±MC err is the Monte-Carlo \
          standard error on the champion probability",
-        iters,
+        ran,
         elapsed.as_secs_f64(),
-        iters as f64 / elapsed.as_secs_f64().max(1e-9),
+        ran as f64 / elapsed.as_secs_f64().max(1e-9),
     );
+    if let Some((worst, met)) = achieved {
+        if met {
+            println!(
+                "  precision target reached: worst champion standard error ±{:.4} after {ran} \
+                 iterations",
+                worst
+            );
+        } else {
+            println!(
+                "  precision target NOT reached: stopped at the {ran}-iteration ceiling with worst \
+                 champion standard error ±{:.4}",
+                worst
+            );
+        }
+    }
     Ok(())
 }
 

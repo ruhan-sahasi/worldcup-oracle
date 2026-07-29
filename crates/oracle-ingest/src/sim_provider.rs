@@ -12,8 +12,7 @@ use crate::provider::DataProvider;
 use async_trait::async_trait;
 use oracle_domain::{EventKind, MatchEvent, MatchId, Scoreline, Stage, TeamId, Tournament};
 use oracle_model::GoalModel;
-use rand::rngs::StdRng;
-use rand::{Rng, SeedableRng};
+use oracle_numeric::Rng;
 use std::time::Duration;
 use tokio::sync::mpsc::Sender;
 use tokio::time::sleep;
@@ -69,13 +68,13 @@ impl SimProvider {
         const P_RED_CARD: f64 = 0.0004; // per team per minute
         const P_YELLOW: f64 = 0.03; // ~1.3 bookings per team per match (realistic)
 
-        let mut rng = StdRng::seed_from_u64(self.seed ^ (u64::from(match_id.0) << 8));
+        let mut rng = Rng::new(self.seed ^ (u64::from(match_id.0) << 8));
         let mut score = Scoreline::new(0, 0);
 
         // Announce confirmed lineups just before kickoff. Each side rests its star ~25% of
         // the time, so the lineup-aware adjustment visibly moves the odds.
-        let drop_home_star = rng.gen_bool(0.25);
-        let drop_away_star = rng.gen_bool(0.25);
+        let drop_home_star = rng.chance(0.25);
+        let drop_away_star = rng.chance(0.25);
         let home_xi = data::starting_lineup(home, drop_home_star);
         let away_xi = data::starting_lineup(away, drop_away_star);
         send(
@@ -113,7 +112,7 @@ impl SimProvider {
             if cancel.is_cancelled() {
                 return Ok(());
             }
-            if rng.gen_bool(p_home_goal) {
+            if rng.chance(p_home_goal) {
                 score.home += 1;
                 send(
                     tx,
@@ -128,7 +127,7 @@ impl SimProvider {
                 )
                 .await?;
             }
-            if rng.gen_bool(p_away_goal) {
+            if rng.chance(p_away_goal) {
                 score.away += 1;
                 send(
                     tx,
@@ -143,18 +142,18 @@ impl SimProvider {
                 )
                 .await?;
             }
-            if rng.gen_bool(P_RED_CARD) {
-                let team = if rng.gen_bool(0.5) { home } else { away };
+            if rng.chance(P_RED_CARD) {
+                let team = if rng.chance(0.5) { home } else { away };
                 send(
                     tx,
                     MatchEvent::new(match_id, minute, EventKind::RedCard { team }),
                 )
                 .await?;
-            } else if rng.gen_bool(P_YELLOW) {
+            } else if rng.chance(P_YELLOW) {
                 // Book a player from the carded side, biased toward the talisman (XI index 1)
                 // so a key player can reach two yellows across the group stage and be
                 // suspended, exercising the suspension-tracking path.
-                let (team, xi) = if rng.gen_bool(0.5) {
+                let (team, xi) = if rng.chance(0.5) {
                     (home, &home_xi)
                 } else {
                     (away, &away_xi)
@@ -235,14 +234,14 @@ async fn send(tx: &Sender<MatchEvent>, event: MatchEvent) -> Result<()> {
 
 /// Pick which player in an XI gets booked, biased toward the talisman (index 1, the
 /// boosted attacker in a synthetic squad) so a key player can accumulate cards.
-fn pick_booked_player(rng: &mut StdRng, xi: &[String]) -> Option<String> {
+fn pick_booked_player(rng: &mut Rng, xi: &[String]) -> Option<String> {
     if xi.is_empty() {
         return None;
     }
-    let idx = if xi.len() > 1 && rng.gen_bool(0.45) {
+    let idx = if xi.len() > 1 && rng.chance(0.45) {
         1 // the star plays on the edge, so bookings concentrate enough to suspend
     } else {
-        rng.gen_range(0..xi.len())
+        rng.index_below(xi.len())
     };
     Some(xi[idx].clone())
 }

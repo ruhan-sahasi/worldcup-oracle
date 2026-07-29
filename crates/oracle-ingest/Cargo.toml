@@ -9,6 +9,7 @@ rust-version.workspace = true
 description = "Pluggable data ingestion (live API / replay / simulation) for worldcup-oracle"
 
 [dependencies]
+oracle-numeric.workspace = true
 oracle-domain.workspace = true
 oracle-model.workspace = true
 oracle-ratings.workspace = true
@@ -20,8 +21,6 @@ async-trait.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
 reqwest.workspace = true
-rand.workspace = true
-rand_distr.workspace = true
 csv.workspace = true
 tracing.workspace = true
 
