@@ -197,27 +197,32 @@ cargo run --release -p oracle-cli -- derivatives --home Brazil --away Japan
   Model                   Brier   LogLoss      Acc
   ------------------------------------------------
   Uniform baseline       0.6667    1.0986    33.3%
-  Dixon-Coles (goals)    0.6168    1.0284    50.1%
-  Dixon-Coles (xG)       0.6097    1.0182    50.7%
-  Elo                    0.6515    1.1080    48.1%
-  Ensemble (+Market)     0.6170    1.0286    49.5%
-  Market (bookmaker)     0.6095    1.0180    50.5%
+  Dixon-Coles (goals)    0.6228    1.0382    47.6%
+  Dixon-Coles (xG)       0.6201    1.0334    49.4%
+  Elo                    0.6379    1.0669    46.8%
+  Ensemble (+Market)     0.6186    1.0311    48.6%
+  Market (bookmaker)     0.6192    1.0323    49.0%
 
-  learned weights: DC 0.38 / Elo 0.24 / Market 0.38   temperature 0.73
+  learned weights: DC 0.40 / Elo 0.17 / Market 0.43   temperature 0.90
 
-  Ensemble calibration (ECE 0.030):
+  Ensemble calibration (ECE 0.011):
           bucket   predicted   empirical        n
-       0-20 %         17.6%      21.8%      110
-      20-40 %         29.5%      27.7%     1745
-      40-60 %         47.6%      54.0%      502
-      60-80 %         64.2%      51.2%       43
+       0-20 %         17.6%      17.6%      136
+      20-40 %         28.2%      27.4%     1628
+      40-60 %         48.0%      49.8%      568
+      60-80 %         64.5%      69.1%       68
 ```
 
 Three things are visible here. Fitting on **xG** beats fitting on goals (a lower-noise
 signal). The **L-BFGS** fit lands the Dixon-Coles (xG) model essentially level with the
-bookmaker's vig-free implied odds (Brier 0.610 vs 0.610) - the hard bar to beat - and stacking
+bookmaker's vig-free implied odds (Brier 0.620 vs 0.619) - the hard bar to beat - and stacking
 still leans on the market as the single sharpest signal. And the **reliability table + ECE**
-confirm the ensemble is well-calibrated (predicted ≈ empirical in every bucket). The synthetic results now carry
+confirm the ensemble is well-calibrated (predicted ≈ empirical in every bucket).
+
+These are *synthetic* numbers, so read them as a check that the machinery works, not as a
+measure of skill: the exact figures move whenever the synthetic generator's random stream
+changes, and only the relationships between the rows mean anything. Real-data results are in
+[`docs/VALIDATION.md`](docs/VALIDATION.md). The synthetic results now carry
 mild **match-level overdispersion** (a Gamma-Poisson "form on the day"), so the negative-binomial
 goal model has fatter, more realistic scoreline tails to fit. `--data` runs the same split on a
 real [football-data.co.uk](https://www.football-data.co.uk) CSV (with closing odds, and xG
