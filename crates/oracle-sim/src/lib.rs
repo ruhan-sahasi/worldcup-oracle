@@ -218,6 +218,101 @@ pub fn simulate_with_live<S: MatchSampler>(
     tally.into_forecast(&prep.teams, config.iterations)
 }
 
+/// Whether `team` was champion in each simulated tournament, one entry per iteration in iteration
+/// order.
+///
+/// The order is the point. Two calls with the same `config.seed` draw from the same labelled
+/// streams, so entry `i` of each describes the *same* simulated universe under two different
+/// premises - which is what lets [`PairedDifference`] difference them iteration by iteration
+/// instead of comparing two aggregate probabilities.
+pub fn champion_indicators<S: MatchSampler>(
+    tournament: &Tournament,
+    sampler: &S,
+    config: SimConfig,
+    inputs: &LiveInputs,
+    live_config: LiveConfig,
+    team: TeamId,
+) -> Vec<bool> {
+    let prep = Prepared::build(tournament, sampler, config, inputs, live_config);
+    let Some(ix) = prep.teams.iter().position(|&t| t == team) else {
+        return vec![false; config.iterations as usize];
+    };
+    let need = prep.required[5];
+    (0..config.iterations)
+        .into_par_iter()
+        .map(|i| prep.simulate_once(&Streams::new(config.seed, i))[ix] >= need)
+        .collect()
+}
+
+/// A difference between two coupled simulations, with the uncertainty of the *difference*.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct PairedDifference {
+    /// The mean difference (scenario minus baseline).
+    pub mean: f64,
+    /// The standard error of that mean, from the spread of the per-iteration differences.
+    pub std_error: f64,
+    pub iterations: u64,
+}
+
+impl PairedDifference {
+    /// Difference two per-iteration series that were drawn from the same streams.
+    ///
+    /// The standard error comes from the variance of the per-iteration differences, which is the
+    /// only way to get it right when the two series are correlated. Treating the two aggregate
+    /// probabilities as independent and adding their variances would overstate the error wherever
+    /// the coupling bites - and understate nothing, but a forecast that reports pessimistic error
+    /// bars on a real effect is as misleading as one that reports none.
+    ///
+    /// Series are compared up to their common length; a mismatch means one run was configured with
+    /// fewer iterations, and the extra tail has no partner to pair with.
+    pub fn from_indicators(scenario: &[bool], baseline: &[bool]) -> Self {
+        let n = scenario.len().min(baseline.len());
+        if n == 0 {
+            return Self {
+                mean: 0.0,
+                std_error: 0.0,
+                iterations: 0,
+            };
+        }
+        // Each difference is one of -1, 0, +1.
+        let diffs = scenario
+            .iter()
+            .zip(baseline)
+            .take(n)
+            .map(|(&s, &b)| f64::from(i8::from(s) - i8::from(b)));
+        let mut sum = 0.0;
+        let mut sum_sq = 0.0;
+        for d in diffs {
+            sum += d;
+            sum_sq += d * d;
+        }
+        let nf = n as f64;
+        let mean = sum / nf;
+        // Sample variance with Bessel's correction, then the standard error of the mean.
+        let var = if n > 1 {
+            (sum_sq - nf * mean * mean) / (nf - 1.0)
+        } else {
+            0.0
+        };
+        Self {
+            mean,
+            std_error: (var.max(0.0) / nf).sqrt(),
+            iterations: n as u64,
+        }
+    }
+
+    /// The half-width of an approximate 95% interval around [`mean`](Self::mean).
+    pub fn margin_95(&self) -> f64 {
+        1.96 * self.std_error
+    }
+
+    /// Whether the difference is distinguishable from zero at ~95% confidence. A swing that fails
+    /// this is a swing the Monte-Carlo cannot actually resolve, however large it looks.
+    pub fn is_significant(&self) -> bool {
+        self.mean.abs() > self.margin_95()
+    }
+}
+
 /// The knockout rounds two teams can meet at, in order (the 2026 shape).
 const MEETING_ROUNDS: [&str; 5] = [
     "Round of 32",
@@ -1572,6 +1667,106 @@ mod tests {
             .map(|&t| (p(&c, t) - p(&b, t)).abs())
             .sum::<f64>()
             / others.len() as f64
+    }
+
+    #[test]
+    fn a_paired_difference_of_identical_series_is_exactly_zero() {
+        // The same premise twice must give a zero swing with zero error - not a small number.
+        let xs = vec![true, false, true, true, false];
+        let d = PairedDifference::from_indicators(&xs, &xs);
+        assert_eq!(d.mean, 0.0);
+        assert_eq!(d.std_error, 0.0);
+        assert_eq!(d.iterations, 5);
+        assert!(!d.is_significant(), "a zero swing cannot be significant");
+    }
+
+    #[test]
+    fn a_paired_difference_reports_a_constant_shift_without_error() {
+        // Scenario wins whenever baseline does not: every per-iteration difference is +1, so the
+        // mean is 1 and there is no spread to be uncertain about.
+        let base = vec![false; 64];
+        let scen = vec![true; 64];
+        let d = PairedDifference::from_indicators(&scen, &base);
+        assert!((d.mean - 1.0).abs() < 1e-12);
+        assert_eq!(d.std_error, 0.0);
+        assert!(d.is_significant());
+    }
+
+    #[test]
+    fn a_paired_difference_prices_disagreement_as_uncertainty() {
+        // Half the iterations swing +1, half -1: the mean is zero but the spread is maximal, so the
+        // estimator must report that it cannot resolve the swing.
+        let n = 400;
+        let base: Vec<bool> = (0..n).map(|i| i % 2 == 0).collect();
+        let scen: Vec<bool> = (0..n).map(|i| i % 2 != 0).collect();
+        let d = PairedDifference::from_indicators(&scen, &base);
+        assert!(d.mean.abs() < 1e-12, "mean {}", d.mean);
+        // Per-iteration differences are +-1, so the SD is 1 and the SE is 1/sqrt(n).
+        assert!(
+            (d.std_error - 1.0 / (n as f64).sqrt()).abs() < 1e-3,
+            "std_error {}",
+            d.std_error
+        );
+        assert!(!d.is_significant());
+    }
+
+    #[test]
+    fn an_empty_or_mismatched_series_pairs_only_what_it_can() {
+        assert_eq!(PairedDifference::from_indicators(&[], &[]).iterations, 0);
+        let d = PairedDifference::from_indicators(&[true, true, true], &[false]);
+        assert_eq!(d.iterations, 1, "pairs up to the common length");
+        assert!((d.mean - 1.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn champion_indicators_agree_with_the_aggregate_forecast() {
+        // The per-iteration series must average to the same champion probability the ordinary
+        // forecast reports, or the paired estimator is measuring something else.
+        let t = full_tournament();
+        let cfg = SimConfig {
+            iterations: 3000,
+            seed: 17,
+            ..Default::default()
+        };
+        let inputs = LiveInputs::default();
+        let flags = champion_indicators(
+            &t,
+            &RankSampler,
+            cfg,
+            &inputs,
+            LiveConfig::default(),
+            TeamId(0),
+        );
+        assert_eq!(flags.len(), 3000);
+        let share = flags.iter().filter(|&&f| f).count() as f64 / 3000.0;
+        let aggregate = simulate(&t, &RankSampler, cfg)
+            .teams
+            .iter()
+            .find(|f| f.team == TeamId(0))
+            .expect("team 0")
+            .p_champion;
+        assert!(
+            (share - aggregate).abs() < 1e-12,
+            "indicator share {share} vs forecast {aggregate}"
+        );
+    }
+
+    #[test]
+    fn an_unknown_team_has_no_champion_iterations() {
+        let t = full_tournament();
+        let flags = champion_indicators(
+            &t,
+            &RankSampler,
+            SimConfig {
+                iterations: 50,
+                ..Default::default()
+            },
+            &LiveInputs::default(),
+            LiveConfig::default(),
+            TeamId(9999),
+        );
+        assert_eq!(flags.len(), 50);
+        assert!(flags.iter().all(|&f| !f));
     }
 
     #[test]

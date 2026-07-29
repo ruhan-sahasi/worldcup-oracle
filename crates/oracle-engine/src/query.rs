@@ -29,7 +29,10 @@ use oracle_players::{
     GoldenBootConfig, GoldenBootContender, GoldenBootOdds, MatchPlayer, PlayerRef, ScorerMarket,
 };
 use oracle_ratings::{RatingStore, StateSpaceRatings};
-use oracle_sim::{meeting_probabilities, simulate_with_live, LiveInputs, SimConfig};
+use oracle_sim::{
+    champion_indicators, meeting_probabilities, simulate_with_live, LiveInputs, PairedDifference,
+    SimConfig,
+};
 use serde::Serialize;
 use std::collections::HashMap;
 
@@ -684,9 +687,16 @@ impl Explorer {
         self.stage_forecast(actual_2026::parse_stage(slug)?, iters, seed)
     }
 
-    /// Per-team champion probabilities from a Monte-Carlo run on a given tournament state (which
-    /// may have some matches fixed to a result). Shared by [`kingmaker`](Self::kingmaker).
-    fn champ_probs(&self, tournament: &Tournament, iters: u64, seed: u64) -> HashMap<TeamId, f64> {
+    /// One team's per-iteration champion series from a Monte-Carlo run on a given tournament state
+    /// (which may have some matches fixed to a result). Used by [`kingmaker`](Self::kingmaker),
+    /// which needs the individual iterations rather than their average so it can pair two runs.
+    fn champion_flags(
+        &self,
+        tournament: &Tournament,
+        iters: u64,
+        seed: u64,
+        team: TeamId,
+    ) -> Vec<bool> {
         let inputs = LiveInputs {
             venue: data::matchup_adjustments(tournament),
             shootout_rating: self.shootout_rating.clone(),
@@ -698,34 +708,40 @@ impl Explorer {
             seed,
             ..SimConfig::default()
         };
-        simulate_with_live(
+        champion_indicators(
             tournament,
             &self.model,
             config,
             &inputs,
             LiveConfig::default(),
+            team,
         )
-        .teams
-        .iter()
-        .map(|t| (t.team, t.p_champion))
-        .collect()
     }
 
     /// Rooting interest for a team: how much each of its group rivals' matches would swing its
     /// championship odds. Conditions the tournament on each result (a representative scoreline) and
-    /// re-simulates, diffing the team's champion probability against the baseline. All runs share
-    /// the seed, so a swing reflects the result rather than Monte-Carlo noise.
+    /// re-simulates, differencing the team's champion series against the baseline one iteration at
+    /// a time.
+    ///
+    /// Every run shares the seed, so paired iterations describe the same simulated universe under
+    /// two premises. That pairing buys less here than it does elsewhere in the simulator: the
+    /// conditioned result changes how often the team tops its group, so it enters a different
+    /// bracket slot and its knockout path is legitimately different randomness. That path change is
+    /// the effect being measured, not noise, so it cannot be coupled away - which is exactly why
+    /// each swing is reported with the standard error of the difference rather than as a bare
+    /// number.
     ///
     /// # Panics
     /// If a candidate match id is absent from the tournament. It cannot: the candidates are
     /// selected out of `self.tournament.matches` in the first place.
     pub fn kingmaker(&self, team: TeamId, iters: u64, seed: u64) -> KingmakerReport {
         let iters = iters.clamp(2000, KINGMAKER_MAX_ITERS);
-        let base_champion = self
-            .champ_probs(&self.tournament, iters, seed)
-            .get(&team)
-            .copied()
-            .unwrap_or(0.0);
+        // The baseline's per-iteration champion series, computed once and paired against every
+        // scenario below. Same cost as the old aggregate baseline, but it keeps the iteration
+        // identities that the paired standard error needs.
+        let base_flags = self.champion_flags(&self.tournament, iters, seed, team);
+        let base_champion =
+            base_flags.iter().filter(|&&f| f).count() as f64 / base_flags.len().max(1) as f64;
         // The team's group rivals' matches (not involving the team) shape whether it advances.
         let group_teams: Vec<TeamId> = self
             .tournament
@@ -747,17 +763,16 @@ impl Explorer {
             })
             .map(|m| m.id)
             .collect();
-        let swing = |id: MatchId, score: Scoreline| -> f64 {
+        let swing = |id: MatchId, score: Scoreline| -> PairedDifference {
             let mut t = self.tournament.clone();
             if let Some(mm) = t.matches.iter_mut().find(|x| x.id == id) {
                 mm.status = MatchStatus::Finished;
                 mm.score = score;
             }
-            self.champ_probs(&t, iters, seed)
-                .get(&team)
-                .copied()
-                .unwrap_or(0.0)
-                - base_champion
+            // Both runs share `seed`, so iteration i of each is the same simulated universe under
+            // the two premises and the differences can be taken one iteration at a time.
+            let flags = self.champion_flags(&t, iters, seed, team);
+            PairedDifference::from_indicators(&flags, &base_flags)
         };
         let mut matches: Vec<KingmakerRow> = cand_ids
             .into_iter()
@@ -775,9 +790,10 @@ impl Explorer {
             .collect();
         let magnitude = |r: &KingmakerRow| {
             r.home_win_swing
+                .mean
                 .abs()
-                .max(r.draw_swing.abs())
-                .max(r.away_win_swing.abs())
+                .max(r.draw_swing.mean.abs())
+                .max(r.away_win_swing.mean.abs())
         };
         matches.sort_by(|a, b| {
             magnitude(b)
@@ -1439,10 +1455,13 @@ pub struct KingmakerRow {
     pub match_id: MatchId,
     pub home_name: String,
     pub away_name: String,
-    /// Signed change (in probability) to the team's championship odds under each result.
-    pub home_win_swing: f64,
-    pub draw_swing: f64,
-    pub away_win_swing: f64,
+    /// Signed change (in probability) to the team's championship odds under each result, each with
+    /// the standard error of that *difference* - not of the two champion probabilities behind it.
+    /// A swing whose magnitude is inside its own error bars is one the Monte-Carlo cannot resolve,
+    /// no matter how large it looks.
+    pub home_win_swing: PairedDifference,
+    pub draw_swing: PairedDifference,
+    pub away_win_swing: PairedDifference,
 }
 
 /// A team's rooting interest: how much each of its group rivals' matches moves its title odds,
@@ -1742,7 +1761,51 @@ mod tests {
         assert_eq!(k.matches.len(), 3);
         for r in &k.matches {
             for s in [r.home_win_swing, r.draw_swing, r.away_win_swing] {
-                assert!(s.is_finite() && s.abs() <= 1.0);
+                assert!(s.mean.is_finite() && s.mean.abs() <= 1.0);
+                // Every swing carries the uncertainty of its own difference.
+                assert_eq!(s.iterations, 3000, "paired over every iteration");
+                assert!(s.std_error > 0.0, "a sampled swing has sampling error");
+                assert!(
+                    s.std_error < 0.1,
+                    "3000 paired iterations should pin the swing far better than {}",
+                    s.std_error
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_kingmaker_swing_is_consistent_with_its_own_error_bars() {
+        // The same scenario at two unrelated seeds must agree to within the error bars each run
+        // reports. This is the check that the standard error is honest rather than decorative: if it
+        // were understated, two seeds would routinely disagree by more than it allows.
+        let ex = Explorer::new();
+        let team = ex.resolve("Brazil").unwrap();
+        let (a, b) = (ex.kingmaker(team, 3000, 1), ex.kingmaker(team, 3000, 2));
+        assert_eq!(a.matches.len(), b.matches.len());
+        for ra in &a.matches {
+            // Rows are ranked by swing magnitude, so two seeds may order them differently; pair
+            // them by fixture rather than by position.
+            let rb = b
+                .matches
+                .iter()
+                .find(|r| r.match_id == ra.match_id)
+                .expect("same fixtures in both runs");
+            for (sa, sb) in [
+                (ra.home_win_swing, rb.home_win_swing),
+                (ra.draw_swing, rb.draw_swing),
+                (ra.away_win_swing, rb.away_win_swing),
+            ] {
+                // Difference of two independent estimates, so the combined 95% margin adds in
+                // quadrature. Allow 3 sigma to keep this from flaking.
+                let tolerance =
+                    3.0 * (sa.std_error * sa.std_error + sb.std_error * sb.std_error).sqrt();
+                assert!(
+                    (sa.mean - sb.mean).abs() <= tolerance,
+                    "swings {} and {} disagree by more than 3 sigma ({tolerance})",
+                    sa.mean,
+                    sb.mean
+                );
             }
         }
     }
