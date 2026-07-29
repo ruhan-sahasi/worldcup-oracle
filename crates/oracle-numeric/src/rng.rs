@@ -26,6 +26,39 @@ impl Rng {
         Self { state: seed }
     }
 
+    /// Seed an independent **substream** addressed by a label rather than by position.
+    ///
+    /// The three coordinates are mixed into one seed, so `stream(s, kind, index)` always returns
+    /// the same stream and different coordinates give streams with no detectable relationship.
+    /// `kind` distinguishes *what* is being drawn (goals, strength, a shootout) and `index`
+    /// *which one* (a match id, a team, a bracket slot).
+    ///
+    /// This is what makes **common random numbers** possible. Drawing a whole simulation from one
+    /// sequential stream ties every draw to how many draws came before it, so changing anything
+    /// early shifts everything after it, and two runs that differ in one match end up with
+    /// unrelated randomness everywhere downstream. That is fatal when the quantity of interest is
+    /// a *difference* between two runs, because the noise in the difference is then as large as
+    /// the noise in each run. Addressing streams by label instead of by position means an entity
+    /// untouched by a change draws exactly the same numbers either way, and the difference
+    /// isolates the change.
+    ///
+    /// The mixing is SplitMix64's finalizer applied to each coordinate in turn, which is a
+    /// deliberately cheap choice: a substream costs a few multiplications, so keying per match or
+    /// per team is affordable inside the innermost simulation loop.
+    pub fn stream(seed: u64, kind: u32, index: u64) -> Self {
+        let mut state = Self::mix(seed);
+        state = Self::mix(state ^ Self::mix(u64::from(kind).wrapping_add(GOLDEN_GAMMA)));
+        state = Self::mix(state ^ Self::mix(index.wrapping_mul(GOLDEN_GAMMA)));
+        Self { state }
+    }
+
+    /// SplitMix64's finalizing avalanche: every input bit affects every output bit.
+    fn mix(mut z: u64) -> u64 {
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    }
+
     /// The next 64 random bits.
     pub fn next_u64(&mut self) -> u64 {
         self.state = self.state.wrapping_add(GOLDEN_GAMMA);
@@ -282,6 +315,73 @@ mod tests {
         let var = xs.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / N as f64;
         assert!(mean.abs() < 0.01, "mean was {mean}");
         assert!((var - 1.0).abs() < 0.02, "variance was {var}");
+    }
+
+    #[test]
+    fn a_substream_is_reproducible_from_its_address() {
+        let mut a = Rng::stream(7, 3, 41);
+        let mut b = Rng::stream(7, 3, 41);
+        for _ in 0..64 {
+            assert_eq!(a.next_u64(), b.next_u64());
+        }
+    }
+
+    #[test]
+    fn substreams_differ_in_every_coordinate() {
+        let first = |mut r: Rng| r.next_u64();
+        let base = first(Rng::stream(7, 3, 41));
+        assert_ne!(base, first(Rng::stream(8, 3, 41)), "seed must matter");
+        assert_ne!(base, first(Rng::stream(7, 4, 41)), "kind must matter");
+        assert_ne!(base, first(Rng::stream(7, 3, 42)), "index must matter");
+        // Coordinates must not be interchangeable: swapping kind and index is a different stream.
+        assert_ne!(first(Rng::stream(7, 3, 41)), first(Rng::stream(7, 41, 3)));
+    }
+
+    #[test]
+    fn adjacent_substreams_do_not_correlate() {
+        // Consecutive indices are the common case (match 0, 1, 2, ...) and the one most likely to
+        // betray a weak mix. Pair up adjacent streams' draws; the correlation should look like zero.
+        const N: usize = 20_000;
+        let (mut sx, mut sy, mut sxy, mut sxx, mut syy) = (0.0, 0.0, 0.0, 0.0, 0.0);
+        for i in 0..N as u64 {
+            let x = Rng::stream(1, 0, i).unit();
+            let y = Rng::stream(1, 0, i + 1).unit();
+            sx += x;
+            sy += y;
+            sxy += x * y;
+            sxx += x * x;
+            syy += y * y;
+        }
+        let n = N as f64;
+        let cov = sxy / n - (sx / n) * (sy / n);
+        let sd = ((sxx / n - (sx / n).powi(2)) * (syy / n - (sy / n).powi(2))).sqrt();
+        let corr = cov / sd;
+        // The standard error of a correlation at this n is ~1/sqrt(N) = 0.007.
+        assert!(corr.abs() < 0.03, "adjacent streams correlated at {corr}");
+    }
+
+    #[test]
+    fn substreams_are_uniform_across_indices() {
+        // One draw from each of many streams should itself look uniform - the property common
+        // random numbers relies on, since each entity contributes a single stream.
+        let mut buckets = [0usize; 10];
+        const N: u64 = 100_000;
+        for i in 0..N {
+            buckets[(Rng::stream(5, 2, i).unit() * 10.0) as usize] += 1;
+        }
+        for (i, count) in buckets.iter().enumerate() {
+            let share = *count as f64 / N as f64;
+            assert!((share - 0.1).abs() < 0.01, "bucket {i} held {share}");
+        }
+    }
+
+    #[test]
+    fn a_zero_address_still_gives_a_live_stream() {
+        // Every coordinate at zero is a legal address and must not degenerate.
+        let mut r = Rng::stream(0, 0, 0);
+        let first = r.next_u64();
+        assert_ne!(first, 0);
+        assert_ne!(first, r.next_u64());
     }
 
     /// Sample mean and (population) variance of `n` draws.
