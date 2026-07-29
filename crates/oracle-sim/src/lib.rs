@@ -1531,6 +1531,112 @@ mod tests {
         t
     }
 
+    /// Two forecasts of `tournament` at the given seed, differing only in the conditioned result.
+    /// Returns the mean absolute difference in group-qualification probability across every team
+    /// outside the conditioned group.
+    fn qualification_drift(conditioned_seed: u64, baseline_seed: u64) -> f64 {
+        let base = full_tournament();
+        // Team 0 (the strongest) is handed a heavy win over its group rival team 1. Nothing outside
+        // group A (teams 0-3) is touched by this.
+        let mut cond = base.clone();
+        let m = cond
+            .matches
+            .iter_mut()
+            .find(|m| m.home == TeamId(0) && m.away == TeamId(1))
+            .expect("group A fixture 0 v 1");
+        m.status = MatchStatus::Finished;
+        m.score = Scoreline::new(4, 0);
+
+        let run = |t: &Tournament, seed: u64| {
+            simulate(
+                t,
+                &RankSampler,
+                SimConfig {
+                    iterations: 3000,
+                    seed,
+                    ..Default::default()
+                },
+            )
+            .teams
+        };
+        let (b, c) = (run(&base, baseline_seed), run(&cond, conditioned_seed));
+        let p = |v: &[TeamForecast], t: TeamId| {
+            v.iter()
+                .find(|f| f.team == t)
+                .expect("team in forecast")
+                .p_advance_group
+        };
+        let others: Vec<TeamId> = (4..48u32).map(TeamId).collect();
+        others
+            .iter()
+            .map(|&t| (p(&c, t) - p(&b, t)).abs())
+            .sum::<f64>()
+            / others.len() as f64
+    }
+
+    #[test]
+    fn labelled_streams_couple_the_untouched_fixtures() {
+        // Conditioning one group-A result should leave the other eleven groups almost exactly as
+        // they were, because every fixture outside group A draws from a stream addressed by its own
+        // match id and so sees identical randomness in both runs. Sharing only a base seed - the
+        // way a single sequential stream would - does not achieve this: the removed fixture shifts
+        // every draw after it.
+        //
+        // The residual drift is not error. Third place qualifies across groups, so group A's
+        // third-placed record genuinely moves who advances elsewhere.
+        for seed in [1u64, 2, 3] {
+            let coupled = qualification_drift(seed, seed);
+            let independent = qualification_drift(seed, seed + 5000);
+            assert!(
+                coupled < 0.004,
+                "seed {seed}: coupled drift {coupled:.5} is larger than the cross-group effect"
+            );
+            assert!(
+                independent > 3.0 * coupled,
+                "seed {seed}: coupling should cut the drift several-fold, \
+                 got coupled {coupled:.5} vs independent {independent:.5}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_streams_draw_depends_on_its_address_and_nothing_else() {
+        let s = Streams::new(11, 4);
+        let take =
+            |mut r: Rng| -> [u64; 4] { [r.next_u64(), r.next_u64(), r.next_u64(), r.next_u64()] };
+
+        // Same address, same draws - and re-deriving the Streams gives the same answer, so nothing
+        // is carried in hidden state.
+        assert_eq!(
+            take(s.group_match(MatchId(7))),
+            take(s.group_match(MatchId(7)))
+        );
+        assert_eq!(
+            take(s.group_match(MatchId(7))),
+            take(Streams::new(11, 4).group_match(MatchId(7)))
+        );
+
+        // Distinct entities, distinct streams.
+        assert_ne!(
+            take(s.group_match(MatchId(7))),
+            take(s.group_match(MatchId(8)))
+        );
+        assert_ne!(take(s.team_strength(2)), take(s.team_strength(3)));
+        assert_ne!(take(s.ko_tie(1, 0)), take(s.ko_tie(2, 0)), "round matters");
+        assert_ne!(take(s.ko_tie(1, 0)), take(s.ko_tie(1, 1)), "slot matters");
+
+        // Different kinds must not collide on a shared index: team 7, match 7 and slot 7 are
+        // unrelated things.
+        assert_ne!(take(s.group_match(MatchId(7))), take(s.team_strength(7)));
+        assert_ne!(take(s.team_strength(7)), take(s.ko_tie(0, 7)));
+
+        // A different iteration is a different universe.
+        assert_ne!(
+            take(s.group_match(MatchId(7))),
+            take(Streams::new(11, 5).group_match(MatchId(7)))
+        );
+    }
+
     #[test]
     fn fixed_bracket_forecast_is_coherent() {
         let t = full_tournament();
