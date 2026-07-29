@@ -53,6 +53,31 @@ impl Rng {
         (self.next_u64() % n as u64) as usize
     }
 
+    /// A uniform draw in `[lo, hi)`. An empty or reversed interval yields `lo`.
+    ///
+    /// Consumes one uniform, so a caller's stream position does not depend on the bounds.
+    pub fn range(&mut self, lo: f64, hi: f64) -> f64 {
+        if hi <= lo {
+            return lo;
+        }
+        lo + self.unit() * (hi - lo)
+    }
+
+    /// A uniform integer in `[lo, hi]`, both ends included. `hi <= lo` yields `lo`.
+    ///
+    /// Inclusive because the ranges this replaces are inclusive by nature - a match minute is
+    /// `1..=90`, and an exclusive bound would quietly drop the ninetieth. Carries the same
+    /// negligible modulo bias as [`index_below`](Self::index_below); the arithmetic is done in
+    /// `i128` so no combination of `i64` bounds can overflow.
+    pub fn int_inclusive(&mut self, lo: i64, hi: i64) -> i64 {
+        if hi <= lo {
+            return lo;
+        }
+        let span = i128::from(hi) - i128::from(lo) + 1;
+        let offset = (u128::from(self.next_u64()) % span as u128) as i128;
+        (i128::from(lo) + offset) as i64
+    }
+
     /// A standard-normal draw, by the Box-Muller transform.
     ///
     /// Box-Muller produces two independent normals per pair of uniforms; we return one and discard
@@ -138,6 +163,72 @@ mod tests {
         assert_eq!(rng.index_below(1), 0);
         for _ in 0..1_000 {
             assert!(rng.index_below(7) < 7);
+        }
+    }
+
+    #[test]
+    fn range_draws_stay_within_their_bounds() {
+        let mut rng = Rng::new(21);
+        for _ in 0..10_000 {
+            let x = rng.range(-2.5, 7.5);
+            assert!((-2.5..7.5).contains(&x), "range() returned {x}");
+        }
+    }
+
+    #[test]
+    fn range_centres_on_the_midpoint() {
+        let mut rng = Rng::new(22);
+        const N: usize = 100_000;
+        let mean = (0..N).map(|_| rng.range(-0.3, 0.3)).sum::<f64>() / N as f64;
+        // SD of one draw is 0.6/sqrt(12) ~ 0.173, so the standard error is ~0.0005.
+        assert!(mean.abs() < 0.005, "mean was {mean}");
+    }
+
+    #[test]
+    fn a_degenerate_or_reversed_range_yields_its_lower_bound() {
+        let mut rng = Rng::new(23);
+        assert_eq!(rng.range(1.5, 1.5), 1.5);
+        assert_eq!(rng.range(4.0, 2.0), 4.0, "reversed bounds do not wrap");
+    }
+
+    #[test]
+    fn int_inclusive_covers_both_endpoints() {
+        let mut rng = Rng::new(24);
+        let mut seen_lo = false;
+        let mut seen_hi = false;
+        for _ in 0..2_000 {
+            let x = rng.int_inclusive(1, 90);
+            assert!((1..=90).contains(&x), "int_inclusive returned {x}");
+            seen_lo |= x == 1;
+            seen_hi |= x == 90;
+        }
+        assert!(seen_lo && seen_hi, "both ends must be reachable");
+    }
+
+    #[test]
+    fn int_inclusive_handles_degenerate_and_extreme_bounds() {
+        let mut rng = Rng::new(25);
+        assert_eq!(rng.int_inclusive(7, 7), 7, "a single-value range");
+        assert_eq!(rng.int_inclusive(9, 3), 9, "reversed bounds");
+        // The widest possible span is exactly 2^64, so the modulo is a no-op and the result must be
+        // the raw draw offset from i64::MIN. Checking that identity exercises the i128 span
+        // arithmetic where an i64 or u64 computation would have overflowed.
+        let (mut a, mut b) = (Rng::new(99), Rng::new(99));
+        let want = (i128::from(i64::MIN) + i128::from(b.next_u64())) as i64;
+        assert_eq!(a.int_inclusive(i64::MIN, i64::MAX), want);
+    }
+
+    #[test]
+    fn int_inclusive_is_roughly_uniform_over_a_small_range() {
+        let mut rng = Rng::new(26);
+        let mut counts = [0usize; 6];
+        const N: usize = 60_000;
+        for _ in 0..N {
+            counts[rng.int_inclusive(0, 5) as usize] += 1;
+        }
+        for (i, c) in counts.iter().enumerate() {
+            let share = *c as f64 / N as f64;
+            assert!((share - 1.0 / 6.0).abs() < 0.01, "face {i} held {share}");
         }
     }
 
