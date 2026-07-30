@@ -473,6 +473,39 @@ the log is replayed on startup to rebuild state, so a restart mid-tournament rec
 rather than starting cold. The earlier `ScoreSync`/`FullTime` reconciliation makes resume
 self-healing for a live feed that re-emits on restart.
 
+### Durable forecast journal (`oracle-engine::forecast_journal`)
+The event log records what the engine *saw*; this records what it **said**. With
+`EngineConfig.forecast_journal` set, each forecaster's leak-free pre-match call is appended as
+one JSON line the first time a match settles, and the track record is scored from those records
+rather than from forecasts the current model would recompute.
+
+The distinction matters more than it first appears. The engine's report card was already
+leak-free - each call is made before the model learns that result - but on restart the event-log
+replay *recomputes* every call using today's model and today's fitted parameters. Change the goal
+model, retune a hyperparameter, or alter the synthetic history the baseline is fit from, and every
+past call moves with it. The scorecard then answers "how would the current model have done?",
+which is a fair question but not the one a track record asks, and the failure is invisible: the
+numbers simply look a little better after each change. (Not hypothetical - an earlier change in
+this repo moved every synthetic value the baseline is fit from, which would have shifted the whole
+published record silently.)
+
+So writes are **idempotent on `(match, model)`** and first-write-wins. A replayed result, a
+re-delivered event, or a changed model attempting to republish are all refused: the first call -
+the one made without knowing the result - is the one that stands. Scoring reads through
+`published_call`, which prefers the journaled forecast and falls back to the in-memory one only
+when no journal is configured.
+
+The format deliberately mirrors the event log: newline-delimited JSON, tolerant of a torn final
+line, no database dependency. Records carry a schema version, and one from a *newer* version is
+refused and counted rather than parsed - serde would happily accept it, dropping whatever the new
+version added and producing plausible, wrong scores. Unreadable lines are counted and surfaced on
+the record itself, since a track record that hid the fact that part of it failed to load would be
+exactly the flattering silence the module exists to remove.
+
+Consequently the record is reconstructible offline from the two durable files alone -
+`wc-oracle track-record --journal <j> --event-log <e>` scores it with no engine and no fitting,
+which is also what makes it auditable by someone who does not trust the running server.
+
 ### On-demand explorer (`oracle-engine::query` + `oracle-api` + `static/explore.html`)
 The live `Engine` tracks one running tournament; the `Explorer` is its complement - a fit-once,
 read-only view that answers *ad-hoc* questions (predict any matchup, its HMC posterior credible

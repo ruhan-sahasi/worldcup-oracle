@@ -19,11 +19,16 @@
 //! recomputed on a throttle and whenever a result lands, not on every tick.
 
 pub mod event_log;
+pub mod forecast_journal;
 pub mod presets;
 pub mod query;
 mod snapshot;
 
 pub use event_log::EventLog;
+pub use forecast_journal::{
+    settle, track_record, ForecastJournal, ForecastRecord, JournalScore, SettledForecast,
+    TrackRecord, SCHEMA_VERSION,
+};
 pub use oracle_model::ReliabilityReport;
 pub use query::{signal_sensitivity, BacktestReport, Explorer, InPlayView, SignalContribution};
 pub use snapshot::{
@@ -144,6 +149,14 @@ impl EngineDeps {
     }
 }
 
+/// The headline forecaster's name, as it appears in the report card and the forecast journal.
+///
+/// A constant because journal scoring groups by this string: written out separately in each place,
+/// a divergence would silently split one model's track record into two partial ones.
+pub const ENSEMBLE_MODEL: &str = "Dixon-Coles ensemble";
+/// The second forecaster's name. See [`ENSEMBLE_MODEL`].
+pub const BRADLEY_TERRY_MODEL: &str = "Bradley-Terry";
+
 /// Tuning for the engine runtime.
 #[derive(Debug, Clone)]
 pub struct EngineConfig {
@@ -156,6 +169,11 @@ pub struct EngineConfig {
     /// Optional append-only event log. When set, every event is recorded and the log is
     /// replayed on startup to recover state across restarts.
     pub event_log: Option<PathBuf>,
+    /// Optional append-only forecast journal. When set, each model's leak-free pre-match call is
+    /// recorded the first time a match settles, and the track record is scored from those records
+    /// instead of from forecasts re-derived by the current model. See
+    /// [`forecast_journal`](crate::forecast_journal).
+    pub forecast_journal: Option<PathBuf>,
 }
 
 impl Default for EngineConfig {
@@ -165,6 +183,7 @@ impl Default for EngineConfig {
             broadcast_capacity: 256,
             forecast_every: Duration::from_secs(3),
             event_log: None,
+            forecast_journal: None,
         }
     }
 }
@@ -233,6 +252,35 @@ pub async fn spawn(
     let metrics = Arc::new(Metrics::default());
 
     // Recover from a prior run: replay the event log before the live feed resumes.
+    // Opened before the event-log replay below, so that replaying a result finds its call already
+    // journaled and declines to write a fresh one.
+    if let Some(path) = &config.forecast_journal {
+        let journal = Arc::new(ForecastJournal::create(path)?);
+        let (_, unreadable) = ForecastJournal::read_reporting(path)?;
+        tracing::info!(
+            calls = journal.len(),
+            unreadable,
+            path = %path.display(),
+            "opened forecast journal"
+        );
+        if unreadable > 0 {
+            tracing::warn!(
+                unreadable,
+                "some journal lines could not be read; the track record excludes them"
+            );
+        }
+        // Index the calls already on disk so scoring prefers them over anything recomputed. Read
+        // separately from the writer's own key set because scoring needs the forecasts, not just the
+        // keys.
+        let (existing, unreadable_at_boot) = ForecastJournal::read_reporting(path)?;
+        state.journal_unreadable_lines = unreadable_at_boot;
+        state.journaled_calls = existing
+            .into_iter()
+            .map(|r| ((r.match_id, r.model), r.forecast))
+            .collect();
+        state.journal = Some(journal);
+    }
+
     let event_log = match &config.event_log {
         Some(path) => {
             let prior = EventLog::read(path)?;
@@ -439,6 +487,17 @@ struct EngineState {
     bradley_terry: BradleyTerry,
     /// Each finished match's pre-match Bradley-Terry forecast (leak-free), for the head-to-head.
     bt_pre_match_forecast: HashMap<MatchId, Probabilities>,
+    /// The durable record of published calls, when one is configured. Held here rather than plumbed
+    /// through the event loop because the only moment a call is knowably leak-free is the instant a
+    /// result is applied, which happens in `apply_event`.
+    journal: Option<Arc<ForecastJournal>>,
+    /// Calls read back from the journal at boot, keyed by `(match, model)`. Scoring prefers these
+    /// over the in-memory forecasts, so a published call is scored as published rather than as the
+    /// current model would recompute it.
+    journaled_calls: HashMap<(MatchId, String), Probabilities>,
+    /// Journal lines that failed to load at boot, carried into the published track record so a
+    /// partially unreadable journal is visible to a reader rather than only to the logs.
+    journal_unreadable_lines: usize,
     /// Per-team knockout factors precomputed once: penalty-shootout skill and knockout pedigree.
     shootout_rating: HashMap<TeamId, f64>,
     knockout_pedigree: HashMap<TeamId, f64>,
@@ -547,6 +606,9 @@ impl EngineState {
             live_history: HashMap::new(),
             bradley_terry: deps.bradley_terry,
             bt_pre_match_forecast: HashMap::new(),
+            journal: None,
+            journaled_calls: HashMap::new(),
+            journal_unreadable_lines: 0,
             shootout_rating,
             knockout_pedigree,
             source_healthy: true,
@@ -697,6 +759,11 @@ impl EngineState {
             // Second model's pre-match call, recorded before it learns from the result (leak-free).
             let bt_pred = self.bradley_terry.outcome_probabilities(home, away, true);
             self.bt_pre_match_forecast.insert(event.match_id, bt_pred);
+            // Durably record both calls. This is the only moment they are knowably leak-free: the
+            // result is in hand but neither model has learned from it yet. `append_if_new` makes the
+            // write idempotent, so replaying this event on a later restart will not overwrite the
+            // original call with one the current model would make instead.
+            self.journal_calls(event.match_id, home, away, pred, bt_pred);
             self.live_history.remove(&event.match_id); // done; drop its live timeline
             self.refit_calibration();
             // Context recalibration: how much of this match's margin the context signals explain
@@ -1552,6 +1619,54 @@ impl EngineState {
         }
     }
 
+    /// Write both forecasters' pre-match calls for a just-settled match to the journal, if one is
+    /// configured. A refused write (the call was already journaled) is the normal replay case and is
+    /// not worth logging; a failed write is, since it means the record is incomplete.
+    fn journal_calls(
+        &mut self,
+        match_id: MatchId,
+        home: TeamId,
+        away: TeamId,
+        ensemble: Probabilities,
+        bradley_terry: Probabilities,
+    ) {
+        let Some(journal) = self.journal.clone() else {
+            return;
+        };
+        let (home_name, away_name) = (self.name_of(home), self.name_of(away));
+        for (model, forecast) in [
+            (ENSEMBLE_MODEL, ensemble),
+            (BRADLEY_TERRY_MODEL, bradley_terry),
+        ] {
+            let record = ForecastRecord::new(
+                match_id,
+                home_name.clone(),
+                away_name.clone(),
+                model,
+                forecast,
+            );
+            match journal.append_if_new(&record) {
+                // Index the call as published straight away. Without this the in-session track
+                // record stays empty until a restart re-read the file, so a live server would
+                // report zero calls while writing them - and worse, would score this session's
+                // matches from recomputed forecasts despite having journaled them.
+                Ok(true) => {
+                    self.journaled_calls
+                        .insert((match_id, model.to_string()), forecast);
+                }
+                // Already journaled. The published call is whatever is on disk, which the boot-time
+                // index already holds, so there is nothing to record.
+                Ok(false) => {}
+                Err(e) => tracing::warn!(
+                    match_id = match_id.0,
+                    model,
+                    error = %e,
+                    "failed to journal a forecast; the track record will be missing this call"
+                ),
+            }
+        }
+    }
+
     fn name_of(&self, id: TeamId) -> String {
         self.names
             .get(&id)
@@ -1783,6 +1898,7 @@ impl EngineState {
             },
             shocks: self.biggest_shocks(8),
             report_card: self.report_card(),
+            track_record: self.track_record(),
             bt_champions: self.bt_champions(),
             consensus: self.consensus(),
             reliability: self.reliability_curve(),
@@ -1838,14 +1954,69 @@ impl EngineState {
         shocks
     }
 
-    /// Score the model's own pre-match calls on the finished matches: accuracy, Brier / log-loss
-    /// (against the uniform baseline), and its most confident correct calls and misses. Almost free
-    /// - the pre-match forecasts and results are already on hand.
+    /// The published call for a finished match: the journaled one if this engine has a journal and
+    /// recorded it, otherwise the in-memory one.
+    ///
+    /// The preference is the point of the journal. An in-memory call is recomputed by whatever model
+    /// is running now, so a model change silently rewrites it; a journaled call is what was actually
+    /// published and cannot move. Falling back keeps the report card working for an engine with no
+    /// journal configured, which is still the default.
+    fn published_call(&self, id: MatchId, model: &str) -> Option<Probabilities> {
+        if let Some(journaled) = self.journaled_calls.get(&(id, model.to_string())).copied() {
+            return Some(journaled);
+        }
+        let in_memory = match model {
+            BRADLEY_TERRY_MODEL => &self.bt_pre_match_forecast,
+            _ => &self.pre_match_forecast,
+        };
+        in_memory.get(&id).copied()
+    }
+
+    /// The durable track record over journaled calls, scored against the results so far.
+    ///
+    /// Built from the journal index rather than from live state, so it reports what was published.
+    /// With no journal configured this is an empty record - honest about having nothing to show
+    /// rather than falling back to recomputed forecasts, which is the distinction the whole module
+    /// exists to draw. The report card beside it still falls back, because it predates the journal
+    /// and its callers expect numbers.
+    fn track_record(&self) -> TrackRecord {
+        let records: Vec<ForecastRecord> = self
+            .journaled_calls
+            .iter()
+            .map(|((match_id, model), forecast)| {
+                let (home, away) = self
+                    .match_index
+                    .get(match_id)
+                    .map(|&pos| {
+                        let m = &self.tournament.matches[pos];
+                        (self.name_of(m.home), self.name_of(m.away))
+                    })
+                    .unwrap_or_default();
+                ForecastRecord {
+                    schema: forecast_journal::SCHEMA_VERSION,
+                    match_id: *match_id,
+                    home_name: home,
+                    away_name: away,
+                    model: model.clone(),
+                    forecast: *forecast,
+                    made_at: self.last_update,
+                }
+            })
+            .collect();
+        forecast_journal::track_record(&records, &self.tournament, self.journal_unreadable_lines)
+    }
+
+    /// Score the model's own published calls on the finished matches: accuracy, Brier / log-loss
+    /// (against the uniform baseline), and its most confident correct calls and misses.
+    ///
+    /// Reads through [`published_call`](Self::published_call), so with a journal configured this is a
+    /// genuine track record - the numbers can only change by playing more matches. Without one it
+    /// falls back to the in-memory forecasts, which a model change would silently rewrite.
     fn report_card(&self) -> ReportCard {
         let mut pairs: Vec<(Probabilities, Outcome)> = Vec::new();
         let mut calls: Vec<Call> = Vec::new();
         for m in self.tournament.matches.iter().filter(|m| m.is_finished()) {
-            let Some(&p) = self.pre_match_forecast.get(&m.id) else {
+            let Some(p) = self.published_call(m.id, ENSEMBLE_MODEL) else {
                 continue;
             };
             let actual = m.score.outcome();
@@ -1875,8 +2046,8 @@ impl EngineState {
         worst.sort_by(by_confidence);
         worst.truncate(3);
         let head_to_head = vec![
-            self.score_model("Dixon-Coles ensemble", &self.pre_match_forecast),
-            self.score_model("Bradley-Terry", &self.bt_pre_match_forecast),
+            self.score_model(ENSEMBLE_MODEL),
+            self.score_model(BRADLEY_TERRY_MODEL),
         ];
         ReportCard {
             scored,
@@ -1901,9 +2072,8 @@ impl EngineState {
             .iter()
             .filter(|m| m.is_finished())
             .filter_map(|m| {
-                self.pre_match_forecast
-                    .get(&m.id)
-                    .map(|&p| (p, m.score.outcome()))
+                self.published_call(m.id, ENSEMBLE_MODEL)
+                    .map(|p| (p, m.score.outcome()))
             })
             .collect();
         reliability(&pairs, 10)
@@ -2001,13 +2171,21 @@ impl EngineState {
 
     /// Score one forecaster's pre-match calls against the finished matches (accuracy, Brier,
     /// log-loss), for the head-to-head between the two models.
-    fn score_model(&self, name: &str, forecasts: &HashMap<MatchId, Probabilities>) -> ModelScore {
+    /// Score one named forecaster over its published calls on the finished matches.
+    ///
+    /// Takes the model by name rather than a forecast map, so it reads the same published-call
+    /// preference as the rest of the report card. Passing the map in would have quietly bypassed the
+    /// journal.
+    fn score_model(&self, name: &str) -> ModelScore {
         let pairs: Vec<(Probabilities, Outcome)> = self
             .tournament
             .matches
             .iter()
             .filter(|m| m.is_finished())
-            .filter_map(|m| forecasts.get(&m.id).map(|&p| (p, m.score.outcome())))
+            .filter_map(|m| {
+                self.published_call(m.id, name)
+                    .map(|p| (p, m.score.outcome()))
+            })
             .collect();
         let r = score(&pairs);
         ModelScore {
@@ -3095,6 +3273,245 @@ mod tests {
             anchored < baseline,
             "away-favouring odds should pull home win probability down ({baseline:.3} -> {anchored:.3})"
         );
+    }
+
+    /// Apply a full match ending `home`-`away`, so the state journals its calls.
+    fn play_out(state: &mut EngineState, m: &oracle_domain::Match, home: u8, away: u8) {
+        let metrics = Metrics::default();
+        state.apply_event(&MatchEvent::new(m.id, 0, EventKind::KickOff), &metrics);
+        state.apply_event(
+            &MatchEvent::new(
+                m.id,
+                90,
+                EventKind::FullTime {
+                    score: Scoreline::new(home, away),
+                },
+            ),
+            &metrics,
+        );
+    }
+
+    #[test]
+    fn a_settled_match_journals_both_forecasters_calls() {
+        let path = std::env::temp_dir().join("oracle_engine_journal_writes.jsonl");
+        let _ = std::fs::remove_file(&path);
+
+        let mut state = fresh_state();
+        state.journal = Some(Arc::new(ForecastJournal::create(&path).unwrap()));
+        let m = state.tournament.matches[0].clone();
+        play_out(&mut state, &m, 2, 1);
+        state.journal = None; // drop the writer so the file is flushed and closed
+
+        let records = ForecastJournal::read(&path).unwrap();
+        assert_eq!(records.len(), 2, "one call per forecaster");
+        let models: Vec<&str> = records.iter().map(|r| r.model.as_str()).collect();
+        assert!(models.contains(&ENSEMBLE_MODEL));
+        assert!(models.contains(&BRADLEY_TERRY_MODEL));
+        for r in &records {
+            assert_eq!(r.match_id, m.id);
+            assert!(!r.home_name.is_empty() && !r.away_name.is_empty());
+            assert!((r.forecast.sum() - 1.0).abs() < 1e-9, "a real forecast");
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn the_journaled_call_matches_what_the_report_card_scored() {
+        // The journal must record the same leak-free call the in-memory scoring uses, or the two
+        // views of the model's performance would disagree from the start.
+        let path = std::env::temp_dir().join("oracle_engine_journal_agrees.jsonl");
+        let _ = std::fs::remove_file(&path);
+
+        let mut state = fresh_state();
+        state.journal = Some(Arc::new(ForecastJournal::create(&path).unwrap()));
+        let m = state.tournament.matches[0].clone();
+        play_out(&mut state, &m, 0, 3);
+        let in_memory = *state.pre_match_forecast.get(&m.id).expect("scored call");
+        state.journal = None;
+
+        let records = ForecastJournal::read(&path).unwrap();
+        let journaled = records
+            .iter()
+            .find(|r| r.model == ENSEMBLE_MODEL)
+            .expect("ensemble call");
+        assert_eq!(journaled.forecast, in_memory);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn an_unconfigured_journal_changes_nothing() {
+        // The journal is opt-in; without a path the engine must behave exactly as before.
+        let mut state = fresh_state();
+        assert!(state.journal.is_none());
+        let m = state.tournament.matches[0].clone();
+        play_out(&mut state, &m, 1, 1);
+        assert!(
+            state.pre_match_forecast.contains_key(&m.id),
+            "in-memory scoring is unaffected"
+        );
+    }
+
+    #[test]
+    fn replaying_a_result_does_not_rewrite_its_journaled_call() {
+        // The durability property, at the engine level. A restart replays the same result; the
+        // original call must survive even though the replaying state would compute its own.
+        let path = std::env::temp_dir().join("oracle_engine_journal_replay.jsonl");
+        let _ = std::fs::remove_file(&path);
+
+        let m = {
+            let mut first = fresh_state();
+            first.journal = Some(Arc::new(ForecastJournal::create(&path).unwrap()));
+            let m = first.tournament.matches[0].clone();
+            play_out(&mut first, &m, 2, 1);
+            m
+        };
+        let original = ForecastJournal::read(&path).unwrap();
+
+        // A second engine, sharing the journal, walks the same result again.
+        let mut second = fresh_state();
+        second.journal = Some(Arc::new(ForecastJournal::create(&path).unwrap()));
+        play_out(&mut second, &m, 2, 1);
+        second.journal = None;
+
+        let after = ForecastJournal::read(&path).unwrap();
+        assert_eq!(after, original, "the replay added and changed nothing");
+        assert_eq!(after.len(), 2, "still one call per forecaster");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_journaled_call_is_scored_as_published_not_as_recomputed() {
+        // The whole point of the feature. A journaled call must be scored exactly as it was made,
+        // even when the running model would now say something completely different.
+        let path = std::env::temp_dir().join("oracle_engine_journal_immutable.jsonl");
+        let _ = std::fs::remove_file(&path);
+
+        let mut state = fresh_state();
+        let m = state.tournament.matches[0].clone();
+
+        // A call nothing like what the model would produce, planted as though published earlier by a
+        // different version of the model.
+        let published = Probabilities::new(0.02, 0.03, 0.95);
+        {
+            let journal = ForecastJournal::create(&path).unwrap();
+            for model in [ENSEMBLE_MODEL, BRADLEY_TERRY_MODEL] {
+                journal
+                    .append_if_new(&ForecastRecord::new(m.id, "H", "A", model, published))
+                    .unwrap();
+            }
+        }
+        let (existing, _) = ForecastJournal::read_reporting(&path).unwrap();
+        state.journaled_calls = existing
+            .into_iter()
+            .map(|r| ((r.match_id, r.model), r.forecast))
+            .collect();
+
+        play_out(&mut state, &m, 3, 0);
+
+        // The current model's own recomputed call is in memory and differs from the journaled one.
+        let recomputed = *state.pre_match_forecast.get(&m.id).expect("recomputed");
+        assert_ne!(
+            recomputed, published,
+            "the test is only meaningful if the model disagrees"
+        );
+
+        // Scoring must use the published call.
+        assert_eq!(state.published_call(m.id, ENSEMBLE_MODEL), Some(published));
+        let card = state.report_card();
+        assert_eq!(card.scored, 1);
+        assert_eq!(
+            card.winners_called, 0,
+            "the journaled call picked an away win; the match finished 3-0 to the home side"
+        );
+        // A 95% call on the wrong outcome is a terrible Brier score; the recomputed call would have
+        // been far better, and the report card must not quietly take the better number.
+        let published_brier = score(&[(published, Outcome::HomeWin)]).brier;
+        let recomputed_brier = score(&[(recomputed, Outcome::HomeWin)]).brier;
+        assert!(
+            recomputed_brier < published_brier,
+            "sanity: the current model would score better"
+        );
+        assert!(
+            (card.brier - published_brier).abs() < 1e-12,
+            "report card scored {} but the published call is worth {}",
+            card.brier,
+            published_brier
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn without_a_journal_scoring_falls_back_to_the_in_memory_call() {
+        // The journal is opt-in, so an engine without one must score exactly as it did before.
+        let mut state = fresh_state();
+        let m = state.tournament.matches[0].clone();
+        play_out(&mut state, &m, 2, 0);
+        let in_memory = *state.pre_match_forecast.get(&m.id).unwrap();
+        assert_eq!(state.published_call(m.id, ENSEMBLE_MODEL), Some(in_memory));
+        assert_eq!(state.report_card().scored, 1);
+    }
+
+    #[test]
+    fn a_journal_covering_one_model_does_not_hide_the_other() {
+        // A partially populated journal must not silently drop the unjournaled forecaster - it falls
+        // back for that model alone.
+        let mut state = fresh_state();
+        let m = state.tournament.matches[0].clone();
+        let planted = Probabilities::new(0.5, 0.3, 0.2);
+        state
+            .journaled_calls
+            .insert((m.id, ENSEMBLE_MODEL.to_string()), planted);
+        play_out(&mut state, &m, 1, 0);
+
+        assert_eq!(state.published_call(m.id, ENSEMBLE_MODEL), Some(planted));
+        let bt_in_memory = *state.bt_pre_match_forecast.get(&m.id).unwrap();
+        assert_eq!(
+            state.published_call(m.id, BRADLEY_TERRY_MODEL),
+            Some(bt_in_memory),
+            "the unjournaled model still scores from memory"
+        );
+        assert_eq!(state.report_card().head_to_head.len(), 2);
+    }
+
+    #[test]
+    fn the_snapshot_track_record_reports_only_journaled_calls() {
+        let mut state = fresh_state();
+        let m = state.tournament.matches[0].clone();
+        let published = Probabilities::new(0.7, 0.2, 0.1);
+        state
+            .journaled_calls
+            .insert((m.id, ENSEMBLE_MODEL.to_string()), published);
+        play_out(&mut state, &m, 2, 0);
+
+        let tr = state.track_record();
+        assert_eq!(tr.calls, 1, "one journaled call");
+        assert_eq!(tr.settled, 1, "and it has a result");
+        assert_eq!(tr.models.len(), 1, "only the journaled model appears");
+        assert_eq!(tr.models[0].model, ENSEMBLE_MODEL);
+        assert_eq!(tr.models[0].winners_called, 1, "0.7 home, finished 2-0");
+        assert!(tr.models[0].brier < tr.baseline_brier);
+    }
+
+    #[test]
+    fn an_unjournaled_engine_publishes_an_empty_track_record() {
+        // Honest about having nothing to show, rather than falling back to recomputed forecasts and
+        // presenting them as a published record.
+        let mut state = fresh_state();
+        let m = state.tournament.matches[0].clone();
+        play_out(&mut state, &m, 1, 0);
+
+        let tr = state.track_record();
+        assert_eq!(tr.calls, 0);
+        assert!(tr.models.is_empty());
+        // The report card, which predates the journal, still reports its fallback numbers.
+        assert_eq!(state.report_card().scored, 1);
+    }
+
+    #[test]
+    fn a_partially_unreadable_journal_is_visible_in_the_track_record() {
+        let mut state = fresh_state();
+        state.journal_unreadable_lines = 2;
+        assert_eq!(state.track_record().unreadable_lines, 2);
     }
 
     #[test]

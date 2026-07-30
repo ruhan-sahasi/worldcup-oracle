@@ -195,6 +195,25 @@ enum Command {
         /// to recover state.
         #[arg(long)]
         event_log: Option<std::path::PathBuf>,
+        /// Append-only forecast journal path. Each model's pre-match call is recorded the first time
+        /// a match settles, and the track record is scored from those records rather than from
+        /// forecasts the current model would recompute. Served at `/track-record`.
+        #[arg(long)]
+        forecast_journal: Option<std::path::PathBuf>,
+    },
+    /// Score a forecast journal: how the calls the engine actually published have held up.
+    TrackRecord {
+        /// Path to the append-only journal written by `serve --forecast-journal`.
+        #[arg(long)]
+        journal: std::path::PathBuf,
+        /// Path to the event log written by `serve --event-log`. Results come from here, so without
+        /// it there is nothing to settle the journaled calls against and the command reports only
+        /// coverage.
+        #[arg(long)]
+        event_log: Option<std::path::PathBuf>,
+        /// How many of the most recent calls to list. 0 lists none.
+        #[arg(long, default_value_t = 10)]
+        recent: usize,
     },
     /// Live terminal dashboard following a simulated tournament.
     Watch {
@@ -267,10 +286,175 @@ async fn main() -> anyhow::Result<()> {
             seed,
         } => cmd_inplay(&home, &away, iters, seed),
         Command::Derivatives { home, away } => cmd_derivatives(&home, &away),
-        Command::Serve { addr, event_log } => cmd_serve(addr, event_log).await,
+        Command::Serve {
+            addr,
+            event_log,
+            forecast_journal,
+        } => cmd_serve(addr, event_log, forecast_journal).await,
+        Command::TrackRecord {
+            journal,
+            event_log,
+            recent,
+        } => cmd_track_record(&journal, event_log.as_deref(), recent),
         Command::Watch { speed } => watch::run(speed).await,
         Command::Sensitivity { iters, seed, top } => cmd_sensitivity(iters, seed, top),
     }
+}
+
+/// `track-record --journal <path>`: score the calls the engine actually published.
+///
+/// Read-only and offline, and reconstructible from disk alone: the calls come from the journal and
+/// the results from the event log, which are the engine's two durable records. Nothing is refit and
+/// nothing is recomputed, which is the whole point - these numbers cannot be improved by changing the
+/// model, only by playing more matches.
+fn cmd_track_record(
+    path: &std::path::Path,
+    event_log: Option<&std::path::Path>,
+    recent: usize,
+) -> anyhow::Result<()> {
+    let (records, unreadable) = oracle_engine::ForecastJournal::read_reporting(path)?;
+    if records.is_empty() && unreadable == 0 {
+        println!(
+            "No calls in {}.\n  Run `wc-oracle serve --forecast-journal {}` and let some matches \
+             settle.",
+            path.display(),
+            path.display()
+        );
+        return Ok(());
+    }
+
+    // Results live in the event log, not the journal - the journal records what was said, not what
+    // happened. Replaying only the full-time events is enough to settle calls, and needs no model.
+    let mut tournament = data::world_cup_2026();
+    let results = match event_log {
+        Some(log) => apply_logged_results(&mut tournament, log)?,
+        None => 0,
+    };
+    let tr = oracle_engine::track_record(&records, &tournament, unreadable);
+
+    println!("Track record from {}\n", path.display());
+    println!(
+        "  {} calls journaled, {} settled across {} matches",
+        tr.calls, tr.settled, tr.matches
+    );
+    if let (Some(first), Some(last)) = (tr.first_call, tr.last_call) {
+        println!(
+            "  spanning {} to {}",
+            first.format("%Y-%m-%d %H:%M"),
+            last.format("%Y-%m-%d %H:%M")
+        );
+    }
+    if tr.unreadable_lines > 0 {
+        println!(
+            "  WARNING: {} journal lines could not be read; the scores below exclude them",
+            tr.unreadable_lines
+        );
+    }
+    match event_log {
+        Some(log) => println!("  {results} results applied from {}", log.display()),
+        None => println!(
+            "  no --event-log given, so no results are available to settle these calls against"
+        ),
+    }
+
+    if tr.models.is_empty() {
+        println!("\n  Nothing has settled yet, so there is nothing to score.");
+        return Ok(());
+    }
+
+    println!(
+        "\n  {:<24} {:>7} {:>7} {:>8} {:>9}",
+        "Model", "Scored", "Called", "Brier", "LogLoss"
+    );
+    println!("  {}", "-".repeat(59));
+    for m in &tr.models {
+        println!(
+            "  {:<24} {:>7} {:>6}  {:>8.4} {:>9.4}",
+            m.model, m.scored, m.winners_called, m.brier, m.log_loss
+        );
+    }
+    // The baseline is quoted over the leading model's sample, not `tr.settled` - that counts calls
+    // across every model, so with two forecasters it would read as double the matches scored.
+    println!(
+        "  {:<24} {:>7} {:>6}  {:>8.4} {:>9.4}",
+        "Uniform baseline", tr.models[0].scored, "-", tr.baseline_brier, 1.0986
+    );
+    println!("  (lower Brier / log-loss is better)");
+
+    println!(
+        "\n  Calibration of {} (ECE {:.3}):",
+        tr.models[0].model, tr.reliability.ece
+    );
+    for b in tr.reliability.bins.iter().filter(|b| b.count > 0) {
+        println!(
+            "    {:>5.0}-{:<3.0}%   predicted {:>5.1}%   empirical {:>5.1}%   n={}",
+            b.lo * 100.0,
+            b.hi * 100.0,
+            b.mean_pred * 100.0,
+            b.empirical * 100.0,
+            b.count
+        );
+    }
+
+    if recent > 0 {
+        let settled = oracle_engine::settle(&records, &tournament);
+        let mut latest: Vec<_> = settled
+            .iter()
+            .filter(|s| s.record.model == tr.models[0].model)
+            .collect();
+        latest.sort_by_key(|s| std::cmp::Reverse(s.record.made_at));
+        if !latest.is_empty() {
+            println!("\n  Most recent settled calls by {}:", tr.models[0].model);
+            for s in latest.into_iter().take(recent) {
+                println!(
+                    "    {} {}-{} {}   called {:>5.1}% {}",
+                    if s.called_correctly() { "OK  " } else { "MISS" },
+                    s.record.home_name,
+                    s.record.away_name,
+                    s.score,
+                    s.confidence() * 100.0,
+                    s.record.forecast.most_likely(),
+                );
+            }
+        }
+    }
+
+    // A track record is only as strong as its sample, and this one will be small for a long while.
+    if tr.settled < 30 {
+        println!(
+            "\n  Note: {} settled calls is a small sample. Treat the numbers as directional; \
+             differences this size are not significant.",
+            tr.settled
+        );
+    }
+    Ok(())
+}
+
+/// Mark every match the event log reports a full-time score for as finished, and return how many.
+///
+/// Deliberately the smallest possible replay: only `FullTime` events are read, and no model is
+/// touched. Settling a journaled call needs the result and nothing else, and reconstructing engine
+/// state here would reintroduce exactly the recomputation the journal exists to avoid.
+fn apply_logged_results(
+    tournament: &mut oracle_domain::Tournament,
+    path: &std::path::Path,
+) -> anyhow::Result<usize> {
+    use oracle_domain::{EventKind, MatchStatus};
+    let mut applied = 0usize;
+    for event in oracle_engine::EventLog::read(path)? {
+        if let EventKind::FullTime { score } = event.kind {
+            if let Some(m) = tournament
+                .matches
+                .iter_mut()
+                .find(|m| m.id == event.match_id)
+            {
+                m.status = MatchStatus::Finished;
+                m.score = score;
+                applied += 1;
+            }
+        }
+    }
+    Ok(applied)
 }
 
 /// Fit the baseline goal model, strength-seeded Elo store, and the learned ensemble.
@@ -1444,7 +1628,11 @@ fn cmd_tune(
     Ok(())
 }
 
-async fn cmd_serve(addr: SocketAddr, event_log: Option<std::path::PathBuf>) -> anyhow::Result<()> {
+async fn cmd_serve(
+    addr: SocketAddr,
+    event_log: Option<std::path::PathBuf>,
+    forecast_journal: Option<std::path::PathBuf>,
+) -> anyhow::Result<()> {
     use tokio_util::sync::CancellationToken;
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -1458,6 +1646,7 @@ async fn cmd_serve(addr: SocketAddr, event_log: Option<std::path::PathBuf>) -> a
         oracle_engine::presets::auto(),
         oracle_engine::EngineConfig {
             event_log,
+            forecast_journal,
             ..Default::default()
         },
         cancel.clone(),
