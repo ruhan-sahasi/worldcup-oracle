@@ -269,6 +269,14 @@ pub async fn spawn(
                 "some journal lines could not be read; the track record excludes them"
             );
         }
+        // Index the calls already on disk so scoring prefers them over anything recomputed. Read
+        // separately from the writer's own key set because scoring needs the forecasts, not just the
+        // keys.
+        let (existing, _) = ForecastJournal::read_reporting(path)?;
+        state.journaled_calls = existing
+            .into_iter()
+            .map(|r| ((r.match_id, r.model), r.forecast))
+            .collect();
         state.journal = Some(journal);
     }
 
@@ -482,6 +490,10 @@ struct EngineState {
     /// through the event loop because the only moment a call is knowably leak-free is the instant a
     /// result is applied, which happens in `apply_event`.
     journal: Option<Arc<ForecastJournal>>,
+    /// Calls read back from the journal at boot, keyed by `(match, model)`. Scoring prefers these
+    /// over the in-memory forecasts, so a published call is scored as published rather than as the
+    /// current model would recompute it.
+    journaled_calls: HashMap<(MatchId, String), Probabilities>,
     /// Per-team knockout factors precomputed once: penalty-shootout skill and knockout pedigree.
     shootout_rating: HashMap<TeamId, f64>,
     knockout_pedigree: HashMap<TeamId, f64>,
@@ -591,6 +603,7 @@ impl EngineState {
             bradley_terry: deps.bradley_terry,
             bt_pre_match_forecast: HashMap::new(),
             journal: None,
+            journaled_calls: HashMap::new(),
             shootout_rating,
             knockout_pedigree,
             source_healthy: true,
@@ -1924,14 +1937,35 @@ impl EngineState {
         shocks
     }
 
-    /// Score the model's own pre-match calls on the finished matches: accuracy, Brier / log-loss
-    /// (against the uniform baseline), and its most confident correct calls and misses. Almost free
-    /// - the pre-match forecasts and results are already on hand.
+    /// The published call for a finished match: the journaled one if this engine has a journal and
+    /// recorded it, otherwise the in-memory one.
+    ///
+    /// The preference is the point of the journal. An in-memory call is recomputed by whatever model
+    /// is running now, so a model change silently rewrites it; a journaled call is what was actually
+    /// published and cannot move. Falling back keeps the report card working for an engine with no
+    /// journal configured, which is still the default.
+    fn published_call(&self, id: MatchId, model: &str) -> Option<Probabilities> {
+        if let Some(journaled) = self.journaled_calls.get(&(id, model.to_string())).copied() {
+            return Some(journaled);
+        }
+        let in_memory = match model {
+            BRADLEY_TERRY_MODEL => &self.bt_pre_match_forecast,
+            _ => &self.pre_match_forecast,
+        };
+        in_memory.get(&id).copied()
+    }
+
+    /// Score the model's own published calls on the finished matches: accuracy, Brier / log-loss
+    /// (against the uniform baseline), and its most confident correct calls and misses.
+    ///
+    /// Reads through [`published_call`](Self::published_call), so with a journal configured this is a
+    /// genuine track record - the numbers can only change by playing more matches. Without one it
+    /// falls back to the in-memory forecasts, which a model change would silently rewrite.
     fn report_card(&self) -> ReportCard {
         let mut pairs: Vec<(Probabilities, Outcome)> = Vec::new();
         let mut calls: Vec<Call> = Vec::new();
         for m in self.tournament.matches.iter().filter(|m| m.is_finished()) {
-            let Some(&p) = self.pre_match_forecast.get(&m.id) else {
+            let Some(p) = self.published_call(m.id, ENSEMBLE_MODEL) else {
                 continue;
             };
             let actual = m.score.outcome();
@@ -1961,8 +1995,8 @@ impl EngineState {
         worst.sort_by(by_confidence);
         worst.truncate(3);
         let head_to_head = vec![
-            self.score_model(ENSEMBLE_MODEL, &self.pre_match_forecast),
-            self.score_model(BRADLEY_TERRY_MODEL, &self.bt_pre_match_forecast),
+            self.score_model(ENSEMBLE_MODEL),
+            self.score_model(BRADLEY_TERRY_MODEL),
         ];
         ReportCard {
             scored,
@@ -1987,9 +2021,8 @@ impl EngineState {
             .iter()
             .filter(|m| m.is_finished())
             .filter_map(|m| {
-                self.pre_match_forecast
-                    .get(&m.id)
-                    .map(|&p| (p, m.score.outcome()))
+                self.published_call(m.id, ENSEMBLE_MODEL)
+                    .map(|p| (p, m.score.outcome()))
             })
             .collect();
         reliability(&pairs, 10)
@@ -2087,13 +2120,21 @@ impl EngineState {
 
     /// Score one forecaster's pre-match calls against the finished matches (accuracy, Brier,
     /// log-loss), for the head-to-head between the two models.
-    fn score_model(&self, name: &str, forecasts: &HashMap<MatchId, Probabilities>) -> ModelScore {
+    /// Score one named forecaster over its published calls on the finished matches.
+    ///
+    /// Takes the model by name rather than a forecast map, so it reads the same published-call
+    /// preference as the rest of the report card. Passing the map in would have quietly bypassed the
+    /// journal.
+    fn score_model(&self, name: &str) -> ModelScore {
         let pairs: Vec<(Probabilities, Outcome)> = self
             .tournament
             .matches
             .iter()
             .filter(|m| m.is_finished())
-            .filter_map(|m| forecasts.get(&m.id).map(|&p| (p, m.score.outcome())))
+            .filter_map(|m| {
+                self.published_call(m.id, name)
+                    .map(|p| (p, m.score.outcome()))
+            })
             .collect();
         let r = score(&pairs);
         ModelScore {
@@ -3285,6 +3326,100 @@ mod tests {
         assert_eq!(after, original, "the replay added and changed nothing");
         assert_eq!(after.len(), 2, "still one call per forecaster");
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_journaled_call_is_scored_as_published_not_as_recomputed() {
+        // The whole point of the feature. A journaled call must be scored exactly as it was made,
+        // even when the running model would now say something completely different.
+        let path = std::env::temp_dir().join("oracle_engine_journal_immutable.jsonl");
+        let _ = std::fs::remove_file(&path);
+
+        let mut state = fresh_state();
+        let m = state.tournament.matches[0].clone();
+
+        // A call nothing like what the model would produce, planted as though published earlier by a
+        // different version of the model.
+        let published = Probabilities::new(0.02, 0.03, 0.95);
+        {
+            let journal = ForecastJournal::create(&path).unwrap();
+            for model in [ENSEMBLE_MODEL, BRADLEY_TERRY_MODEL] {
+                journal
+                    .append_if_new(&ForecastRecord::new(m.id, "H", "A", model, published))
+                    .unwrap();
+            }
+        }
+        let (existing, _) = ForecastJournal::read_reporting(&path).unwrap();
+        state.journaled_calls = existing
+            .into_iter()
+            .map(|r| ((r.match_id, r.model), r.forecast))
+            .collect();
+
+        play_out(&mut state, &m, 3, 0);
+
+        // The current model's own recomputed call is in memory and differs from the journaled one.
+        let recomputed = *state.pre_match_forecast.get(&m.id).expect("recomputed");
+        assert_ne!(
+            recomputed, published,
+            "the test is only meaningful if the model disagrees"
+        );
+
+        // Scoring must use the published call.
+        assert_eq!(state.published_call(m.id, ENSEMBLE_MODEL), Some(published));
+        let card = state.report_card();
+        assert_eq!(card.scored, 1);
+        assert_eq!(
+            card.winners_called, 0,
+            "the journaled call picked an away win; the match finished 3-0 to the home side"
+        );
+        // A 95% call on the wrong outcome is a terrible Brier score; the recomputed call would have
+        // been far better, and the report card must not quietly take the better number.
+        let published_brier = score(&[(published, Outcome::HomeWin)]).brier;
+        let recomputed_brier = score(&[(recomputed, Outcome::HomeWin)]).brier;
+        assert!(
+            recomputed_brier < published_brier,
+            "sanity: the current model would score better"
+        );
+        assert!(
+            (card.brier - published_brier).abs() < 1e-12,
+            "report card scored {} but the published call is worth {}",
+            card.brier,
+            published_brier
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn without_a_journal_scoring_falls_back_to_the_in_memory_call() {
+        // The journal is opt-in, so an engine without one must score exactly as it did before.
+        let mut state = fresh_state();
+        let m = state.tournament.matches[0].clone();
+        play_out(&mut state, &m, 2, 0);
+        let in_memory = *state.pre_match_forecast.get(&m.id).unwrap();
+        assert_eq!(state.published_call(m.id, ENSEMBLE_MODEL), Some(in_memory));
+        assert_eq!(state.report_card().scored, 1);
+    }
+
+    #[test]
+    fn a_journal_covering_one_model_does_not_hide_the_other() {
+        // A partially populated journal must not silently drop the unjournaled forecaster - it falls
+        // back for that model alone.
+        let mut state = fresh_state();
+        let m = state.tournament.matches[0].clone();
+        let planted = Probabilities::new(0.5, 0.3, 0.2);
+        state
+            .journaled_calls
+            .insert((m.id, ENSEMBLE_MODEL.to_string()), planted);
+        play_out(&mut state, &m, 1, 0);
+
+        assert_eq!(state.published_call(m.id, ENSEMBLE_MODEL), Some(planted));
+        let bt_in_memory = *state.bt_pre_match_forecast.get(&m.id).unwrap();
+        assert_eq!(
+            state.published_call(m.id, BRADLEY_TERRY_MODEL),
+            Some(bt_in_memory),
+            "the unjournaled model still scores from memory"
+        );
+        assert_eq!(state.report_card().head_to_head.len(), 2);
     }
 
     #[test]
