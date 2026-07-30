@@ -1623,14 +1623,14 @@ impl EngineState {
     /// configured. A refused write (the call was already journaled) is the normal replay case and is
     /// not worth logging; a failed write is, since it means the record is incomplete.
     fn journal_calls(
-        &self,
+        &mut self,
         match_id: MatchId,
         home: TeamId,
         away: TeamId,
         ensemble: Probabilities,
         bradley_terry: Probabilities,
     ) {
-        let Some(journal) = &self.journal else {
+        let Some(journal) = self.journal.clone() else {
             return;
         };
         let (home_name, away_name) = (self.name_of(home), self.name_of(away));
@@ -1645,13 +1645,24 @@ impl EngineState {
                 model,
                 forecast,
             );
-            if let Err(e) = journal.append_if_new(&record) {
-                tracing::warn!(
+            match journal.append_if_new(&record) {
+                // Index the call as published straight away. Without this the in-session track
+                // record stays empty until a restart re-read the file, so a live server would
+                // report zero calls while writing them - and worse, would score this session's
+                // matches from recomputed forecasts despite having journaled them.
+                Ok(true) => {
+                    self.journaled_calls
+                        .insert((match_id, model.to_string()), forecast);
+                }
+                // Already journaled. The published call is whatever is on disk, which the boot-time
+                // index already holds, so there is nothing to record.
+                Ok(false) => {}
+                Err(e) => tracing::warn!(
                     match_id = match_id.0,
                     model,
                     error = %e,
                     "failed to journal a forecast; the track record will be missing this call"
-                );
+                ),
             }
         }
     }
