@@ -6,6 +6,7 @@
 //! cell (lock-free reads for the REST layer) and broadcasts it to WebSocket
 //! subscribers. Because it's a value type, consumers never touch engine internals.
 
+use crate::forecast_journal::TrackRecord;
 use chrono::{DateTime, Utc};
 use oracle_domain::{
     MatchId, MatchStatus, Probabilities, ScoreGrid, Scoreline, Stage, TeamId, TournamentForecast,
@@ -146,6 +147,10 @@ pub struct Snapshot {
     pub shocks: Vec<Upset>,
     /// The model's self-scored report card on its own pre-match calls so far.
     pub report_card: ReportCard,
+    /// The durable track record over journaled calls. Empty (zero calls) when no forecast journal is
+    /// configured, which distinguishes "nothing published yet" from "not recording" only in the log -
+    /// the field itself is always present so the shape of the snapshot does not depend on config.
+    pub track_record: TrackRecord,
     /// The second model's (Bradley-Terry) live champion odds over the current knockout bracket,
     /// conditioning on knockout results already played. Empty until the bracket is materialized.
     pub bt_champions: Vec<BtChampion>,

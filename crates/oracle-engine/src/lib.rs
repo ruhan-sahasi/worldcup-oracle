@@ -272,7 +272,8 @@ pub async fn spawn(
         // Index the calls already on disk so scoring prefers them over anything recomputed. Read
         // separately from the writer's own key set because scoring needs the forecasts, not just the
         // keys.
-        let (existing, _) = ForecastJournal::read_reporting(path)?;
+        let (existing, unreadable_at_boot) = ForecastJournal::read_reporting(path)?;
+        state.journal_unreadable_lines = unreadable_at_boot;
         state.journaled_calls = existing
             .into_iter()
             .map(|r| ((r.match_id, r.model), r.forecast))
@@ -494,6 +495,9 @@ struct EngineState {
     /// over the in-memory forecasts, so a published call is scored as published rather than as the
     /// current model would recompute it.
     journaled_calls: HashMap<(MatchId, String), Probabilities>,
+    /// Journal lines that failed to load at boot, carried into the published track record so a
+    /// partially unreadable journal is visible to a reader rather than only to the logs.
+    journal_unreadable_lines: usize,
     /// Per-team knockout factors precomputed once: penalty-shootout skill and knockout pedigree.
     shootout_rating: HashMap<TeamId, f64>,
     knockout_pedigree: HashMap<TeamId, f64>,
@@ -604,6 +608,7 @@ impl EngineState {
             bt_pre_match_forecast: HashMap::new(),
             journal: None,
             journaled_calls: HashMap::new(),
+            journal_unreadable_lines: 0,
             shootout_rating,
             knockout_pedigree,
             source_healthy: true,
@@ -1882,6 +1887,7 @@ impl EngineState {
             },
             shocks: self.biggest_shocks(8),
             report_card: self.report_card(),
+            track_record: self.track_record(),
             bt_champions: self.bt_champions(),
             consensus: self.consensus(),
             reliability: self.reliability_curve(),
@@ -1953,6 +1959,40 @@ impl EngineState {
             _ => &self.pre_match_forecast,
         };
         in_memory.get(&id).copied()
+    }
+
+    /// The durable track record over journaled calls, scored against the results so far.
+    ///
+    /// Built from the journal index rather than from live state, so it reports what was published.
+    /// With no journal configured this is an empty record - honest about having nothing to show
+    /// rather than falling back to recomputed forecasts, which is the distinction the whole module
+    /// exists to draw. The report card beside it still falls back, because it predates the journal
+    /// and its callers expect numbers.
+    fn track_record(&self) -> TrackRecord {
+        let records: Vec<ForecastRecord> = self
+            .journaled_calls
+            .iter()
+            .map(|((match_id, model), forecast)| {
+                let (home, away) = self
+                    .match_index
+                    .get(match_id)
+                    .map(|&pos| {
+                        let m = &self.tournament.matches[pos];
+                        (self.name_of(m.home), self.name_of(m.away))
+                    })
+                    .unwrap_or_default();
+                ForecastRecord {
+                    schema: forecast_journal::SCHEMA_VERSION,
+                    match_id: *match_id,
+                    home_name: home,
+                    away_name: away,
+                    model: model.clone(),
+                    forecast: *forecast,
+                    made_at: self.last_update,
+                }
+            })
+            .collect();
+        forecast_journal::track_record(&records, &self.tournament, self.journal_unreadable_lines)
     }
 
     /// Score the model's own published calls on the finished matches: accuracy, Brier / log-loss
@@ -3420,6 +3460,47 @@ mod tests {
             "the unjournaled model still scores from memory"
         );
         assert_eq!(state.report_card().head_to_head.len(), 2);
+    }
+
+    #[test]
+    fn the_snapshot_track_record_reports_only_journaled_calls() {
+        let mut state = fresh_state();
+        let m = state.tournament.matches[0].clone();
+        let published = Probabilities::new(0.7, 0.2, 0.1);
+        state
+            .journaled_calls
+            .insert((m.id, ENSEMBLE_MODEL.to_string()), published);
+        play_out(&mut state, &m, 2, 0);
+
+        let tr = state.track_record();
+        assert_eq!(tr.calls, 1, "one journaled call");
+        assert_eq!(tr.settled, 1, "and it has a result");
+        assert_eq!(tr.models.len(), 1, "only the journaled model appears");
+        assert_eq!(tr.models[0].model, ENSEMBLE_MODEL);
+        assert_eq!(tr.models[0].winners_called, 1, "0.7 home, finished 2-0");
+        assert!(tr.models[0].brier < tr.baseline_brier);
+    }
+
+    #[test]
+    fn an_unjournaled_engine_publishes_an_empty_track_record() {
+        // Honest about having nothing to show, rather than falling back to recomputed forecasts and
+        // presenting them as a published record.
+        let mut state = fresh_state();
+        let m = state.tournament.matches[0].clone();
+        play_out(&mut state, &m, 1, 0);
+
+        let tr = state.track_record();
+        assert_eq!(tr.calls, 0);
+        assert!(tr.models.is_empty());
+        // The report card, which predates the journal, still reports its fallback numbers.
+        assert_eq!(state.report_card().scored, 1);
+    }
+
+    #[test]
+    fn a_partially_unreadable_journal_is_visible_in_the_track_record() {
+        let mut state = fresh_state();
+        state.journal_unreadable_lines = 2;
+        assert_eq!(state.track_record().unreadable_lines, 2);
     }
 
     #[test]

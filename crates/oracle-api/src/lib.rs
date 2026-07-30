@@ -136,6 +136,7 @@ pub fn router(engine: Arc<Engine>, explorer: ExplorerSlot) -> Router {
         .route("/predict/tournament", get(predict_tournament))
         .route("/upsets", get(upsets))
         .route("/report", get(report))
+        .route("/track-record", get(track_record))
         .route("/bt/champions", get(bt_champions))
         .route("/consensus", get(consensus))
         .route("/calibration", get(calibration))
@@ -761,6 +762,16 @@ async fn upsets(State(engine): State<Arc<Engine>>) -> Json<UpsetBoard> {
 /// The model's self-scored report card on its own pre-match calls (from the live snapshot).
 async fn report(State(engine): State<Arc<Engine>>) -> Json<ReportCard> {
     Json(engine.snapshot().report_card.clone())
+}
+
+/// The durable track record: how the forecasts the engine actually published have scored.
+///
+/// Distinct from `/report`, which falls back to forecasts recomputed by the current model when no
+/// journal is configured. Everything here comes from journaled calls, so it moves only as matches are
+/// played - a model change cannot improve it. A response with `calls: 0` means no journal is
+/// configured (or nothing has settled yet), not that the model has no skill.
+async fn track_record(State(engine): State<Arc<Engine>>) -> Json<oracle_engine::TrackRecord> {
+    Json(engine.snapshot().track_record.clone())
 }
 
 /// The second model's (Bradley-Terry) live champion odds over the current knockout bracket, from the
