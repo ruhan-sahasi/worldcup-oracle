@@ -29,7 +29,7 @@
 
 use chrono::{DateTime, Utc};
 use oracle_domain::{MatchId, Outcome, Probabilities, Scoreline, Tournament};
-use oracle_model::score;
+use oracle_model::{reliability, score, CalibrationReport, ReliabilityReport};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::fs::{File, OpenOptions};
@@ -354,6 +354,75 @@ pub fn score_by_model(settled: &[SettledForecast]) -> Vec<JournalScore> {
     scores
 }
 
+/// The engine's published track record: how the forecasts it actually made have held up.
+///
+/// Distinct from [`ReportCard`](crate::ReportCard), which re-derives its forecasts from current
+/// model state. Every number here comes from journaled calls, so it cannot move except by playing
+/// more matches.
+#[derive(Debug, Clone, Serialize)]
+pub struct TrackRecord {
+    /// Journaled calls, including those whose match has not been played.
+    pub calls: usize,
+    /// Calls settled against a result - the sample the scores below rest on.
+    pub settled: usize,
+    /// Distinct matches covered by at least one settled call.
+    pub matches: usize,
+    /// One row per forecaster, best Brier first.
+    pub models: Vec<JournalScore>,
+    /// The naive uniform baseline over the same number of calls, for context.
+    pub baseline_brier: f64,
+    /// The leading model's reliability curve over its own journaled calls.
+    pub reliability: ReliabilityReport,
+    /// When the earliest and latest surviving calls were made. `None` for an empty journal.
+    pub first_call: Option<DateTime<Utc>>,
+    pub last_call: Option<DateTime<Utc>>,
+    /// Journal lines that could not be parsed. Non-zero means part of the record is unreadable, and
+    /// the scores above are over what remains.
+    pub unreadable_lines: usize,
+}
+
+/// Build the track record from journaled calls and the results known so far.
+///
+/// `unreadable_lines` is threaded through from the read rather than recomputed, because a track
+/// record that quietly omits the fact that some of it failed to load would be exactly the kind of
+/// flattering silence this whole module exists to remove.
+pub fn track_record(
+    records: &[ForecastRecord],
+    tournament: &Tournament,
+    unreadable_lines: usize,
+) -> TrackRecord {
+    let settled = settle(records, tournament);
+    let models = score_by_model(&settled);
+
+    // The reliability curve is the leading model's, since a curve pooled across forecasters would
+    // describe no single one of them.
+    let leader_pairs: Vec<(Probabilities, Outcome)> = match models.first() {
+        Some(best) => settled
+            .iter()
+            .filter(|s| s.record.model == best.model)
+            .map(|s| s.pair())
+            .collect(),
+        None => Vec::new(),
+    };
+
+    let distinct_matches: HashSet<MatchId> = settled.iter().map(|s| s.record.match_id).collect();
+    let made_at = |pick: fn(&mut dyn Iterator<Item = DateTime<Utc>>) -> Option<DateTime<Utc>>| {
+        pick(&mut records.iter().map(|r| r.made_at))
+    };
+
+    TrackRecord {
+        calls: records.len(),
+        settled: settled.len(),
+        matches: distinct_matches.len(),
+        baseline_brier: CalibrationReport::uniform_baseline(settled.len().max(1)).brier,
+        models,
+        reliability: reliability(&leader_pairs, 10),
+        first_call: made_at(|it| it.min()),
+        last_call: made_at(|it| it.max()),
+        unreadable_lines,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -638,6 +707,68 @@ mod tests {
             assert_eq!(scores[0].model, "alpha", "ties break by name");
             assert_eq!(scores[1].model, "zeta");
         }
+    }
+
+    #[test]
+    fn a_track_record_summarises_the_journal() {
+        let t = tournament_with_one_result();
+        let mut records = calls_by("sharp", 0.9, &[1]);
+        records.extend(calls_by("blunt", 0.4, &[1]));
+        // A call on an unplayed match: counted as a call, not as settled.
+        records.extend(calls_by("sharp", 0.5, &[2]));
+
+        let tr = track_record(&records, &t, 0);
+        assert_eq!(tr.calls, 3, "every journaled call");
+        assert_eq!(tr.settled, 2, "only those with a result");
+        assert_eq!(tr.matches, 1, "both settled calls are on match 1");
+        assert_eq!(tr.models.len(), 2);
+        assert_eq!(tr.models[0].model, "sharp", "ranked by Brier");
+        assert!(tr.first_call.is_some() && tr.last_call.is_some());
+        assert!(tr.last_call >= tr.first_call);
+        assert_eq!(tr.unreadable_lines, 0);
+    }
+
+    #[test]
+    fn a_track_record_beats_the_baseline_when_the_model_is_right() {
+        let t = tournament_with_one_result();
+        let tr = track_record(&calls_by("sharp", 0.9, &[1]), &t, 0);
+        assert!(
+            tr.models[0].brier < tr.baseline_brier,
+            "a confident correct call must beat uniform: {} vs {}",
+            tr.models[0].brier,
+            tr.baseline_brier
+        );
+    }
+
+    #[test]
+    fn an_empty_journal_yields_an_honest_empty_record() {
+        let tr = track_record(&[], &tournament_with_one_result(), 0);
+        assert_eq!(tr.calls, 0);
+        assert_eq!(tr.settled, 0);
+        assert_eq!(tr.matches, 0);
+        assert!(tr.models.is_empty());
+        assert!(tr.first_call.is_none() && tr.last_call.is_none());
+        // The baseline is still reported rather than dividing by zero.
+        assert!(tr.baseline_brier.is_finite());
+    }
+
+    #[test]
+    fn unreadable_lines_are_surfaced_not_swallowed() {
+        // The count comes from the read, and a track record must admit part of it failed to load.
+        let tr = track_record(&calls_by("m", 0.6, &[1]), &tournament_with_one_result(), 3);
+        assert_eq!(tr.unreadable_lines, 3);
+    }
+
+    #[test]
+    fn the_reliability_curve_describes_the_leading_model_alone() {
+        // A curve pooled across forecasters would describe none of them. With only the blunt model's
+        // calls settled, the curve must reflect the leader's, not an average.
+        let t = tournament_with_one_result();
+        let mut records = calls_by("sharp", 0.9, &[1]);
+        records.extend(calls_by("blunt", 0.4, &[1]));
+        let tr = track_record(&records, &t, 0);
+        let leader_only = reliability(&[(records[0].forecast, Outcome::HomeWin)], 10);
+        assert_eq!(tr.reliability.ece, leader_only.ece);
     }
 
     #[test]

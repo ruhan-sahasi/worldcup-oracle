@@ -25,7 +25,10 @@ pub mod query;
 mod snapshot;
 
 pub use event_log::EventLog;
-pub use forecast_journal::{ForecastJournal, ForecastRecord, SCHEMA_VERSION};
+pub use forecast_journal::{
+    settle, track_record, ForecastJournal, ForecastRecord, JournalScore, SettledForecast,
+    TrackRecord, SCHEMA_VERSION,
+};
 pub use oracle_model::ReliabilityReport;
 pub use query::{signal_sensitivity, BacktestReport, Explorer, InPlayView, SignalContribution};
 pub use snapshot::{
