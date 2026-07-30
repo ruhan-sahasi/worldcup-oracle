@@ -28,9 +28,9 @@
 //! cost of reading the whole file is nothing.
 
 use chrono::{DateTime, Utc};
-use oracle_domain::{MatchId, Probabilities};
+use oracle_domain::{MatchId, Outcome, Probabilities, Scoreline, Tournament};
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs::{File, OpenOptions};
 use std::io::{self, BufRead, BufReader, BufWriter, Write};
 use std::path::Path;
@@ -238,6 +238,67 @@ impl ForecastJournal {
     }
 }
 
+/// A journaled call paired with the result that settled it.
+///
+/// Settlement is deliberately a separate step from journaling. A call is written when made and the
+/// result arrives later, so the join happens at scoring time against whatever results are known -
+/// which also means an unfinished match simply has no settled call yet, rather than needing a
+/// placeholder in the journal.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SettledForecast {
+    pub record: ForecastRecord,
+    /// What actually happened.
+    pub actual: Outcome,
+    /// The final scoreline, kept for display alongside the call.
+    pub score: Scoreline,
+}
+
+impl SettledForecast {
+    /// The `(forecast, outcome)` pair the scoring functions take.
+    pub fn pair(&self) -> (Probabilities, Outcome) {
+        (self.record.forecast, self.actual)
+    }
+
+    /// Whether the call's most likely outcome was the one that happened.
+    pub fn called_correctly(&self) -> bool {
+        self.record.forecast.most_likely() == self.actual
+    }
+
+    /// The probability the call assigned to its own most likely outcome.
+    pub fn confidence(&self) -> f64 {
+        let f = self.record.forecast;
+        f.of(f.most_likely())
+    }
+}
+
+/// Pair each journaled call with its match's result, dropping calls whose match is unknown or not
+/// yet finished.
+///
+/// Silently dropping is the correct behaviour rather than a compromise. A journal legitimately
+/// contains calls on matches that have not been played, and it may outlive a tournament definition
+/// entirely - the point of storing team names on the record is that such a call stays *readable*
+/// even when it can no longer be *scored*. What must never happen is a call being scored against
+/// the wrong match, which is why the join is on match id and nothing else.
+pub fn settle(records: &[ForecastRecord], tournament: &Tournament) -> Vec<SettledForecast> {
+    let finished: HashMap<MatchId, Scoreline> = tournament
+        .matches
+        .iter()
+        .filter(|m| m.is_finished())
+        .map(|m| (m.id, m.score))
+        .collect();
+    records
+        .iter()
+        .filter_map(|r| {
+            let score = *finished.get(&r.match_id)?;
+            Some(SettledForecast {
+                record: r.clone(),
+                actual: score.outcome(),
+                score,
+            })
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -355,6 +416,89 @@ mod tests {
         assert_eq!(read[0].match_id, MatchId(42));
         assert_eq!(read[1].match_id, MatchId(99));
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// A two-match tournament: match 1 finished 2-0 to the home side, match 2 still scheduled.
+    fn tournament_with_one_result() -> Tournament {
+        use oracle_domain::{Match, MatchStatus, Stage, Team};
+        let mut t = Tournament::new("Test Cup");
+        for i in 0..4u32 {
+            t.teams.push(Team::new(
+                i,
+                format!("T{i}"),
+                format!("{i:03}"),
+                oracle_domain::Confederation::Uefa,
+            ));
+        }
+        let kickoff = chrono::DateTime::from_timestamp(0, 0).unwrap();
+        t.matches.push(Match {
+            id: MatchId(1),
+            home: oracle_domain::TeamId(0),
+            away: oracle_domain::TeamId(1),
+            stage: Stage::Group('A'),
+            kickoff,
+            status: MatchStatus::Finished,
+            score: Scoreline::new(2, 0),
+        });
+        t.matches.push(Match {
+            id: MatchId(2),
+            home: oracle_domain::TeamId(2),
+            away: oracle_domain::TeamId(3),
+            stage: Stage::Group('A'),
+            kickoff,
+            status: MatchStatus::Scheduled,
+            score: Scoreline::new(0, 0),
+        });
+        t
+    }
+
+    fn call_on(match_id: u32, forecast: Probabilities) -> ForecastRecord {
+        ForecastRecord::new(MatchId(match_id), "H", "A", "m", forecast)
+    }
+
+    #[test]
+    fn settlement_pairs_a_call_with_its_result() {
+        let t = tournament_with_one_result();
+        let calls = vec![call_on(1, Probabilities::new(0.7, 0.2, 0.1))];
+        let settled = settle(&calls, &t);
+        assert_eq!(settled.len(), 1);
+        assert_eq!(settled[0].actual, Outcome::HomeWin, "2-0 is a home win");
+        assert_eq!(settled[0].score, Scoreline::new(2, 0));
+        assert_eq!(settled[0].pair(), (calls[0].forecast, Outcome::HomeWin));
+    }
+
+    #[test]
+    fn settlement_skips_unplayed_and_unknown_matches() {
+        let t = tournament_with_one_result();
+        let calls = vec![
+            call_on(1, Probabilities::new(0.7, 0.2, 0.1)), // finished
+            call_on(2, Probabilities::new(0.4, 0.3, 0.3)), // scheduled
+            call_on(999, Probabilities::uniform()),        // not in this tournament at all
+        ];
+        let settled = settle(&calls, &t);
+        assert_eq!(settled.len(), 1, "only the finished match settles");
+        assert_eq!(settled[0].record.match_id, MatchId(1));
+    }
+
+    #[test]
+    fn settlement_reads_a_call_as_correct_or_not() {
+        let t = tournament_with_one_result();
+        // Match 1 was a home win.
+        let right = settle(&[call_on(1, Probabilities::new(0.7, 0.2, 0.1))], &t);
+        assert!(right[0].called_correctly());
+        assert!((right[0].confidence() - 0.7).abs() < 1e-12);
+
+        let wrong = settle(&[call_on(1, Probabilities::new(0.1, 0.2, 0.7))], &t);
+        assert!(!wrong[0].called_correctly());
+        assert!(
+            (wrong[0].confidence() - 0.7).abs() < 1e-12,
+            "confidence is in its own pick, right or wrong"
+        );
+    }
+
+    #[test]
+    fn settlement_of_an_empty_journal_is_empty() {
+        assert!(settle(&[], &tournament_with_one_result()).is_empty());
     }
 
     #[test]
