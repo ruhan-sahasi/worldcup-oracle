@@ -204,11 +204,13 @@ impl ForecastJournal {
 
     /// Read every record in the journal at `path`, oldest first. A missing journal reads as empty.
     ///
-    /// Unparseable lines are skipped rather than failing the read, so a process killed mid-append
-    /// costs at most its final record instead of the whole history. That tolerance is the right
-    /// trade here - a journal that refuses to load is a track record that has been destroyed - but
-    /// it does mean a corrupt line is silently dropped, so [`read_reporting`](Self::read_reporting)
-    /// exists for callers that want to know.
+    /// Two kinds of line are skipped rather than failing the read: unparseable ones, and records
+    /// whose [`schema`](ForecastRecord::schema) is newer than this build understands. A process
+    /// killed mid-append then costs at most its final record instead of the whole history, which is
+    /// the right trade - a journal that refuses to load is a track record that has been destroyed.
+    ///
+    /// Skipping is silent by necessity here, which is why [`read_reporting`](Self::read_reporting)
+    /// exists: the count is the only evidence that part of the record did not load.
     pub fn read(path: impl AsRef<Path>) -> io::Result<Vec<ForecastRecord>> {
         Ok(Self::read_reporting(path)?.0)
     }
@@ -231,6 +233,12 @@ impl ForecastJournal {
                 continue;
             }
             match serde_json::from_str::<ForecastRecord>(&line) {
+                // A record from a future schema parsed into today's shape is the dangerous case: the
+                // fields present still deserialize, so it looks valid while whatever the new version
+                // added - a different probability basis, a market adjustment, a retraction flag - is
+                // silently dropped. Scoring it would produce plausible, wrong numbers. Refusing it
+                // costs a call and keeps the rest of the record trustworthy.
+                Ok(r) if r.schema > SCHEMA_VERSION => skipped += 1,
                 Ok(r) => records.push(r),
                 Err(_) => skipped += 1,
             }
@@ -769,6 +777,75 @@ mod tests {
         let tr = track_record(&records, &t, 0);
         let leader_only = reliability(&[(records[0].forecast, Outcome::HomeWin)], 10);
         assert_eq!(tr.reliability.ece, leader_only.ece);
+    }
+
+    #[test]
+    fn a_record_from_a_future_schema_is_refused_rather_than_mis_scored() {
+        // The dangerous case. A future record's known fields still deserialize, so it looks valid
+        // while whatever the new version added is dropped - and scoring it would give plausible,
+        // wrong numbers. Refusing costs one call and keeps the rest of the record trustworthy.
+        let path = scratch("future_schema");
+        let journal = ForecastJournal::create(&path).unwrap();
+        journal.append(&sample()).unwrap();
+        drop(journal);
+
+        let mut future = sample();
+        future.match_id = MatchId(43);
+        future.schema = SCHEMA_VERSION + 1;
+        let mut line = serde_json::to_string(&future).unwrap();
+        line.push('\n');
+        {
+            let mut f = OpenOptions::new().append(true).open(&path).unwrap();
+            f.write_all(line.as_bytes()).unwrap();
+        }
+
+        let (records, skipped) = ForecastJournal::read_reporting(&path).unwrap();
+        assert_eq!(records.len(), 1, "only the readable record loads");
+        assert_eq!(records[0].match_id, MatchId(42));
+        assert_eq!(skipped, 1, "and the future record is reported");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_record_from_the_current_or_an_older_schema_loads() {
+        let path = scratch("old_schema");
+        let journal = ForecastJournal::create(&path).unwrap();
+        journal.append(&sample()).unwrap();
+        drop(journal);
+        {
+            // A version-0 record, as though written before the field was introduced.
+            let mut older = sample();
+            older.match_id = MatchId(44);
+            older.schema = 0;
+            let mut f = OpenOptions::new().append(true).open(&path).unwrap();
+            f.write_all(serde_json::to_string(&older).unwrap().as_bytes())
+                .unwrap();
+            f.write_all(b"\n").unwrap();
+        }
+        let (records, skipped) = ForecastJournal::read_reporting(&path).unwrap();
+        assert_eq!(records.len(), 2, "old records stay readable");
+        assert_eq!(skipped, 0);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_future_record_does_not_reserve_its_key() {
+        // A refused record must not block the key, or a downgrade would leave that match
+        // permanently unjournalable while looking fine.
+        let path = scratch("future_key");
+        let mut future = sample();
+        future.schema = SCHEMA_VERSION + 1;
+        {
+            let journal = ForecastJournal::create(&path).unwrap();
+            journal.append(&future).unwrap();
+        }
+        let reopened = ForecastJournal::create(&path).unwrap();
+        assert_eq!(reopened.len(), 0, "the future record is not a known key");
+        assert!(
+            reopened.append_if_new(&sample()).unwrap(),
+            "so the call can still be journaled by this build"
+        );
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
