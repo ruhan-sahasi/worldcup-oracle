@@ -30,6 +30,7 @@
 use chrono::{DateTime, Utc};
 use oracle_domain::{MatchId, Probabilities};
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::fs::{File, OpenOptions};
 use std::io::{self, BufRead, BufReader, BufWriter, Write};
 use std::path::Path;
@@ -103,20 +104,82 @@ impl ForecastRecord {
 }
 
 /// An append-only, newline-delimited-JSON journal of published forecasts.
+///
+/// Writes are **idempotent on `(match, model)`**: the first call journaled for a pair is the one
+/// that stands, and any later call for the same pair is refused. See
+/// [`append_if_new`](Self::append_if_new).
 pub struct ForecastJournal {
     writer: Mutex<BufWriter<File>>,
+    /// Keys already on disk or written this session, so a repeat is recognised without re-reading.
+    seen: Mutex<HashSet<(MatchId, String)>>,
 }
 
 impl ForecastJournal {
     /// Open the journal at `path` for appending, creating it if absent.
+    ///
+    /// Existing records are read first so their keys are known: a restart must recognise the calls
+    /// it already published, or replaying the event log would duplicate every one of them.
     pub fn create(path: impl AsRef<Path>) -> io::Result<Self> {
+        let seen = Self::read(&path)?
+            .into_iter()
+            .map(|r| (r.match_id, r.model))
+            .collect();
         let file = OpenOptions::new().create(true).append(true).open(path)?;
         Ok(Self {
             writer: Mutex::new(BufWriter::new(file)),
+            seen: Mutex::new(seen),
         })
     }
 
-    /// Append one record as a JSON line and flush.
+    /// Journal a call only if this `(match, model)` has never been journaled. Returns whether it was
+    /// written.
+    ///
+    /// This is the operation that makes the record immutable, and it is the one the engine uses. A
+    /// forecast is journaled when a result lands; replaying the event log walks that same result
+    /// again, and so would a re-delivered event from a flaky feed. Without a first-write-wins rule,
+    /// each of those would append another copy - inflating the sample the scores are averaged over
+    /// and, worse, letting a *newly recomputed* forecast for an old match enter the record, which is
+    /// exactly the retroactive rewriting the journal exists to prevent.
+    ///
+    /// First write wins rather than last, because the first call is the one that was made without
+    /// knowing the result. A later one is at best a recomputation and at worst contaminated.
+    ///
+    /// # Panics
+    /// If either internal mutex is poisoned; see [`append`](Self::append).
+    pub fn append_if_new(&self, record: &ForecastRecord) -> io::Result<bool> {
+        {
+            let seen = self.seen.lock().expect("forecast-journal mutex poisoned");
+            if seen.contains(&(record.match_id, record.model.clone())) {
+                return Ok(false);
+            }
+        }
+        self.append(record)?;
+        Ok(true)
+    }
+
+    /// How many distinct calls the journal holds.
+    ///
+    /// # Panics
+    /// If the internal mutex is poisoned; see [`append`](Self::append).
+    pub fn len(&self) -> usize {
+        self.seen
+            .lock()
+            .expect("forecast-journal mutex poisoned")
+            .len()
+    }
+
+    /// Whether the journal holds no calls yet.
+    ///
+    /// # Panics
+    /// If the internal mutex is poisoned; see [`append`](Self::append).
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Append one record as a JSON line and flush, unconditionally.
+    ///
+    /// Prefer [`append_if_new`](Self::append_if_new); this is the lower-level write and does not
+    /// enforce first-write-wins.
     ///
     /// # Panics
     /// If the writer mutex is poisoned, i.e. a previous caller panicked mid-append. Failing loudly
@@ -125,10 +188,17 @@ impl ForecastJournal {
     /// can read back. I/O failures are returned as `Err` for the caller to handle.
     pub fn append(&self, record: &ForecastRecord) -> io::Result<()> {
         let line = serde_json::to_string(record)?;
-        let mut w = self.writer.lock().expect("forecast-journal mutex poisoned");
-        w.write_all(line.as_bytes())?;
-        w.write_all(b"\n")?;
-        w.flush()
+        {
+            let mut w = self.writer.lock().expect("forecast-journal mutex poisoned");
+            w.write_all(line.as_bytes())?;
+            w.write_all(b"\n")?;
+            w.flush()?;
+        }
+        self.seen
+            .lock()
+            .expect("forecast-journal mutex poisoned")
+            .insert((record.match_id, record.model.clone()));
+        Ok(())
     }
 
     /// Read every record in the journal at `path`, oldest first. A missing journal reads as empty.
@@ -284,6 +354,85 @@ mod tests {
         assert_eq!(read.len(), 2, "both sessions' calls survive");
         assert_eq!(read[0].match_id, MatchId(42));
         assert_eq!(read[1].match_id, MatchId(99));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_repeated_call_is_refused_and_the_first_one_stands() {
+        let path = scratch("idempotent");
+        let journal = ForecastJournal::create(&path).unwrap();
+
+        let first = sample();
+        assert!(journal.append_if_new(&first).unwrap(), "first write lands");
+
+        // The same match and model, but a different forecast - what a recomputation by a changed
+        // model would produce. It must not enter the record.
+        let mut recomputed = sample();
+        recomputed.forecast = Probabilities::new(0.1, 0.2, 0.7);
+        assert!(
+            !journal.append_if_new(&recomputed).unwrap(),
+            "a second call for the same match and model is refused"
+        );
+        assert_eq!(journal.len(), 1);
+        drop(journal);
+
+        let read = ForecastJournal::read(&path).unwrap();
+        assert_eq!(read.len(), 1, "only one line on disk");
+        assert_eq!(
+            read[0].forecast, first.forecast,
+            "the original call is what survived, not the recomputation"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_restart_recognises_the_calls_it_already_published() {
+        // The replay case. A restart reopens the journal and walks the same results again; without
+        // loading existing keys it would duplicate every call it had ever made.
+        let path = scratch("restart");
+        let first = ForecastJournal::create(&path).unwrap();
+        assert!(first.append_if_new(&sample()).unwrap());
+        drop(first);
+
+        let reopened = ForecastJournal::create(&path).unwrap();
+        assert_eq!(reopened.len(), 1, "prior calls are known on open");
+        assert!(
+            !reopened.append_if_new(&sample()).unwrap(),
+            "a replayed result does not re-journal its call"
+        );
+        drop(reopened);
+
+        assert_eq!(ForecastJournal::read(&path).unwrap().len(), 1);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn two_models_journal_the_same_match_independently() {
+        // The key is (match, model), so the second forecaster's call on a match is a distinct call,
+        // not a duplicate of the first's.
+        let path = scratch("two_models");
+        let journal = ForecastJournal::create(&path).unwrap();
+        let ensemble = sample();
+        let mut bt = sample();
+        bt.model = "Bradley-Terry".to_string();
+
+        assert!(journal.append_if_new(&ensemble).unwrap());
+        assert!(journal.append_if_new(&bt).unwrap(), "a different model");
+        assert_eq!(journal.len(), 2);
+        drop(journal);
+
+        assert_eq!(ForecastJournal::read(&path).unwrap().len(), 2);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn an_empty_journal_reports_itself_empty() {
+        let path = scratch("empty");
+        let journal = ForecastJournal::create(&path).unwrap();
+        assert!(journal.is_empty());
+        assert_eq!(journal.len(), 0);
+        journal.append_if_new(&sample()).unwrap();
+        assert!(!journal.is_empty());
         let _ = std::fs::remove_file(&path);
     }
 
