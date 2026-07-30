@@ -29,6 +29,7 @@
 
 use chrono::{DateTime, Utc};
 use oracle_domain::{MatchId, Outcome, Probabilities, Scoreline, Tournament};
+use oracle_model::score;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::fs::{File, OpenOptions};
@@ -299,6 +300,60 @@ pub fn settle(records: &[ForecastRecord], tournament: &Tournament) -> Vec<Settle
         .collect()
 }
 
+/// One forecaster's record over its journaled, settled calls.
+#[derive(Debug, Clone, Serialize)]
+pub struct JournalScore {
+    pub model: String,
+    /// Settled calls behind these numbers.
+    pub scored: usize,
+    pub winners_called: usize,
+    pub accuracy: f64,
+    pub brier: f64,
+    pub log_loss: f64,
+}
+
+/// Score the settled calls of every model in a journal, best Brier first.
+///
+/// The scoring itself is [`oracle_model::score`], the same proper scoring rules the backtest and the
+/// existing report card use. That reuse is the point: a track record computed by its own private
+/// arithmetic could drift away from the numbers the rest of the project quotes, and the two would
+/// disagree with no way to tell which was wrong.
+///
+/// Grouping is by model name, so two forecasters journaled against the same matches are directly
+/// comparable. Ordering is by Brier ascending because lower is better - and Brier rather than
+/// accuracy, since accuracy throws away everything the probabilities said and rewards a model for
+/// being confidently right on easy matches.
+pub fn score_by_model(settled: &[SettledForecast]) -> Vec<JournalScore> {
+    let mut by_model: HashMap<&str, Vec<&SettledForecast>> = HashMap::new();
+    for s in settled {
+        by_model.entry(s.record.model.as_str()).or_default().push(s);
+    }
+    let mut scores: Vec<JournalScore> = by_model
+        .into_iter()
+        .map(|(model, calls)| {
+            let pairs: Vec<(Probabilities, Outcome)> = calls.iter().map(|c| c.pair()).collect();
+            let report = score(&pairs);
+            JournalScore {
+                model: model.to_string(),
+                scored: pairs.len(),
+                winners_called: calls.iter().filter(|c| c.called_correctly()).count(),
+                accuracy: report.accuracy,
+                brier: report.brier,
+                log_loss: report.log_loss,
+            }
+        })
+        .collect();
+    scores.sort_by(|a, b| {
+        a.brier
+            .partial_cmp(&b.brier)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            // A stable tie-break keeps the order deterministic when two models score identically,
+            // which they do when a journal is small or the models agree.
+            .then_with(|| a.model.cmp(&b.model))
+    });
+    scores
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -499,6 +554,90 @@ mod tests {
     #[test]
     fn settlement_of_an_empty_journal_is_empty() {
         assert!(settle(&[], &tournament_with_one_result()).is_empty());
+    }
+
+    /// A journal where `model` calls every match with `p_home`, over a tournament of `n` home wins.
+    fn calls_by(model: &str, p_home: f64, ids: &[u32]) -> Vec<ForecastRecord> {
+        ids.iter()
+            .map(|&i| {
+                ForecastRecord::new(
+                    MatchId(i),
+                    "H",
+                    "A",
+                    model,
+                    Probabilities::new(p_home, (1.0 - p_home) / 2.0, (1.0 - p_home) / 2.0),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn scoring_groups_by_model_and_ranks_the_sharper_one_first() {
+        let t = tournament_with_one_result(); // match 1 was a home win
+        let mut records = calls_by("confident", 0.9, &[1]);
+        records.extend(calls_by("timid", 0.4, &[1]));
+        let scores = score_by_model(&settle(&records, &t));
+
+        assert_eq!(scores.len(), 2, "one row per model");
+        // Both called the home win; the confident one is better calibrated to what happened, so it
+        // takes a lower Brier and sorts first.
+        assert_eq!(scores[0].model, "confident");
+        assert!(scores[0].brier < scores[1].brier);
+        for s in &scores {
+            assert_eq!(s.scored, 1);
+            assert_eq!(s.winners_called, 1);
+            assert!((s.accuracy - 1.0).abs() < 1e-12);
+        }
+    }
+
+    #[test]
+    fn scoring_counts_only_settled_calls() {
+        let t = tournament_with_one_result(); // match 2 is unplayed
+        let records = calls_by("m", 0.6, &[1, 2, 999]);
+        let scores = score_by_model(&settle(&records, &t));
+        assert_eq!(scores.len(), 1);
+        assert_eq!(scores[0].scored, 1, "only the finished match counts");
+    }
+
+    #[test]
+    fn scoring_matches_the_shared_calibration_function() {
+        // The track record must not develop its own arithmetic; it has to agree with the scoring the
+        // backtest and report card already use, exactly.
+        let t = tournament_with_one_result();
+        let records = calls_by("m", 0.75, &[1]);
+        let settled = settle(&records, &t);
+        let scores = score_by_model(&settled);
+        let direct = score(&[(records[0].forecast, Outcome::HomeWin)]);
+        assert_eq!(scores[0].brier, direct.brier);
+        assert_eq!(scores[0].log_loss, direct.log_loss);
+        assert_eq!(scores[0].accuracy, direct.accuracy);
+    }
+
+    #[test]
+    fn a_wrong_call_is_scored_as_wrong() {
+        let t = tournament_with_one_result(); // home win
+        let records = vec![call_on(1, Probabilities::new(0.1, 0.2, 0.7))];
+        let scores = score_by_model(&settle(&records, &t));
+        assert_eq!(scores[0].winners_called, 0);
+        assert!(scores[0].accuracy.abs() < 1e-12);
+    }
+
+    #[test]
+    fn scoring_an_empty_journal_yields_no_rows() {
+        assert!(score_by_model(&[]).is_empty());
+    }
+
+    #[test]
+    fn tied_models_keep_a_deterministic_order() {
+        // Identical forecasts score identically; the order must not depend on hash iteration.
+        let t = tournament_with_one_result();
+        let mut records = calls_by("zeta", 0.6, &[1]);
+        records.extend(calls_by("alpha", 0.6, &[1]));
+        for _ in 0..5 {
+            let scores = score_by_model(&settle(&records, &t));
+            assert_eq!(scores[0].model, "alpha", "ties break by name");
+            assert_eq!(scores[1].model, "zeta");
+        }
     }
 
     #[test]
