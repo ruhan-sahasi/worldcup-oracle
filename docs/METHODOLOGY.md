@@ -97,6 +97,35 @@ The goal-model parameters progressed deliberately:
 Hyperparameters (`ξ`, ridge, score model) are chosen by **Bayesian optimization** (a Gaussian-process
 surrogate + Expected Improvement) over a continuous space, not a hand-specified grid.
 
+## Accountability: a record that cannot be edited
+
+A forecaster that can revise its own history is not accountable, and the revision does not have to
+be deliberate to be a problem. The engine scored its pre-match calls from an in-memory map, rebuilt
+by replaying results through whatever model is running now. Every model improvement therefore
+improved the past as well - quietly, with no diff, in the flattering direction.
+
+The fix is that a published forecast is written to an append-only journal and never recomputed.
+Three properties follow, and each is a deliberate choice rather than a consequence of the format:
+
+**First write wins.** The first call is the only one made in genuine ignorance of the result. Any
+later one is at best a recomputation and at worst contaminated, so a repeat for the same
+`(match, model)` is refused - including from a replay, a re-delivered event, or a new model version.
+
+**Refuse what cannot be read correctly, rather than reading it approximately.** A record from a
+future schema still deserializes into today's shape, so it looks valid while silently dropping
+whatever the newer version added. It is declined and counted instead. The same logic applies to
+unreadable lines: they are counted and reported on the record, because a sample that quietly
+shrank is worse than one that admits a gap.
+
+**Report coverage, not just scores.** Calls journaled, calls settled, and distinct matches are
+three different numbers, and a record showing 200 calls of which 12 have settled is honest in a way
+that showing only the 200 is not. The CLI additionally says outright when a sample is too small to
+support the differences it is displaying - which it will be for a long time here.
+
+What this does *not* claim: the sample is tiny, and a track record over a few dozen matches
+distinguishes almost nothing. The value is that the number will still mean something in a year,
+because it cannot have been edited in the meantime.
+
 ## Monte-Carlo error as a first-class quantity
 
 A simulated forecast is an estimate, and an estimate without an error bar invites a reader to trust
