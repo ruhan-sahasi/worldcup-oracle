@@ -149,6 +149,14 @@ impl EngineDeps {
     }
 }
 
+/// The headline forecaster's name, as it appears in the report card and the forecast journal.
+///
+/// A constant because journal scoring groups by this string: written out separately in each place,
+/// a divergence would silently split one model's track record into two partial ones.
+pub const ENSEMBLE_MODEL: &str = "Dixon-Coles ensemble";
+/// The second forecaster's name. See [`ENSEMBLE_MODEL`].
+pub const BRADLEY_TERRY_MODEL: &str = "Bradley-Terry";
+
 /// Tuning for the engine runtime.
 #[derive(Debug, Clone)]
 pub struct EngineConfig {
@@ -161,6 +169,11 @@ pub struct EngineConfig {
     /// Optional append-only event log. When set, every event is recorded and the log is
     /// replayed on startup to recover state across restarts.
     pub event_log: Option<PathBuf>,
+    /// Optional append-only forecast journal. When set, each model's leak-free pre-match call is
+    /// recorded the first time a match settles, and the track record is scored from those records
+    /// instead of from forecasts re-derived by the current model. See
+    /// [`forecast_journal`](crate::forecast_journal).
+    pub forecast_journal: Option<PathBuf>,
 }
 
 impl Default for EngineConfig {
@@ -170,6 +183,7 @@ impl Default for EngineConfig {
             broadcast_capacity: 256,
             forecast_every: Duration::from_secs(3),
             event_log: None,
+            forecast_journal: None,
         }
     }
 }
@@ -238,6 +252,26 @@ pub async fn spawn(
     let metrics = Arc::new(Metrics::default());
 
     // Recover from a prior run: replay the event log before the live feed resumes.
+    // Opened before the event-log replay below, so that replaying a result finds its call already
+    // journaled and declines to write a fresh one.
+    if let Some(path) = &config.forecast_journal {
+        let journal = Arc::new(ForecastJournal::create(path)?);
+        let (_, unreadable) = ForecastJournal::read_reporting(path)?;
+        tracing::info!(
+            calls = journal.len(),
+            unreadable,
+            path = %path.display(),
+            "opened forecast journal"
+        );
+        if unreadable > 0 {
+            tracing::warn!(
+                unreadable,
+                "some journal lines could not be read; the track record excludes them"
+            );
+        }
+        state.journal = Some(journal);
+    }
+
     let event_log = match &config.event_log {
         Some(path) => {
             let prior = EventLog::read(path)?;
@@ -444,6 +478,10 @@ struct EngineState {
     bradley_terry: BradleyTerry,
     /// Each finished match's pre-match Bradley-Terry forecast (leak-free), for the head-to-head.
     bt_pre_match_forecast: HashMap<MatchId, Probabilities>,
+    /// The durable record of published calls, when one is configured. Held here rather than plumbed
+    /// through the event loop because the only moment a call is knowably leak-free is the instant a
+    /// result is applied, which happens in `apply_event`.
+    journal: Option<Arc<ForecastJournal>>,
     /// Per-team knockout factors precomputed once: penalty-shootout skill and knockout pedigree.
     shootout_rating: HashMap<TeamId, f64>,
     knockout_pedigree: HashMap<TeamId, f64>,
@@ -552,6 +590,7 @@ impl EngineState {
             live_history: HashMap::new(),
             bradley_terry: deps.bradley_terry,
             bt_pre_match_forecast: HashMap::new(),
+            journal: None,
             shootout_rating,
             knockout_pedigree,
             source_healthy: true,
@@ -702,6 +741,11 @@ impl EngineState {
             // Second model's pre-match call, recorded before it learns from the result (leak-free).
             let bt_pred = self.bradley_terry.outcome_probabilities(home, away, true);
             self.bt_pre_match_forecast.insert(event.match_id, bt_pred);
+            // Durably record both calls. This is the only moment they are knowably leak-free: the
+            // result is in hand but neither model has learned from it yet. `append_if_new` makes the
+            // write idempotent, so replaying this event on a later restart will not overwrite the
+            // original call with one the current model would make instead.
+            self.journal_calls(event.match_id, home, away, pred, bt_pred);
             self.live_history.remove(&event.match_id); // done; drop its live timeline
             self.refit_calibration();
             // Context recalibration: how much of this match's margin the context signals explain
@@ -1557,6 +1601,43 @@ impl EngineState {
         }
     }
 
+    /// Write both forecasters' pre-match calls for a just-settled match to the journal, if one is
+    /// configured. A refused write (the call was already journaled) is the normal replay case and is
+    /// not worth logging; a failed write is, since it means the record is incomplete.
+    fn journal_calls(
+        &self,
+        match_id: MatchId,
+        home: TeamId,
+        away: TeamId,
+        ensemble: Probabilities,
+        bradley_terry: Probabilities,
+    ) {
+        let Some(journal) = &self.journal else {
+            return;
+        };
+        let (home_name, away_name) = (self.name_of(home), self.name_of(away));
+        for (model, forecast) in [
+            (ENSEMBLE_MODEL, ensemble),
+            (BRADLEY_TERRY_MODEL, bradley_terry),
+        ] {
+            let record = ForecastRecord::new(
+                match_id,
+                home_name.clone(),
+                away_name.clone(),
+                model,
+                forecast,
+            );
+            if let Err(e) = journal.append_if_new(&record) {
+                tracing::warn!(
+                    match_id = match_id.0,
+                    model,
+                    error = %e,
+                    "failed to journal a forecast; the track record will be missing this call"
+                );
+            }
+        }
+    }
+
     fn name_of(&self, id: TeamId) -> String {
         self.names
             .get(&id)
@@ -1880,8 +1961,8 @@ impl EngineState {
         worst.sort_by(by_confidence);
         worst.truncate(3);
         let head_to_head = vec![
-            self.score_model("Dixon-Coles ensemble", &self.pre_match_forecast),
-            self.score_model("Bradley-Terry", &self.bt_pre_match_forecast),
+            self.score_model(ENSEMBLE_MODEL, &self.pre_match_forecast),
+            self.score_model(BRADLEY_TERRY_MODEL, &self.bt_pre_match_forecast),
         ];
         ReportCard {
             scored,
@@ -3100,6 +3181,110 @@ mod tests {
             anchored < baseline,
             "away-favouring odds should pull home win probability down ({baseline:.3} -> {anchored:.3})"
         );
+    }
+
+    /// Apply a full match ending `home`-`away`, so the state journals its calls.
+    fn play_out(state: &mut EngineState, m: &oracle_domain::Match, home: u8, away: u8) {
+        let metrics = Metrics::default();
+        state.apply_event(&MatchEvent::new(m.id, 0, EventKind::KickOff), &metrics);
+        state.apply_event(
+            &MatchEvent::new(
+                m.id,
+                90,
+                EventKind::FullTime {
+                    score: Scoreline::new(home, away),
+                },
+            ),
+            &metrics,
+        );
+    }
+
+    #[test]
+    fn a_settled_match_journals_both_forecasters_calls() {
+        let path = std::env::temp_dir().join("oracle_engine_journal_writes.jsonl");
+        let _ = std::fs::remove_file(&path);
+
+        let mut state = fresh_state();
+        state.journal = Some(Arc::new(ForecastJournal::create(&path).unwrap()));
+        let m = state.tournament.matches[0].clone();
+        play_out(&mut state, &m, 2, 1);
+        state.journal = None; // drop the writer so the file is flushed and closed
+
+        let records = ForecastJournal::read(&path).unwrap();
+        assert_eq!(records.len(), 2, "one call per forecaster");
+        let models: Vec<&str> = records.iter().map(|r| r.model.as_str()).collect();
+        assert!(models.contains(&ENSEMBLE_MODEL));
+        assert!(models.contains(&BRADLEY_TERRY_MODEL));
+        for r in &records {
+            assert_eq!(r.match_id, m.id);
+            assert!(!r.home_name.is_empty() && !r.away_name.is_empty());
+            assert!((r.forecast.sum() - 1.0).abs() < 1e-9, "a real forecast");
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn the_journaled_call_matches_what_the_report_card_scored() {
+        // The journal must record the same leak-free call the in-memory scoring uses, or the two
+        // views of the model's performance would disagree from the start.
+        let path = std::env::temp_dir().join("oracle_engine_journal_agrees.jsonl");
+        let _ = std::fs::remove_file(&path);
+
+        let mut state = fresh_state();
+        state.journal = Some(Arc::new(ForecastJournal::create(&path).unwrap()));
+        let m = state.tournament.matches[0].clone();
+        play_out(&mut state, &m, 0, 3);
+        let in_memory = *state.pre_match_forecast.get(&m.id).expect("scored call");
+        state.journal = None;
+
+        let records = ForecastJournal::read(&path).unwrap();
+        let journaled = records
+            .iter()
+            .find(|r| r.model == ENSEMBLE_MODEL)
+            .expect("ensemble call");
+        assert_eq!(journaled.forecast, in_memory);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn an_unconfigured_journal_changes_nothing() {
+        // The journal is opt-in; without a path the engine must behave exactly as before.
+        let mut state = fresh_state();
+        assert!(state.journal.is_none());
+        let m = state.tournament.matches[0].clone();
+        play_out(&mut state, &m, 1, 1);
+        assert!(
+            state.pre_match_forecast.contains_key(&m.id),
+            "in-memory scoring is unaffected"
+        );
+    }
+
+    #[test]
+    fn replaying_a_result_does_not_rewrite_its_journaled_call() {
+        // The durability property, at the engine level. A restart replays the same result; the
+        // original call must survive even though the replaying state would compute its own.
+        let path = std::env::temp_dir().join("oracle_engine_journal_replay.jsonl");
+        let _ = std::fs::remove_file(&path);
+
+        let m = {
+            let mut first = fresh_state();
+            first.journal = Some(Arc::new(ForecastJournal::create(&path).unwrap()));
+            let m = first.tournament.matches[0].clone();
+            play_out(&mut first, &m, 2, 1);
+            m
+        };
+        let original = ForecastJournal::read(&path).unwrap();
+
+        // A second engine, sharing the journal, walks the same result again.
+        let mut second = fresh_state();
+        second.journal = Some(Arc::new(ForecastJournal::create(&path).unwrap()));
+        play_out(&mut second, &m, 2, 1);
+        second.journal = None;
+
+        let after = ForecastJournal::read(&path).unwrap();
+        assert_eq!(after, original, "the replay added and changed nothing");
+        assert_eq!(after.len(), 2, "still one call per forecaster");
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
