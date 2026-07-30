@@ -30,6 +30,10 @@
 use chrono::{DateTime, Utc};
 use oracle_domain::{MatchId, Probabilities};
 use serde::{Deserialize, Serialize};
+use std::fs::{File, OpenOptions};
+use std::io::{self, BufRead, BufReader, BufWriter, Write};
+use std::path::Path;
+use std::sync::Mutex;
 
 /// The schema version new records are written with.
 ///
@@ -98,9 +102,82 @@ impl ForecastRecord {
     }
 }
 
+/// An append-only, newline-delimited-JSON journal of published forecasts.
+pub struct ForecastJournal {
+    writer: Mutex<BufWriter<File>>,
+}
+
+impl ForecastJournal {
+    /// Open the journal at `path` for appending, creating it if absent.
+    pub fn create(path: impl AsRef<Path>) -> io::Result<Self> {
+        let file = OpenOptions::new().create(true).append(true).open(path)?;
+        Ok(Self {
+            writer: Mutex::new(BufWriter::new(file)),
+        })
+    }
+
+    /// Append one record as a JSON line and flush.
+    ///
+    /// # Panics
+    /// If the writer mutex is poisoned, i.e. a previous caller panicked mid-append. Failing loudly
+    /// matches [`EventLog::append`](crate::EventLog::append) and for the same reason: continuing to
+    /// write after a torn line would produce a journal whose scores silently rest on a record nobody
+    /// can read back. I/O failures are returned as `Err` for the caller to handle.
+    pub fn append(&self, record: &ForecastRecord) -> io::Result<()> {
+        let line = serde_json::to_string(record)?;
+        let mut w = self.writer.lock().expect("forecast-journal mutex poisoned");
+        w.write_all(line.as_bytes())?;
+        w.write_all(b"\n")?;
+        w.flush()
+    }
+
+    /// Read every record in the journal at `path`, oldest first. A missing journal reads as empty.
+    ///
+    /// Unparseable lines are skipped rather than failing the read, so a process killed mid-append
+    /// costs at most its final record instead of the whole history. That tolerance is the right
+    /// trade here - a journal that refuses to load is a track record that has been destroyed - but
+    /// it does mean a corrupt line is silently dropped, so [`read_reporting`](Self::read_reporting)
+    /// exists for callers that want to know.
+    pub fn read(path: impl AsRef<Path>) -> io::Result<Vec<ForecastRecord>> {
+        Ok(Self::read_reporting(path)?.0)
+    }
+
+    /// [`read`](Self::read), plus how many lines had to be skipped.
+    ///
+    /// Splitting this out keeps the common path simple while letting the engine log the fact that a
+    /// journal was partially unreadable, rather than that fact vanishing.
+    pub fn read_reporting(path: impl AsRef<Path>) -> io::Result<(Vec<ForecastRecord>, usize)> {
+        let file = match File::open(path) {
+            Ok(f) => f,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok((Vec::new(), 0)),
+            Err(e) => return Err(e),
+        };
+        let mut records = Vec::new();
+        let mut skipped = 0usize;
+        for line in BufReader::new(file).lines() {
+            let line = line?;
+            if line.trim().is_empty() {
+                continue;
+            }
+            match serde_json::from_str::<ForecastRecord>(&line) {
+                Ok(r) => records.push(r),
+                Err(_) => skipped += 1,
+            }
+        }
+        Ok((records, skipped))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A scratch path unique to one test, so tests can run in parallel without colliding.
+    fn scratch(name: &str) -> std::path::PathBuf {
+        let p = std::env::temp_dir().join(format!("oracle_journal_{name}.jsonl"));
+        let _ = std::fs::remove_file(&p);
+        p
+    }
 
     fn sample() -> ForecastRecord {
         ForecastRecord::new(
@@ -160,6 +237,95 @@ mod tests {
         d.forecast = Probabilities::uniform();
         d.made_at = Utc::now();
         assert_eq!(a.key(), d.key());
+    }
+
+    #[test]
+    fn records_round_trip_through_the_journal_in_order() {
+        let path = scratch("roundtrip");
+        let records: Vec<ForecastRecord> = (1..=3u32)
+            .map(|i| {
+                ForecastRecord::new(
+                    MatchId(i),
+                    format!("H{i}"),
+                    format!("A{i}"),
+                    "Dixon-Coles ensemble",
+                    Probabilities::new(0.5, 0.3, 0.2),
+                )
+            })
+            .collect();
+
+        let journal = ForecastJournal::create(&path).unwrap();
+        for r in &records {
+            journal.append(r).unwrap();
+        }
+        drop(journal);
+
+        let read = ForecastJournal::read(&path).unwrap();
+        assert_eq!(read, records, "records read back in the order written");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn reopening_the_journal_appends_rather_than_truncates() {
+        // The whole point is durability across restarts, so a second open must not clobber the
+        // first session's calls.
+        let path = scratch("append");
+        let first = ForecastJournal::create(&path).unwrap();
+        first.append(&sample()).unwrap();
+        drop(first);
+
+        let mut second_record = sample();
+        second_record.match_id = MatchId(99);
+        let second = ForecastJournal::create(&path).unwrap();
+        second.append(&second_record).unwrap();
+        drop(second);
+
+        let read = ForecastJournal::read(&path).unwrap();
+        assert_eq!(read.len(), 2, "both sessions' calls survive");
+        assert_eq!(read[0].match_id, MatchId(42));
+        assert_eq!(read[1].match_id, MatchId(99));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn reading_a_missing_journal_is_empty() {
+        let path = scratch("absent");
+        assert!(ForecastJournal::read(&path).unwrap().is_empty());
+        assert_eq!(ForecastJournal::read_reporting(&path).unwrap().1, 0);
+    }
+
+    #[test]
+    fn a_torn_final_line_costs_only_that_record() {
+        // Simulates a process killed mid-append: the last line is truncated JSON.
+        let path = scratch("torn");
+        let journal = ForecastJournal::create(&path).unwrap();
+        journal.append(&sample()).unwrap();
+        drop(journal);
+        {
+            let mut f = OpenOptions::new().append(true).open(&path).unwrap();
+            f.write_all(br#"{"match_id":43,"home_name":"Spa"#).unwrap();
+        }
+
+        let (records, skipped) = ForecastJournal::read_reporting(&path).unwrap();
+        assert_eq!(records.len(), 1, "the intact record still loads");
+        assert_eq!(skipped, 1, "and the torn one is reported, not hidden");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn blank_lines_are_not_counted_as_corruption() {
+        let path = scratch("blank");
+        let journal = ForecastJournal::create(&path).unwrap();
+        journal.append(&sample()).unwrap();
+        drop(journal);
+        {
+            let mut f = OpenOptions::new().append(true).open(&path).unwrap();
+            f.write_all(b"\n   \n").unwrap();
+        }
+        let (records, skipped) = ForecastJournal::read_reporting(&path).unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(skipped, 0, "whitespace is not a damaged record");
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
