@@ -1,0 +1,20 @@
+[package]
+name = "oracle-eval"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Offline skill evaluation and the regression gate that protects it"
+
+[dependencies]
+oracle-domain.workspace = true
+oracle-model.workspace = true
+oracle-ratings.workspace = true
+oracle-ingest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[lints]
+workspace = true

@@ -1111,10 +1111,10 @@ fn cmd_backtest(
     seed: u64,
     data_path: Option<std::path::PathBuf>,
 ) -> anyhow::Result<()> {
-    use oracle_model::{score, DixonColesConfig, Observation};
+    use oracle_eval::{EvalConfig, Model};
 
     // Real CSV when --data is given, else synthetic history with a synthetic market line.
-    let (mut records, source, real_data) = match &data_path {
+    let (records, source, real_data) = match &data_path {
         Some(p) => (data::load_results_csv(p)?, format!("{}", p.display()), true),
         None => (
             data::synthetic_history_with_market(n_matches, seed),
@@ -1122,181 +1122,77 @@ fn cmd_backtest(
             false,
         ),
     };
-    if records.len() < 50 {
-        anyhow::bail!(
-            "need at least 50 matches to backtest (got {})",
-            records.len()
-        );
-    }
-
-    // Three-way temporal split: fit on the oldest 60%, learn the ensemble weights on the
-    // next 20% (validation), report on the most recent 20% (test).
-    records.sort_by(|a, b| {
-        b.obs
-            .age_days
-            .partial_cmp(&a.obs.age_days)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
-    let n = records.len();
-    let train_end = n * 6 / 10;
-    let val_end = n * 8 / 10;
-    let train_obs: Vec<Observation> = records[..train_end].iter().map(|r| r.obs).collect();
-    let validation = &records[train_end..val_end];
-    let test = &records[val_end..];
-
-    let xg_present = train_obs.iter().any(|o| o.home_xg.is_some());
-    let market_present = records.iter().any(|r| r.market.is_some());
-    // Real club fixtures have a genuine home venue; the synthetic World Cup is neutral.
-    let neutral = !real_data;
-
-    // Fit the goal model on xG when present (sharper), and build Elo by replaying training
-    // results. For synthetic data we can also seed Elo from known strengths; real CSV teams
-    // are interned, so Elo simply learns from the training matches.
-    let model = GoalModel::fit(&train_obs, DixonColesConfig::default());
-    // A goals-only refit for comparison, to show the xG lever explicitly.
-    let model_goals = xg_present.then(|| {
-        let stripped: Vec<Observation> = train_obs
-            .iter()
-            .map(|o| Observation::new(o.home, o.away, o.score, o.age_days))
-            .collect();
-        GoalModel::fit(&stripped, DixonColesConfig::default())
-    });
-    let mut ratings = RatingStore::with_defaults();
-    if !real_data {
-        for (team, rating) in data::team_strengths() {
-            ratings.seed(team, rating);
-        }
-    }
-    for r in &records[..train_end] {
-        ratings.record(r.obs.home, r.obs.away, r.obs.score, neutral);
-    }
-
-    // Learn the ensemble on validation. Include the market as a third member when odds are
-    // available, so the ensemble can anchor to the sharpest signal.
-    let mut val_preds = Vec::new();
-    let mut val_actuals = Vec::new();
-    for r in validation {
-        let dc = model.outcome_probabilities(r.obs.home, r.obs.away, neutral);
-        let elo = ratings.win_probabilities(r.obs.home, r.obs.away, neutral);
-        if market_present {
-            if let Some(m) = r.market {
-                val_preds.push(vec![dc, elo, m]);
-                val_actuals.push(r.obs.score.outcome());
-            }
-        } else {
-            val_preds.push(vec![dc, elo]);
-            val_actuals.push(r.obs.score.outcome());
-        }
-    }
-    let n_members = if market_present { 3 } else { 2 };
-    let ensemble = Ensemble::fit(&val_preds, &val_actuals, n_members);
-
-    // Evaluate everything (incl. the bookmaker) on the held-out test split.
-    let mut dc_preds = Vec::new();
-    let mut dc_goals_preds = Vec::new();
-    let mut elo_preds = Vec::new();
-    let mut ens_preds = Vec::new();
-    let mut market_preds = Vec::new();
-    for r in test {
-        let actual = r.obs.score.outcome();
-        let dc = model.outcome_probabilities(r.obs.home, r.obs.away, neutral);
-        let elo = ratings.win_probabilities(r.obs.home, r.obs.away, neutral);
-        dc_preds.push((dc, actual));
-        elo_preds.push((elo, actual));
-        if let Some(mg) = &model_goals {
-            dc_goals_preds.push((
-                mg.outcome_probabilities(r.obs.home, r.obs.away, neutral),
-                actual,
-            ));
-        }
-        let mut members = vec![dc, elo];
-        if let Some(market) = r.market {
-            members.push(market);
-            market_preds.push((market, actual));
-        }
-        ens_preds.push((ensemble.blend(&members), actual));
-    }
+    // Real club fixtures have a genuine home venue and interned teams; the synthetic World Cup is
+    // neutral and its team strengths are known, so Elo can be seeded from them.
+    let report = oracle_eval::evaluate(
+        &records,
+        EvalConfig {
+            neutral: !real_data,
+            seed_elo_from_strengths: !real_data,
+            ..Default::default()
+        },
+    )?;
 
     println!(
         "\nBacktest on {}  (train {} / val {} / test {})\n",
-        source,
-        train_obs.len(),
-        validation.len(),
-        test.len()
+        source, report.train, report.validation, report.test
     );
     println!(
         "  {:<20} {:>8} {:>9} {:>8}",
         "Model", "Brier", "LogLoss", "Acc"
     );
     println!("  {}", "-".repeat(48));
-    let row = |label: &str, r: oracle_model::CalibrationReport| {
+    for m in &report.models {
+        // Two labels depend on what the dataset carried, so they are decided here at the point of
+        // display rather than baked into the model enum.
+        let label = match m.model {
+            Model::DixonColes if report.xg_present => "Dixon-Coles (xG)",
+            Model::Ensemble if report.market_present => "Ensemble (+Market)",
+            Model::Ensemble => "Ensemble (DC+Elo)",
+            other => other.label(),
+        };
         println!(
             "  {:<20} {:>8.4} {:>9.4} {:>7.1}%",
             label,
-            r.brier,
-            r.log_loss,
-            r.accuracy * 100.0
+            m.brier,
+            m.log_loss,
+            m.accuracy * 100.0
         );
-    };
-    row(
-        "Uniform baseline",
-        oracle_model::CalibrationReport::uniform_baseline(test.len()),
-    );
-    if !dc_goals_preds.is_empty() {
-        row("Dixon-Coles (goals)", score(&dc_goals_preds));
     }
-    row(
-        if xg_present {
-            "Dixon-Coles (xG)"
-        } else {
-            "Dixon-Coles"
-        },
-        score(&dc_preds),
-    );
-    row("Elo", score(&elo_preds));
-    row(
-        if market_present {
-            "Ensemble (+Market)"
-        } else {
-            "Ensemble (DC+Elo)"
-        },
-        score(&ens_preds),
-    );
-    if market_preds.is_empty() {
+    if !report.market_present {
         println!("  Market (bookmaker)        (no odds in this dataset)");
-    } else {
-        row("Market (bookmaker)", score(&market_preds));
     }
 
-    let wsum: f64 = ensemble.weights.iter().sum::<f64>().max(1e-9);
-    let w = |i: usize| ensemble.weights.get(i).copied().unwrap_or(0.0) / wsum;
-    if market_present {
+    let w = |i: usize| report.ensemble_weights.get(i).copied().unwrap_or(0.0);
+    if report.market_present {
         println!(
             "\n  learned weights: DC {:.2} / Elo {:.2} / Market {:.2}   temperature {:.2}",
             w(0),
             w(1),
             w(2),
-            ensemble.temperature,
+            report.ensemble_temperature,
         );
     } else {
         println!(
             "\n  learned weights: DC {:.2} / Elo {:.2}   temperature {:.2}",
             w(0),
             w(1),
-            ensemble.temperature,
+            report.ensemble_temperature,
         );
     }
     println!("  (lower Brier / log-loss is better; the market is the bar to beat)");
 
     // Reliability (calibration) of the learned ensemble: in each predicted-probability
     // bucket, how often did the outcome actually happen?
-    let rel = oracle_model::reliability(&ens_preds, 5);
-    println!("\n  Ensemble calibration (ECE {:.3}):", rel.ece);
+    println!(
+        "\n  Ensemble calibration (ECE {:.3}):",
+        report.reliability.ece
+    );
     println!(
         "    {:>12}   {:>9}   {:>9}   {:>6}",
         "bucket", "predicted", "empirical", "n"
     );
-    for b in &rel.bins {
+    for b in &report.reliability.bins {
         if b.count == 0 {
             continue;
         }
