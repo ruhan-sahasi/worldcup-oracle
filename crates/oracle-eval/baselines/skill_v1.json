@@ -1,0 +1,58 @@
+{
+  "schema": 1,
+  "fixture": "crates/oracle-eval/fixtures/skill_v1.csv",
+  "fixture_hash": "69c8feb56518051b",
+  "train": 2400,
+  "validation": 800,
+  "test": 800,
+  "models": [
+    {
+      "model": "uniform_baseline",
+      "scored": 800,
+      "brier": 0.6666666666666667,
+      "log_loss": 1.0986122886681098,
+      "accuracy": 0.3333333333333333
+    },
+    {
+      "model": "dixon_coles_goals",
+      "scored": 800,
+      "brier": 0.6285540526854165,
+      "log_loss": 1.0461630790790502,
+      "accuracy": 0.47
+    },
+    {
+      "model": "dixon_coles",
+      "scored": 800,
+      "brier": 0.6205946904832929,
+      "log_loss": 1.0341571002568792,
+      "accuracy": 0.4925
+    },
+    {
+      "model": "elo",
+      "scored": 800,
+      "brier": 0.6377484715828057,
+      "log_loss": 1.0664928488759982,
+      "accuracy": 0.4675
+    },
+    {
+      "model": "ensemble",
+      "scored": 800,
+      "brier": 0.6187198356058111,
+      "log_loss": 1.0311903963252842,
+      "accuracy": 0.4875
+    },
+    {
+      "model": "market",
+      "scored": 800,
+      "brier": 0.6191537505190042,
+      "log_loss": 1.0322571198359867,
+      "accuracy": 0.49
+    }
+  ],
+  "tolerance": {
+    "brier": 0.0002,
+    "log_loss": 0.0005,
+    "accuracy": null
+  },
+  "note": "Initial baseline for skill_v1.csv. Tolerance calibrated so that disabling the learned ensemble stacking (worth 0.0006 Brier here) fails the gate."
+}

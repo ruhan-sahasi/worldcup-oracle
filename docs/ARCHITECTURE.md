@@ -529,4 +529,45 @@ Request inputs (`iters`, `samples`) are clamped.
   and asserts the model beats the uniform baseline out-of-sample (Brier + log-loss).
 - A Criterion benchmark (`oracle-sim/benches/tournament.rs`) tracks simulation
   throughput.
-- CI runs `fmt --check`, `clippy -D warnings`, the test suite, and a release build.
+- A **skill regression gate** (`oracle-eval`) evaluates a frozen fixture and fails if the model
+  scores worse than a recorded baseline. See below.
+- CI runs `fmt --check`, `clippy -D warnings`, the test suite, a release build, and the skill gate.
+
+### Skill regression gate (`oracle-eval`)
+The project claims forecasting skill; until this existed, nothing enforced it. The tests covered the
+machinery - probabilities normalize, grids sum to one, the simulator reproduces its seed - and said
+nothing about whether the model was any *good*, so a change costing ten percent of skill passed CI
+green.
+
+`wc-oracle skill-gate` fits and scores every forecaster on a committed fixture and compares against a
+committed baseline, failing if any metric worsens beyond tolerance. It runs both from `cargo test` and
+as its own CI step, so a regression is labelled as one rather than hiding in a generic test failure.
+
+Four decisions carry the design.
+
+**The dataset is frozen, not regenerated.** Calling the synthetic generator with a fixed seed would
+make the gate fire whenever the generator changed - which is often - and it could then not tell a data
+change from a model change. Since data changes are the more frequent kind it would mostly cry wolf, and
+a gate that cries wolf gets switched off. `fixtures/skill_v1.csv` is inert, so a metric that moves means
+the *model* moved. Its content hash is recorded in the baseline, so the dataset cannot be quietly edited
+to make a regression disappear.
+
+**The evaluation is bit-reproducible.** Building the gate exposed a real bug: the goal-model fit computed
+its centring mean by summing a `HashMap`'s values, and Rust reseeds every `HashMap` instance, so two fits
+on identical data disagreed in their last bits. Fixed by summing over an ordered slice. That reproducibility
+is what lets the tolerance be set by what counts as a regression rather than by how much noise the harness
+generates.
+
+**The tolerance was calibrated by measurement.** A first attempt at 0.002 Brier turned out to pass a change
+that disabled the learned ensemble stacking entirely, which costs only 0.0006 Brier here. It is now 0.0002
+Brier / 0.0005 log loss - ten orders of magnitude above the floating-point floor and tight enough to catch
+a deleted model component.
+
+**A discrepancy is not a regression.** A changed fixture, a changed split or a dropped forecaster block the
+gate but are reported as invalid comparisons rather than as the model getting worse, because the two send you
+to completely different places. An *added* forecaster is reported and does not block.
+
+What the gate does not do: it does not measure absolute skill, since the fixture is synthetic - that is
+`docs/VALIDATION.md`. And it does not prevent the bar being moved, which has to remain possible for a genuine
+improvement. `skill-gate-update` is a separate command requiring a `--note`, so moving the bar is deliberate
+and lands as a reviewable diff of the numbers being claimed.

@@ -57,6 +57,7 @@ fully offline with **zero keys and zero network**.
 | **Live recalibration** - as matches finish, their leak-free pre-match forecasts are scored against the results and a **temperature-scaling** correction is refit and applied to the remaining forecasts | the model recalibrates itself against the tournament as it plays, correcting any over/under-confidence the offline fit could not anticipate |
 | **Bradley-Terry-Davidson** - a **second, outcome-based model** (win/draw/loss from a per-team strength + a Davidson tie term), time-weighted so real results dominate deep in the tournament; its winner prediction is an **exact knockout bracket DP** | a genuinely different second opinion that leans on the growing result set, offered alongside the goal-model ensemble rather than folded into it |
 | **Consensus + live divergence** - a 50/50 blend of the two independent title forecasts, plus the **Jensen-Shannon divergence** between them and the per-team gap | one reconciled read, with an honest live measure of how far the two models disagree and on which contenders |
+| **Skill regression gate** (`oracle-eval`) - CI fits and scores every forecaster on a **frozen, content-hashed fixture** and fails if any metric worsens beyond tolerance against a **committed baseline**; the tolerance is calibrated by measuring what a real degradation costs (disabling the learned stacking is worth 0.0006 Brier, so the bar is 0.0002) | the project claims forecasting skill, and this is what makes the claim enforceable rather than aspirational: a change that quietly costs skill fails the build, and moving the bar is a separate command with a required reason so it lands as a reviewable diff |
 | **Durable forecast journal + track record** (`oracle-engine::forecast_journal`) - every published pre-match call is appended to an immutable, append-only journal keyed by `(match, model)`, and the track record is scored from those records rather than from forecasts the current model would recompute on replay | genuine accountability rather than the appearance of it: a model change cannot retroactively improve the record, because the calls it is scored on are the ones that were actually published. Served at `/track-record`, and reconstructible offline from the journal plus the event log via `wc-oracle track-record` |
 | **Live reliability curve + ECE** - the model's leak-free pre-match calls binned by predicted probability against how often they came true, with the **expected calibration error** | honest, visible accountability: is a 70% call right about 70% of the time, right now, as the tournament plays |
 | **Massey power ranking** - a **least-squares** rating solved from every goal margin at once over *this tournament's results only*, with an offense/defense split | a prior-free, strength-of-schedule-adjusted read on who has actually been strongest here, a different method (linear algebra) than the game-by-game raters |
@@ -117,6 +118,7 @@ flowchart LR
 | `oracle-players` | goalscorer markets (anytime / brace / hat-trick / first) + Golden Boot race |
 | `oracle-live` | in-play win probability, hedging and cash-out trading |
 | `oracle-derivatives` | totals, Asian handicap, correct score priced off the score grid |
+| `oracle-eval` | offline skill evaluation + the regression gate that protects it |
 | `oracle-engine` | event-driven orchestrator, pub/sub, snapshot cache, metrics |
 | `oracle-api` | axum REST + WebSocket server (`oracle-server`) |
 | `oracle-cli` | `wc-oracle`: CLI commands + live TUI |
@@ -133,6 +135,9 @@ cd worldcup-oracle
 cargo build --release
 
 # 2. Champion odds for the 2026 World Cup (reproducible with --seed):
+# Check the model has not lost skill against the committed baseline (this is the CI gate).
+cargo run --release -p oracle-cli -- skill-gate
+
 # Score the calls the engine actually published (immutable; needs a journal from `serve`).
 cargo run --release -p oracle-cli -- track-record --journal forecasts.jsonl --event-log events.jsonl
 

@@ -97,6 +97,37 @@ The goal-model parameters progressed deliberately:
 Hyperparameters (`ξ`, ridge, score model) are chosen by **Bayesian optimization** (a Gaussian-process
 surrogate + Expected Improvement) over a continuous space, not a hand-specified grid.
 
+## Enforcing the claim
+
+Claiming skill and measuring skill are different things, and a project can do the second without the
+first noticing when it stops being true. This one quoted Brier scores in its README and had no
+mechanism that would fail if they got worse.
+
+A regression gate closes that, and the interesting part is what it takes for one to be worth having
+rather than decorative.
+
+**It has to be sensitive enough to catch a real loss.** The way to find out is to break the model and
+look. Disabling the learned ensemble stacking - equal weights, no temperature scaling - costs 0.0006
+Brier on the fixture, which the first tolerance I chose passed happily. A gate calibrated by intuition
+rather than by measurement provides false assurance, which is worse than none.
+
+**It has to be specific about what it is measuring.** The dataset is frozen and hashed, so the gate
+cannot be satisfied by editing the data, and a metric that moves is attributable to the model. The
+evaluation is bit-reproducible, so a movement is a real change rather than harness noise - a property
+that turned out to require fixing an actual bug in the goal-model fit.
+
+**It has to distinguish "worse" from "cannot tell".** A changed fixture and a regressed model both fail,
+but they are reported differently, because sending someone to debug the model when the data moved wastes
+their time and teaches them to distrust the gate.
+
+**It must not become a formality.** Recording a new baseline is a separate command with a required
+reason, so the bar moves only when someone decides to move it and writes down why. The alternative - a
+`--update` flag on the checking command - would be used reflexively the moment the gate went red.
+
+An honest note on scope: the fixture is synthetic, so the gate protects against *getting worse*, not
+against *not being good*. Absolute skill on real data is in [`VALIDATION.md`](VALIDATION.md), and no
+automated gate can substitute for it.
+
 ## Accountability: a record that cannot be edited
 
 A forecaster that can revise its own history is not accountable, and the revision does not have to

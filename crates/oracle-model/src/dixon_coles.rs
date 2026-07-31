@@ -374,8 +374,14 @@ impl GoalModel {
         }
         intercept = x[2 * n_t];
         home_advantage = x[2 * n_t + 1];
-        let mean_a: f64 = attack.values().sum::<f64>() / n_t as f64;
-        let mean_d: f64 = defense.values().sum::<f64>() / n_t as f64;
+        // Summed over `teams` rather than over the maps' own iteration order. A `HashMap` in Rust
+        // gets a fresh hash seed per instance, so `attack.values().sum()` adds the same numbers in a
+        // different order on every fit - and floating-point addition is not associative, so the mean
+        // differs in its last bits, shifting every fitted coefficient with it. The effect is around
+        // 1e-16 per coefficient and harmless numerically, but it makes the fit irreproducible: two
+        // fits on identical data disagree. `teams` is a slice in a fixed order, so this is stable.
+        let mean_a: f64 = teams.iter().map(|t| attack[t]).sum::<f64>() / n_t as f64;
+        let mean_d: f64 = teams.iter().map(|t| defense[t]).sum::<f64>() / n_t as f64;
         for v in attack.values_mut() {
             *v -= mean_a;
         }

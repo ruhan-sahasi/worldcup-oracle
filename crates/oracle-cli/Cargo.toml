@@ -21,6 +21,7 @@ oracle-ingest.workspace = true
 oracle-engine.workspace = true
 oracle-api.workspace = true
 oracle-market.workspace = true
+oracle-eval.workspace = true
 clap.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
