@@ -21,9 +21,12 @@
 //! ## Module map
 //! - [`skill`] - fit on a dataset, score every forecaster out of sample
 //! - [`fixture`] - freeze a dataset to CSV so the gate's data stops being a function of the code
+//! - [`gate`] - the recorded baseline and the regression verdict
 #![forbid(unsafe_code)]
 
 pub mod fixture;
+pub mod gate;
 pub mod skill;
 
+pub use gate::{GateError, SkillBaseline, Tolerance};
 pub use skill::{evaluate, EvalConfig, EvalError, Model, ModelSkill, SkillReport, MIN_MATCHES};
