@@ -29,4 +29,6 @@ pub mod gate;
 pub mod skill;
 
 pub use gate::{compare, Discrepancy, GateError, SkillBaseline, Tolerance, Verdict};
-pub use skill::{evaluate, EvalConfig, EvalError, Model, ModelSkill, SkillReport, MIN_MATCHES};
+pub use skill::{
+    evaluate, Bootstrap, EvalConfig, EvalError, Model, ModelSkill, SkillReport, MIN_MATCHES,
+};

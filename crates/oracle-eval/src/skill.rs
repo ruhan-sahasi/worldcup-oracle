@@ -8,7 +8,8 @@
 use oracle_domain::{Outcome, Probabilities};
 use oracle_ingest::data::{self, MatchRecord};
 use oracle_model::{
-    score, CalibrationReport, DixonColesConfig, Ensemble, GoalModel, Observation, ReliabilityReport,
+    bootstrap_score_ci, score, CalibrationReport, DixonColesConfig, Ensemble, GoalModel, MetricCi,
+    Observation, ReliabilityReport,
 };
 use oracle_ratings::RatingStore;
 use serde::{Deserialize, Serialize};
@@ -61,6 +62,20 @@ pub struct ModelSkill {
     pub brier: f64,
     pub log_loss: f64,
     pub accuracy: f64,
+    /// Bootstrap 95% interval on the Brier score, when [`EvalConfig::bootstrap`] asked for one.
+    ///
+    /// This is **not** what the gate decides on, and the distinction is the whole reason it is worth
+    /// reporting. The evaluation is deterministic over a fixed fixture, so a moved metric is a real
+    /// change to the model with no sampling noise to explain it - the gate compares the point values
+    /// and is right to. What the interval answers is the *next* question a reader has: would this
+    /// change survive on different matches, or is it smaller than the spread of the sample it was
+    /// measured on? A gate cannot answer that, and quietly conflating the two would either hide real
+    /// regressions or fail on ones that mean nothing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub brier_ci: Option<MetricCi>,
+    /// Bootstrap 95% interval on the log loss. See [`brier_ci`](Self::brier_ci).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub log_loss_ci: Option<MetricCi>,
 }
 
 /// A complete evaluation of a dataset: how each forecaster scored on the held-out split.
@@ -100,6 +115,29 @@ pub struct EvalConfig {
     pub seed_elo_from_strengths: bool,
     /// Bins in the reported reliability curve.
     pub reliability_bins: usize,
+    /// Bootstrap resamples and seed for the confidence intervals, or `None` to skip them.
+    ///
+    /// Skipped by default because they cost a few thousand rescorings per model and most callers -
+    /// including the gate's pass/fail decision - do not need them.
+    pub bootstrap: Option<Bootstrap>,
+}
+
+/// How to compute the bootstrap intervals.
+#[derive(Debug, Clone, Copy)]
+pub struct Bootstrap {
+    pub resamples: usize,
+    /// Seed for the resampling, so the intervals are reproducible. A gate that reported a different
+    /// interval on every run would look flaky even though its verdict was stable.
+    pub seed: u64,
+}
+
+impl Default for Bootstrap {
+    fn default() -> Self {
+        Self {
+            resamples: 2000,
+            seed: 20_260_611,
+        }
+    }
 }
 
 impl Default for EvalConfig {
@@ -108,6 +146,7 @@ impl Default for EvalConfig {
             neutral: true,
             seed_elo_from_strengths: true,
             reliability_bins: 5,
+            bootstrap: None,
         }
     }
 }
@@ -250,12 +289,21 @@ pub fn evaluate(records: &[MatchRecord], config: EvalConfig) -> Result<SkillRepo
             return None;
         }
         let r = score(preds);
+        let (brier_ci, log_loss_ci) = match config.bootstrap {
+            Some(b) => {
+                let (brier, log_loss, _accuracy) = bootstrap_score_ci(preds, b.resamples, b.seed);
+                (Some(brier), Some(log_loss))
+            }
+            None => (None, None),
+        };
         Some(ModelSkill {
             model,
             scored: preds.len(),
             brier: r.brier,
             log_loss: r.log_loss,
             accuracy: r.accuracy,
+            brier_ci,
+            log_loss_ci,
         })
     };
     let baseline = CalibrationReport::uniform_baseline(test.len());
@@ -265,6 +313,11 @@ pub fn evaluate(records: &[MatchRecord], config: EvalConfig) -> Result<SkillRepo
         brier: baseline.brier,
         log_loss: baseline.log_loss,
         accuracy: baseline.accuracy,
+        // The uniform baseline is a constant, not an estimate: it makes the same prediction on every
+        // match, so resampling would return the same number every time. An interval of zero width
+        // would be technically correct and read as suspicious, so there is none.
+        brier_ci: None,
+        log_loss_ci: None,
     }];
     models.extend(
         [
@@ -424,6 +477,99 @@ mod tests {
             }
         );
         assert!(evaluate(&synthetic(1000)[..50], EvalConfig::default()).is_ok());
+    }
+
+    #[test]
+    fn intervals_are_absent_unless_asked_for() {
+        let r = evaluate(&synthetic(400), EvalConfig::default()).unwrap();
+        assert!(r.models.iter().all(|m| m.brier_ci.is_none()));
+        assert!(r.models.iter().all(|m| m.log_loss_ci.is_none()));
+    }
+
+    #[test]
+    fn intervals_bracket_their_point_estimate() {
+        let cfg = EvalConfig {
+            bootstrap: Some(Bootstrap {
+                resamples: 400,
+                seed: 11,
+            }),
+            ..Default::default()
+        };
+        let r = evaluate(&synthetic(1000), cfg).unwrap();
+        for m in r
+            .models
+            .iter()
+            .filter(|m| m.model != Model::UniformBaseline)
+        {
+            let ci = m.brier_ci.expect("an interval was requested");
+            assert!(
+                ci.lo <= m.brier && m.brier <= ci.hi,
+                "{}: {} outside [{}, {}]",
+                m.model.label(),
+                m.brier,
+                ci.lo,
+                ci.hi
+            );
+            assert!(ci.lo < ci.hi, "a degenerate interval is not informative");
+            assert!(
+                (ci.point - m.brier).abs() < 1e-12,
+                "point matches the score"
+            );
+            let ll = m.log_loss_ci.expect("log-loss interval");
+            assert!(ll.lo <= m.log_loss && m.log_loss <= ll.hi);
+        }
+    }
+
+    #[test]
+    fn the_uniform_baseline_has_no_interval() {
+        // It predicts the same thing on every match, so resampling returns the same number and a
+        // zero-width interval would read as suspicious precision rather than as a constant.
+        let cfg = EvalConfig {
+            bootstrap: Some(Bootstrap::default()),
+            ..Default::default()
+        };
+        let r = evaluate(&synthetic(400), cfg).unwrap();
+        let base = r.get(Model::UniformBaseline).unwrap();
+        assert!(base.brier_ci.is_none());
+    }
+
+    #[test]
+    fn intervals_are_reproducible_for_a_seed() {
+        // A gate reporting a different interval on every run would look flaky even with a stable
+        // verdict.
+        let cfg = EvalConfig {
+            bootstrap: Some(Bootstrap {
+                resamples: 300,
+                seed: 99,
+            }),
+            ..Default::default()
+        };
+        let records = synthetic(400);
+        let a = evaluate(&records, cfg).unwrap();
+        let b = evaluate(&records, cfg).unwrap();
+        assert_eq!(a.models, b.models);
+    }
+
+    #[test]
+    fn asking_for_intervals_does_not_move_the_point_estimates() {
+        // The intervals are extra reporting, not a different measurement. If requesting them shifted
+        // a metric, a baseline recorded with them would not compare against a run without them.
+        let records = synthetic(1000);
+        let plain = evaluate(&records, EvalConfig::default()).unwrap();
+        let with_ci = evaluate(
+            &records,
+            EvalConfig {
+                bootstrap: Some(Bootstrap::default()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        for (a, b) in plain.models.iter().zip(&with_ci.models) {
+            assert_eq!(a.model, b.model);
+            assert_eq!(a.brier, b.brier, "{} Brier moved", a.model.label());
+            assert_eq!(a.log_loss, b.log_loss);
+            assert_eq!(a.accuracy, b.accuracy);
+        }
     }
 
     #[test]
