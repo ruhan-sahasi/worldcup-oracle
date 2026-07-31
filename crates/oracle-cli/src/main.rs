@@ -201,6 +201,36 @@ enum Command {
         #[arg(long)]
         forecast_journal: Option<std::path::PathBuf>,
     },
+    /// Check the model's skill on the frozen fixture against the recorded baseline.
+    ///
+    /// Exits non-zero on a regression, so it works as a CI gate.
+    SkillGate {
+        /// The frozen evaluation fixture.
+        #[arg(long, default_value = "crates/oracle-eval/fixtures/skill_v1.csv")]
+        fixture: std::path::PathBuf,
+        /// The recorded baseline to compare against.
+        #[arg(long, default_value = "crates/oracle-eval/baselines/skill_v1.json")]
+        baseline: std::path::PathBuf,
+        /// Also report bootstrap 95% intervals, for judging whether a change would generalize.
+        #[arg(long)]
+        intervals: bool,
+    },
+    /// Record a new skill baseline for the frozen fixture, replacing any existing one.
+    ///
+    /// Separate from `skill-gate` rather than a flag on it, so that moving the bar can never happen
+    /// as a side effect of checking it.
+    SkillGateUpdate {
+        /// The frozen evaluation fixture.
+        #[arg(long, default_value = "crates/oracle-eval/fixtures/skill_v1.csv")]
+        fixture: std::path::PathBuf,
+        /// Where to write the baseline.
+        #[arg(long, default_value = "crates/oracle-eval/baselines/skill_v1.json")]
+        baseline: std::path::PathBuf,
+        /// Why the baseline is being moved. Recorded in the file, and required: a baseline change
+        /// without a reason is indistinguishable from one that hides a regression.
+        #[arg(long)]
+        note: String,
+    },
     /// Score a forecast journal: how the calls the engine actually published have held up.
     TrackRecord {
         /// Path to the append-only journal written by `serve --forecast-journal`.
@@ -291,6 +321,16 @@ async fn main() -> anyhow::Result<()> {
             event_log,
             forecast_journal,
         } => cmd_serve(addr, event_log, forecast_journal).await,
+        Command::SkillGate {
+            fixture,
+            baseline,
+            intervals,
+        } => cmd_skill_gate(&fixture, &baseline, intervals),
+        Command::SkillGateUpdate {
+            fixture,
+            baseline,
+            note,
+        } => cmd_skill_gate_update(&fixture, &baseline, &note),
         Command::TrackRecord {
             journal,
             event_log,
@@ -299,6 +339,212 @@ async fn main() -> anyhow::Result<()> {
         Command::Watch { speed } => watch::run(speed).await,
         Command::Sensitivity { iters, seed, top } => cmd_sensitivity(iters, seed, top),
     }
+}
+
+/// `skill-gate`: evaluate the frozen fixture and compare against the recorded baseline.
+///
+/// Returns an error - and so a non-zero exit - on a regression or on anything that makes the
+/// comparison invalid. That exit code is the whole interface as far as CI is concerned; everything
+/// printed is for the human reading the failure.
+fn cmd_skill_gate(
+    fixture_path: &std::path::Path,
+    baseline_path: &std::path::Path,
+    intervals: bool,
+) -> anyhow::Result<()> {
+    use oracle_eval::gate::{compare, Discrepancy};
+    use oracle_eval::{Bootstrap, EvalConfig, SkillBaseline};
+
+    let (records, fixture_hash) = oracle_eval::fixture::load(fixture_path)
+        .map_err(|e| anyhow::anyhow!("reading {}: {e}", fixture_path.display()))?;
+    let baseline = SkillBaseline::load(baseline_path).map_err(|e| {
+        anyhow::anyhow!(
+            "reading {}: {e}\n  If no baseline exists yet, record one with \
+             `wc-oracle skill-gate-update`.",
+            baseline_path.display()
+        )
+    })?;
+    let report = oracle_eval::evaluate(
+        &records,
+        EvalConfig {
+            bootstrap: intervals.then(Bootstrap::default),
+            ..Default::default()
+        },
+    )?;
+    let verdict = compare(&baseline, &report, &fixture_hash);
+
+    println!(
+        "Skill gate on {} ({} matches, test split {})\n",
+        fixture_path.display(),
+        records.len(),
+        report.test
+    );
+    if !baseline.note.is_empty() {
+        println!("  baseline note: {}\n", baseline.note);
+    }
+
+    println!(
+        "  {:<30} {:>9} {:>9} {:>9}   verdict",
+        "Model", "baseline", "current", "delta"
+    );
+    println!("  {}", "-".repeat(80));
+    for c in &verdict.comparisons {
+        for d in &c.deltas {
+            let mark = if d.breached() {
+                "REGRESSION"
+            } else if d.regression < -d.tolerance {
+                "improved"
+            } else {
+                "ok"
+            };
+            println!(
+                "  {:<30} {:>9.4} {:>9.4} {:>+9.4}   {}",
+                format!("{} {}", c.model.label(), d.metric),
+                d.baseline,
+                d.current,
+                // Printed in the metric's own direction, not the normalized one: a reader comparing
+                // this against the two columns beside it expects current minus baseline.
+                d.current - d.baseline,
+                mark
+            );
+        }
+    }
+    println!(
+        "\n  tolerance: Brier {:.4}, log loss {:.4}{}",
+        baseline.tolerance.brier,
+        baseline.tolerance.log_loss,
+        match baseline.tolerance.accuracy {
+            Some(a) => format!(", accuracy {a:.4}"),
+            None => String::from(" (accuracy not gated)"),
+        }
+    );
+
+    if intervals {
+        println!("\n  Bootstrap 95% intervals on the current run:");
+        for m in &report.models {
+            if let Some(ci) = m.brier_ci {
+                println!(
+                    "    {:<22} Brier {:.4} [{:.4}, {:.4}]",
+                    m.model.label(),
+                    ci.point,
+                    ci.lo,
+                    ci.hi
+                );
+            }
+        }
+        println!(
+            "    (the gate compares point values; these say whether a move would survive on \
+             different matches)"
+        );
+    }
+
+    for d in &verdict.discrepancies {
+        match d {
+            Discrepancy::FixtureChanged { expected, found } => println!(
+                "\n  FIXTURE CHANGED: the baseline was measured on bytes hashing {expected}, this \
+                 run used {found}.\n  This is not a model regression - the comparison is invalid. \
+                 Restore the fixture, or freeze a new one and record a fresh baseline."
+            ),
+            Discrepancy::SplitChanged { expected, found } => println!(
+                "\n  SPLIT CHANGED: baseline {expected:?} vs current {found:?}. The two \
+                 measurements are over different test sets."
+            ),
+            Discrepancy::ModelMissing { model } => println!(
+                "\n  MODEL MISSING: {} is in the baseline but was not scored.",
+                model.label()
+            ),
+            Discrepancy::ModelAdded { model } => println!(
+                "\n  note: {} is new since the baseline (not a failure).",
+                model.label()
+            ),
+        }
+    }
+
+    if verdict.passed() {
+        println!("\nPASS - no skill regression.");
+        return Ok(());
+    }
+    if let Some((model, d)) = verdict.worst_regression() {
+        anyhow::bail!(
+            "skill regression: {} {} moved {:+.4} (tolerance {:.4}).\n  \
+             If this is a deliberate, understood change, record a new baseline with \
+             `wc-oracle skill-gate-update --note \"why\"` so the new numbers are reviewable.",
+            model.label(),
+            d.metric,
+            d.current - d.baseline,
+            d.tolerance
+        );
+    }
+    anyhow::bail!("the skill comparison is not valid; see the discrepancies above")
+}
+
+/// `skill-gate-update`: record the current skill as the new baseline.
+///
+/// Deliberately a separate command from `skill-gate` rather than a `--update` flag on it. A flag on
+/// the checking command invites `skill-gate --update` as a reflex when the gate goes red, which is
+/// exactly the habit the gate exists to prevent. As its own command with a required `--note`, moving
+/// the bar is a decision someone wrote down.
+fn cmd_skill_gate_update(
+    fixture_path: &std::path::Path,
+    baseline_path: &std::path::Path,
+    note: &str,
+) -> anyhow::Result<()> {
+    use oracle_eval::gate::compare;
+    use oracle_eval::{EvalConfig, SkillBaseline, Tolerance};
+
+    if note.trim().is_empty() {
+        anyhow::bail!("--note must say why the baseline is being moved");
+    }
+    let (records, fixture_hash) = oracle_eval::fixture::load(fixture_path)
+        .map_err(|e| anyhow::anyhow!("reading {}: {e}", fixture_path.display()))?;
+    let report = oracle_eval::evaluate(&records, EvalConfig::default())?;
+
+    // Show what is changing before writing it. The diff a reviewer sees is the JSON, but the person
+    // running this should see it too - a silent overwrite is how a regression gets recorded as the
+    // new normal.
+    match SkillBaseline::load(baseline_path) {
+        Ok(previous) => {
+            let verdict = compare(&previous, &report, &fixture_hash);
+            println!("Replacing the baseline at {}\n", baseline_path.display());
+            for c in &verdict.comparisons {
+                for d in &c.deltas {
+                    if d.regression.abs() > 1e-12 {
+                        println!(
+                            "  {:<22} {:.4} -> {:.4} ({:+.4}){}",
+                            format!("{} {}", c.model.label(), d.metric),
+                            d.baseline,
+                            d.current,
+                            d.current - d.baseline,
+                            if d.breached() { "  <- was failing" } else { "" }
+                        );
+                    }
+                }
+            }
+            if verdict.comparisons.is_empty() {
+                println!("  (no comparable models in the previous baseline)");
+            }
+        }
+        Err(_) => println!("Writing a new baseline at {}\n", baseline_path.display()),
+    }
+
+    let baseline = SkillBaseline::record(
+        &report,
+        fixture_path.to_string_lossy(),
+        &fixture_hash,
+        Tolerance::default(),
+        note,
+    );
+    if let Some(dir) = baseline_path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    std::fs::write(baseline_path, baseline.to_json())?;
+    println!(
+        "\nWrote {} ({} models, fixture hash {}).\n  Commit it: the diff is the record of what \
+         skill this project claims.",
+        baseline_path.display(),
+        baseline.models.len(),
+        fixture_hash
+    );
+    Ok(())
 }
 
 /// `track-record --journal <path>`: score the calls the engine actually published.
