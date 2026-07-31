@@ -11,7 +11,7 @@ env:
 
 jobs:
   check:
-    name: fmt · clippy · test · build
+    name: fmt · clippy · test · build · skill
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -35,6 +35,18 @@ jobs:
 
       - name: Release build
         run: cargo build --workspace --release
+
+      # The skill gate, run explicitly as well as via `cargo test`, so a regression is labelled as
+      # one in the job list instead of hiding inside a generic test failure. Uses the release binary
+      # already built above, since the gate fits the goal model and a debug build is several times
+      # slower for no benefit.
+      #
+      # A failure here means the model got worse on the frozen fixture, not that a test is broken.
+      # The command's output says which forecaster moved and by how much; if the change is deliberate,
+      # record a new baseline with `skill-gate-update --note "why"` so the numbers being claimed show
+      # up as a reviewable diff.
+      - name: Skill regression gate
+        run: ./target/release/wc-oracle skill-gate
 
   docker:
     name: docker image build
