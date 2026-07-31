@@ -81,15 +81,21 @@ pub struct Tolerance {
 
 impl Default for Tolerance {
     fn default() -> Self {
-        // Chosen against the noise floor rather than picked round. The evaluation is exactly
-        // reproducible, so run-to-run noise is zero; what these have to absorb is the last-bits drift
-        // an unrelated refactor can cause (measured at ~1e-14 before the fit was made
-        // bit-reproducible, and zero after). 0.002 Brier on an 800-match test split is roughly a
-        // fifth of one standard error, so it catches any regression worth the name while leaving
-        // room for genuinely inconsequential change.
+        // Calibrated by measuring what a real degradation actually costs, not picked round.
+        //
+        // The evaluation is bit-reproducible over a frozen fixture, so there is no run-to-run noise
+        // to absorb - only the last-bits drift an unrelated refactor might introduce, on the order of
+        // 1e-14. That leaves a wide range to choose from, and the choice matters: a first attempt at
+        // 0.002 Brier turned out to pass a change that disabled the learned ensemble stacking
+        // entirely (equal weights, no temperature scaling), which costs only 0.0006 Brier on this
+        // fixture. A gate that lets a whole model component be deleted is decoration.
+        //
+        // 0.0002 catches that with room to spare while sitting ten orders of magnitude above the
+        // floating-point floor. Log loss is set proportionally: it moved about twice as far as Brier
+        // in the same experiment.
         Self {
-            brier: 0.002,
-            log_loss: 0.004,
+            brier: 0.0002,
+            log_loss: 0.0005,
             accuracy: None,
         }
     }
