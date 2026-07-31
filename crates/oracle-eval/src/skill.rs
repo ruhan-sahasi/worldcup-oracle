@@ -350,6 +350,35 @@ mod tests {
     }
 
     #[test]
+    fn the_same_input_twice_gives_bit_identical_metrics() {
+        // The property the regression gate rests on. Nothing in the fit or the scoring is random, so
+        // two runs over the same data must agree to the last bit - otherwise the gate could fail on
+        // noise, and a gate that cries wolf gets switched off.
+        //
+        // This did not hold until the goal-model fit stopped summing over a HashMap's own iteration
+        // order; see the comment in dixon_coles.rs.
+        let records = synthetic(1000);
+        let a = evaluate(&records, EvalConfig::default()).unwrap();
+        let b = evaluate(&records, EvalConfig::default()).unwrap();
+        assert_eq!(a.models, b.models, "metrics are not reproducible");
+        assert_eq!(a.ensemble_weights, b.ensemble_weights);
+        assert_eq!(a.ensemble_temperature, b.ensemble_temperature);
+        assert_eq!(a.reliability.ece, b.reliability.ece);
+    }
+
+    #[test]
+    fn repeated_evaluation_is_stable_over_many_runs() {
+        // Once is luck; the hash seed differs per HashMap instance, so a residual order dependency
+        // would show up intermittently rather than every time.
+        let records = synthetic(400);
+        let first = evaluate(&records, EvalConfig::default()).unwrap();
+        for i in 0..12 {
+            let again = evaluate(&records, EvalConfig::default()).unwrap();
+            assert_eq!(first.models, again.models, "run {i} disagreed");
+        }
+    }
+
+    #[test]
     fn reordering_the_input_does_not_move_the_metrics() {
         // A weaker but still necessary property: a committed fixture's row order must not decide the
         // result. Before the total tie-break in `evaluate` this failed outright, because a stable
