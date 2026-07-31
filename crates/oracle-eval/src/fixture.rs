@@ -83,10 +83,127 @@ pub fn to_csv(records: &[MatchRecord]) -> String {
     out
 }
 
+/// A content fingerprint of a fixture's bytes, as lowercase hex.
+///
+/// Recorded in the baseline so the gate can tell whether it is comparing against the dataset the
+/// baseline was taken from. Without it the fixture is the one input nobody checks: a regression could
+/// be made to disappear by nudging a few rows, and the gate would go green with no sign that the bar
+/// had moved rather than the model improving.
+///
+/// This is **not** a cryptographic hash and is not trying to be. The threat is an accidental or
+/// careless edit - a stray reformat, a partial regeneration, an editor rewriting line endings - not
+/// an adversary constructing a collision. FNV-1a over the bytes catches all of those
+/// and costs one pass with no dependency; a real digest would mean pulling in sha2 to defend against
+/// something that cannot happen in a repository you already control.
+///
+/// Line endings are normalized first, so a checkout that converted LF to CRLF does not read as a
+/// tampered fixture.
+pub fn content_hash(bytes: &[u8]) -> String {
+    // FNV-1a: one multiply and one xor per byte, well-mixed for accidental change detection.
+    const OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+    const PRIME: u64 = 0x0000_0100_0000_01b3;
+    let mut h = OFFSET;
+    for &b in bytes {
+        if b == b'\r' {
+            continue;
+        }
+        h ^= u64::from(b);
+        h = h.wrapping_mul(PRIME);
+    }
+    format!("{h:016x}")
+}
+
+/// Read a fixture from `path`, returning its records and the hash of its bytes.
+///
+/// Both together, because the gate needs them together: records to evaluate, hash to prove which
+/// dataset was evaluated. Reading the file once for both also removes the chance of hashing one
+/// version and scoring another.
+pub fn load(path: impl AsRef<std::path::Path>) -> std::io::Result<(Vec<MatchRecord>, String)> {
+    let path = path.as_ref();
+    let bytes = std::fs::read(path)?;
+    let hash = content_hash(&bytes);
+    let records = oracle_ingest::data::load_results_csv(path)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
+    Ok((records, hash))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use oracle_ingest::data;
+
+    #[test]
+    fn the_hash_changes_when_any_byte_changes() {
+        let base = to_csv(&data::synthetic_history_with_market(200, 7));
+        let h = content_hash(base.as_bytes());
+
+        // A single digit altered in one score - the kind of edit that could make a regression vanish.
+        let tampered = base.replacen(",4,2,", ",5,2,", 1);
+        assert_ne!(
+            tampered, base,
+            "the test edit must actually change something"
+        );
+        assert_ne!(content_hash(tampered.as_bytes()), h, "edit went undetected");
+
+        // A dropped row.
+        let truncated: String = base.lines().take(100).collect::<Vec<_>>().join("\n");
+        assert_ne!(content_hash(truncated.as_bytes()), h);
+
+        // Reordered rows: same bytes, different arrangement.
+        let mut lines: Vec<&str> = base.lines().collect();
+        lines.swap(1, 2);
+        assert_ne!(content_hash(lines.join("\n").as_bytes()), h);
+    }
+
+    #[test]
+    fn the_hash_is_stable_for_identical_bytes() {
+        let csv = to_csv(&data::synthetic_history_with_market(200, 7));
+        assert_eq!(content_hash(csv.as_bytes()), content_hash(csv.as_bytes()));
+        // And across a fresh generation of the same data, since the fixture is regenerable.
+        let again = to_csv(&data::synthetic_history_with_market(200, 7));
+        assert_eq!(content_hash(csv.as_bytes()), content_hash(again.as_bytes()));
+    }
+
+    #[test]
+    fn line_endings_do_not_affect_the_hash() {
+        // A Windows checkout must not read as a tampered fixture.
+        let unix = to_csv(&data::synthetic_history_with_market(100, 7));
+        let windows = unix.replace('\n', "\r\n");
+        assert_ne!(unix, windows);
+        assert_eq!(
+            content_hash(unix.as_bytes()),
+            content_hash(windows.as_bytes())
+        );
+    }
+
+    #[test]
+    fn loading_returns_both_the_records_and_the_hash() {
+        let path = std::env::temp_dir().join("oracle_fixture_load.csv");
+        let csv = to_csv(&data::synthetic_history_with_market(200, 7));
+        std::fs::write(&path, &csv).unwrap();
+        let (records, hash) = load(&path).unwrap();
+        assert_eq!(records.len(), 200);
+        assert_eq!(hash, content_hash(csv.as_bytes()));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn the_committed_fixture_loads_and_hashes() {
+        // Guards the committed file itself: if it is ever corrupted or half-regenerated, this fails
+        // here rather than as a confusing gate error.
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/fixtures/skill_v1.csv");
+        let (records, hash) = load(path).unwrap();
+        assert_eq!(records.len(), 4000, "the committed fixture is 4000 matches");
+        assert_eq!(hash.len(), 16, "a 64-bit hex fingerprint");
+        assert!(
+            records.iter().all(|r| r.market.is_some()),
+            "every row carries odds"
+        );
+        assert!(
+            records.iter().all(|r| r.obs.home_xg.is_some()),
+            "every row carries xG"
+        );
+    }
 
     fn write_and_reload(records: &[MatchRecord], name: &str) -> Vec<MatchRecord> {
         let path = std::env::temp_dir().join(format!("oracle_fixture_{name}.csv"));
