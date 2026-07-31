@@ -449,14 +449,29 @@ mod tests {
 
     #[test]
     fn a_movement_inside_tolerance_passes() {
-        // Half the Brier tolerance: real but not worth failing a build over.
-        let (b, slightly_worse) = worsened(Model::Ensemble, 0.0009);
+        // Derived from the tolerance rather than hardcoded. An earlier version of this test used a
+        // literal 0.0009, which was half the tolerance at the time; tightening the tolerance to
+        // 0.0002 then made the test fail for a reason that had nothing to do with what it checks.
+        let tol = Tolerance::default();
+        let inside = tol.brier.min(tol.log_loss) / 2.0;
+        let (b, slightly_worse) = worsened(Model::Ensemble, inside);
         let v = compare(&b, &slightly_worse, "H");
         assert!(
             v.passed(),
-            "a sub-tolerance move must not fail: {:?}",
+            "a move of {inside} is inside tolerance and must not fail: {:?}",
             v.regressions().collect::<Vec<_>>()
         );
+    }
+
+    #[test]
+    fn a_movement_just_outside_tolerance_fails() {
+        // The other side of the same boundary, also derived, so the two together pin where the line
+        // actually is rather than asserting only that some large move fails.
+        let tol = Tolerance::default();
+        let outside = tol.brier.max(tol.log_loss) * 1.5;
+        let (b, worse) = worsened(Model::Ensemble, outside);
+        let v = compare(&b, &worse, "H");
+        assert!(!v.passed(), "a move of {outside} must fail");
     }
 
     #[test]
