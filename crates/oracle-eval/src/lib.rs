@@ -28,5 +28,5 @@ pub mod fixture;
 pub mod gate;
 pub mod skill;
 
-pub use gate::{GateError, SkillBaseline, Tolerance};
+pub use gate::{compare, Discrepancy, GateError, SkillBaseline, Tolerance, Verdict};
 pub use skill::{evaluate, EvalConfig, EvalError, Model, ModelSkill, SkillReport, MIN_MATCHES};

@@ -203,6 +203,185 @@ pub fn fixture_hash(bytes: &[u8]) -> String {
     fixture::content_hash(bytes)
 }
 
+/// How one metric moved against its recorded value.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
+pub struct MetricDelta {
+    pub metric: &'static str,
+    pub baseline: f64,
+    pub current: f64,
+    /// Positive means worse than baseline, for every metric here. Brier and log loss are losses, so
+    /// worse is larger; accuracy is a score, so worse is smaller and the sign is flipped. Normalizing
+    /// the direction means the comparison logic never has to remember which is which.
+    pub regression: f64,
+    pub tolerance: f64,
+}
+
+impl MetricDelta {
+    /// Whether this metric moved further than its tolerance allows.
+    pub fn breached(&self) -> bool {
+        self.regression > self.tolerance
+    }
+}
+
+/// One forecaster's comparison against its recorded entry.
+#[derive(Debug, Clone, Serialize)]
+pub struct ModelComparison {
+    pub model: Model,
+    pub deltas: Vec<MetricDelta>,
+}
+
+impl ModelComparison {
+    /// The metrics that breached tolerance.
+    pub fn breaches(&self) -> impl Iterator<Item = &MetricDelta> {
+        self.deltas.iter().filter(|d| d.breached())
+    }
+}
+
+/// Everything that can make a gate run fail, other than a metric moving.
+///
+/// Each of these means the comparison is not valid, which is different from the model being worse -
+/// so they are reported separately and never silently treated as a pass.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub enum Discrepancy {
+    /// The fixture's bytes are not the ones the baseline was measured on.
+    FixtureChanged { expected: String, found: String },
+    /// The split sizes differ, so the two measurements are over different test sets.
+    SplitChanged {
+        expected: (usize, usize, usize),
+        found: (usize, usize, usize),
+    },
+    /// A model in the baseline is missing from the fresh evaluation.
+    ModelMissing { model: Model },
+    /// A model appeared that the baseline has no entry for. Not a failure on its own - a new
+    /// forecaster is a legitimate addition - but reported so it is noticed rather than ignored.
+    ModelAdded { model: Model },
+}
+
+/// The outcome of comparing an evaluation against a baseline.
+#[derive(Debug, Clone, Serialize)]
+pub struct Verdict {
+    pub comparisons: Vec<ModelComparison>,
+    pub discrepancies: Vec<Discrepancy>,
+}
+
+impl Verdict {
+    /// Whether the gate passes.
+    ///
+    /// Fails on any breached metric, and on any discrepancy other than an added model. A changed
+    /// fixture or split is not evidence the model regressed, but it *is* evidence the comparison
+    /// cannot be trusted, and a gate that passes when it does not know the answer is worse than no
+    /// gate.
+    pub fn passed(&self) -> bool {
+        self.regressions().next().is_none() && !self.has_blocking_discrepancy()
+    }
+
+    /// Every metric that moved beyond tolerance, with the model it belongs to.
+    pub fn regressions(&self) -> impl Iterator<Item = (Model, &MetricDelta)> {
+        self.comparisons
+            .iter()
+            .flat_map(|c| c.breaches().map(move |d| (c.model, d)))
+    }
+
+    /// Whether any discrepancy invalidates the comparison.
+    pub fn has_blocking_discrepancy(&self) -> bool {
+        self.discrepancies
+            .iter()
+            .any(|d| !matches!(d, Discrepancy::ModelAdded { .. }))
+    }
+
+    /// The largest regression seen, for a one-line summary.
+    pub fn worst_regression(&self) -> Option<(Model, MetricDelta)> {
+        self.regressions()
+            .max_by(|(_, a), (_, b)| {
+                (a.regression - a.tolerance)
+                    .partial_cmp(&(b.regression - b.tolerance))
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .map(|(m, d)| (m, *d))
+    }
+}
+
+/// Compare a fresh evaluation against a recorded baseline.
+///
+/// `current_fixture_hash` is the hash of the bytes actually evaluated, so a mismatch against the
+/// baseline's recorded hash is detected here rather than assumed away.
+pub fn compare(
+    baseline: &SkillBaseline,
+    report: &SkillReport,
+    current_fixture_hash: &str,
+) -> Verdict {
+    let mut discrepancies = Vec::new();
+    if baseline.fixture_hash != current_fixture_hash {
+        discrepancies.push(Discrepancy::FixtureChanged {
+            expected: baseline.fixture_hash.clone(),
+            found: current_fixture_hash.to_string(),
+        });
+    }
+    let recorded_split = (baseline.train, baseline.validation, baseline.test);
+    let current_split = (report.train, report.validation, report.test);
+    if recorded_split != current_split {
+        discrepancies.push(Discrepancy::SplitChanged {
+            expected: recorded_split,
+            found: current_split,
+        });
+    }
+    for entry in &baseline.models {
+        if report.get(entry.model).is_none() {
+            discrepancies.push(Discrepancy::ModelMissing { model: entry.model });
+        }
+    }
+    for m in &report.models {
+        if baseline.get(m.model).is_none() {
+            discrepancies.push(Discrepancy::ModelAdded { model: m.model });
+        }
+    }
+
+    let t = baseline.tolerance;
+    let comparisons = baseline
+        .models
+        .iter()
+        .filter_map(|entry| {
+            let current = report.get(entry.model)?;
+            let mut deltas = vec![
+                // Losses: worse is larger.
+                MetricDelta {
+                    metric: "brier",
+                    baseline: entry.brier,
+                    current: current.brier,
+                    regression: current.brier - entry.brier,
+                    tolerance: t.brier,
+                },
+                MetricDelta {
+                    metric: "log_loss",
+                    baseline: entry.log_loss,
+                    current: current.log_loss,
+                    regression: current.log_loss - entry.log_loss,
+                    tolerance: t.log_loss,
+                },
+            ];
+            if let Some(tol) = t.accuracy {
+                // A score: worse is smaller, so the sign flips.
+                deltas.push(MetricDelta {
+                    metric: "accuracy",
+                    baseline: entry.accuracy,
+                    current: current.accuracy,
+                    regression: entry.accuracy - current.accuracy,
+                    tolerance: tol,
+                });
+            }
+            Some(ModelComparison {
+                model: entry.model,
+                deltas,
+            })
+        })
+        .collect();
+
+    Verdict {
+        comparisons,
+        discrepancies,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -225,6 +404,182 @@ mod tests {
             Tolerance::default(),
             "",
         )
+    }
+
+    /// A baseline over `report`, then a report with `model`'s metrics shifted by `delta` (positive =
+    /// worse), so a regression can be simulated without changing the model.
+    fn worsened(model: Model, delta: f64) -> (SkillBaseline, SkillReport) {
+        let r = report();
+        let b = SkillBaseline::record(&r, "f.csv", "H", Tolerance::default(), "");
+        let mut worse = r.clone();
+        for m in worse.models.iter_mut().filter(|m| m.model == model) {
+            m.brier += delta;
+            m.log_loss += delta;
+        }
+        (b, worse)
+    }
+
+    #[test]
+    fn an_unchanged_evaluation_passes() {
+        let r = report();
+        let b = SkillBaseline::record(&r, "f.csv", "H", Tolerance::default(), "");
+        let v = compare(&b, &r, "H");
+        assert!(v.passed(), "identical metrics must pass");
+        assert!(v.discrepancies.is_empty());
+        assert_eq!(v.regressions().count(), 0);
+        assert!(v.worst_regression().is_none());
+    }
+
+    #[test]
+    fn a_regression_beyond_tolerance_fails_and_names_the_model() {
+        let (b, worse) = worsened(Model::Ensemble, 0.01);
+        let v = compare(&b, &worse, "H");
+        assert!(!v.passed());
+        let (model, delta) = v.worst_regression().expect("a regression");
+        assert_eq!(model, Model::Ensemble, "the gate names the culprit");
+        assert!(delta.breached());
+        assert!(delta.regression > delta.tolerance);
+    }
+
+    #[test]
+    fn a_movement_inside_tolerance_passes() {
+        // Half the Brier tolerance: real but not worth failing a build over.
+        let (b, slightly_worse) = worsened(Model::Ensemble, 0.0009);
+        let v = compare(&b, &slightly_worse, "H");
+        assert!(
+            v.passed(),
+            "a sub-tolerance move must not fail: {:?}",
+            v.regressions().collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn an_improvement_passes_and_is_not_reported_as_a_regression() {
+        let (b, better) = worsened(Model::Ensemble, -0.05);
+        let v = compare(&b, &better, "H");
+        assert!(v.passed());
+        assert_eq!(v.regressions().count(), 0, "getting better is not a breach");
+        // The delta is still recorded, with a negative regression, so an improvement is visible.
+        let ens = v
+            .comparisons
+            .iter()
+            .find(|c| c.model == Model::Ensemble)
+            .unwrap();
+        assert!(ens.deltas.iter().all(|d| d.regression < 0.0));
+    }
+
+    #[test]
+    fn a_changed_fixture_blocks_rather_than_passing_or_blaming_the_model() {
+        let r = report();
+        let b = SkillBaseline::record(&r, "f.csv", "expected-hash", Tolerance::default(), "");
+        let v = compare(&b, &r, "different-hash");
+        assert!(!v.passed(), "an invalid comparison must not pass");
+        assert_eq!(v.regressions().count(), 0, "the model did not regress");
+        assert!(matches!(
+            v.discrepancies.first(),
+            Some(Discrepancy::FixtureChanged { .. })
+        ));
+    }
+
+    #[test]
+    fn a_changed_split_blocks() {
+        let r = report();
+        let mut b = SkillBaseline::record(&r, "f.csv", "H", Tolerance::default(), "");
+        b.test += 1;
+        let v = compare(&b, &r, "H");
+        assert!(!v.passed());
+        assert!(v
+            .discrepancies
+            .iter()
+            .any(|d| matches!(d, Discrepancy::SplitChanged { .. })));
+    }
+
+    #[test]
+    fn a_missing_model_blocks_but_a_new_one_does_not() {
+        let r = report();
+        let b = SkillBaseline::record(&r, "f.csv", "H", Tolerance::default(), "");
+
+        // Dropping a forecaster hides its skill, so it blocks.
+        let mut without_elo = r.clone();
+        without_elo.models.retain(|m| m.model != Model::Elo);
+        let v = compare(&b, &without_elo, "H");
+        assert!(!v.passed());
+        assert!(v
+            .discrepancies
+            .iter()
+            .any(|d| matches!(d, Discrepancy::ModelMissing { model } if *model == Model::Elo)));
+
+        // Adding one is a legitimate change, reported but not blocking.
+        let mut trimmed_baseline = b.clone();
+        trimmed_baseline.models.retain(|m| m.model != Model::Elo);
+        let v = compare(&trimmed_baseline, &r, "H");
+        assert!(v.passed(), "a new forecaster must not fail the gate");
+        assert!(v
+            .discrepancies
+            .iter()
+            .any(|d| matches!(d, Discrepancy::ModelAdded { model } if *model == Model::Elo)));
+    }
+
+    #[test]
+    fn accuracy_is_gated_only_when_a_tolerance_is_set() {
+        let r = report();
+        let mut worse = r.clone();
+        for m in worse.models.iter_mut() {
+            m.accuracy -= 0.10; // a big accuracy drop, metrics otherwise untouched
+        }
+
+        let ungated = SkillBaseline::record(&r, "f.csv", "H", Tolerance::default(), "");
+        assert!(
+            compare(&ungated, &worse, "H").passed(),
+            "accuracy is not gated by default"
+        );
+
+        let gated = SkillBaseline::record(
+            &r,
+            "f.csv",
+            "H",
+            Tolerance {
+                accuracy: Some(0.02),
+                ..Tolerance::default()
+            },
+            "",
+        );
+        let v = compare(&gated, &worse, "H");
+        assert!(!v.passed(), "an explicit accuracy tolerance is enforced");
+        assert!(v.regressions().any(|(_, d)| d.metric == "accuracy"));
+    }
+
+    #[test]
+    fn the_regression_sign_is_normalized_across_metrics() {
+        // Brier and log loss are losses; accuracy is a score. `regression` must be positive-is-worse
+        // for all three, or the comparison logic would have to remember which is which - the sort of
+        // asymmetry that makes a gate silently one-sided.
+        let r = report();
+        let mut changed = r.clone();
+        for m in changed.models.iter_mut() {
+            m.brier += 0.01; // worse
+            m.log_loss += 0.01; // worse
+            m.accuracy += 0.01; // better
+        }
+        let b = SkillBaseline::record(
+            &r,
+            "f.csv",
+            "H",
+            Tolerance {
+                accuracy: Some(0.02),
+                ..Tolerance::default()
+            },
+            "",
+        );
+        let v = compare(&b, &changed, "H");
+        let first = &v.comparisons[0];
+        let d = |name: &str| first.deltas.iter().find(|d| d.metric == name).unwrap();
+        assert!(d("brier").regression > 0.0, "a higher Brier is worse");
+        assert!(d("log_loss").regression > 0.0, "a higher log loss is worse");
+        assert!(
+            d("accuracy").regression < 0.0,
+            "a higher accuracy is better"
+        );
     }
 
     #[test]
