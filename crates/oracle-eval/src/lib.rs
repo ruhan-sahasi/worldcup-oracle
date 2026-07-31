@@ -20,8 +20,10 @@
 //!
 //! ## Module map
 //! - [`skill`] - fit on a dataset, score every forecaster out of sample
+//! - [`fixture`] - freeze a dataset to CSV so the gate's data stops being a function of the code
 #![forbid(unsafe_code)]
 
+pub mod fixture;
 pub mod skill;
 
 pub use skill::{evaluate, EvalConfig, EvalError, Model, ModelSkill, SkillReport, MIN_MATCHES};
