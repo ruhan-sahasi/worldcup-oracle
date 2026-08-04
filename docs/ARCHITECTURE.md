@@ -519,7 +519,7 @@ Consequently the record is reconstructible offline from the two durable files al
 `wc-oracle track-record --journal <j> --event-log <e>` scores it with no engine and no fitting,
 which is also what makes it auditable by someone who does not trust the running server.
 
-### On-demand explorer (`oracle-engine::query` + `oracle-api` + `static/explore.html`)
+### On-demand explorer (`oracle-engine::query` + `oracle-api` + `crates/oracle-api/static/explore.html`)
 The live `Engine` tracks one running tournament; the `Explorer` is its complement - a fit-once,
 read-only view that answers *ad-hoc* questions (predict any matchup, its HMC posterior credible
 interval, a custom Monte-Carlo run, the signal-sensitivity ablation, the ratings). It holds its own
