@@ -24,7 +24,7 @@ pub mod presets;
 pub mod query;
 mod snapshot;
 
-pub use event_log::EventLog;
+pub use event_log::{apply_results, EventLog};
 pub use forecast_journal::{
     settle, track_record, ForecastJournal, ForecastRecord, JournalScore, SettledForecast,
     TrackRecord, SCHEMA_VERSION,

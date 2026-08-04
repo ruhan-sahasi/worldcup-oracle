@@ -12,7 +12,7 @@
 
 use oracle_domain::{EventKind, MatchEvent, MatchId, Scoreline};
 use oracle_engine::{
-    settle, track_record, EventLog, ForecastJournal, ForecastRecord, ENSEMBLE_MODEL,
+    apply_results, settle, track_record, EventLog, ForecastJournal, ForecastRecord, ENSEMBLE_MODEL,
 };
 use oracle_ingest::data;
 
@@ -194,20 +194,7 @@ fn the_record_is_reconstructible_from_the_two_files_alone() {
     // Rebuild using only the files.
     let records = ForecastJournal::read(&journal_path).unwrap();
     let mut tournament = data::world_cup_2026();
-    let mut applied = 0;
-    for event in EventLog::read(&log_path).unwrap() {
-        if let EventKind::FullTime { score } = event.kind {
-            if let Some(m) = tournament
-                .matches
-                .iter_mut()
-                .find(|m| m.id == event.match_id)
-            {
-                m.status = oracle_domain::MatchStatus::Finished;
-                m.score = score;
-                applied += 1;
-            }
-        }
-    }
+    let applied = apply_results(&mut tournament, &EventLog::read(&log_path).unwrap());
     assert_eq!(applied, 6, "every logged result found its fixture");
 
     let settled = settle(&records, &tournament);
@@ -260,18 +247,7 @@ fn a_journal_and_log_that_disagree_settle_only_their_overlap() {
 
     let records = ForecastJournal::read(&journal_path).unwrap();
     let mut tournament = data::world_cup_2026();
-    for event in EventLog::read(&log_path).unwrap() {
-        if let EventKind::FullTime { score } = event.kind {
-            if let Some(m) = tournament
-                .matches
-                .iter_mut()
-                .find(|m| m.id == event.match_id)
-            {
-                m.status = oracle_domain::MatchStatus::Finished;
-                m.score = score;
-            }
-        }
-    }
+    apply_results(&mut tournament, &EventLog::read(&log_path).unwrap());
 
     let tr = track_record(&records, &tournament, 0);
     assert_eq!(tr.calls, 4, "four calls journaled");
