@@ -651,6 +651,11 @@ pub fn synthetic_history_with_market(n_matches: usize, seed: u64) -> Vec<MatchRe
 /// style CSV. Required columns: `HomeTeam, AwayTeam, FTHG, FTAG`. Optional Bet365 odds
 /// (`B365H, B365D, B365A`) populate the market line. Team names are interned to ids; rows
 /// are assumed oldest-first, so match age is taken from row order for the time decay.
+///
+/// # Errors
+/// If the file cannot be opened, its header cannot be read, or the four required columns are
+/// absent. Individual *rows* that cannot be parsed are skipped rather than failing the load, since
+/// real published datasets carry postponed and abandoned fixtures with blank scores.
 pub fn load_results_csv(path: impl AsRef<Path>) -> Result<Vec<MatchRecord>> {
     let mut reader = csv::ReaderBuilder::new()
         .flexible(true)

@@ -23,6 +23,11 @@ pub struct EventLog {
 
 impl EventLog {
     /// Open the log at `path` for appending, creating it if absent.
+    ///
+    /// # Errors
+    /// If the path cannot be opened for appending - a missing parent directory, or no write
+    /// permission. Worth propagating rather than defaulting to no log: an engine that silently ran
+    /// without its recovery record would look healthy right up to the restart that lost everything.
     pub fn create(path: impl AsRef<Path>) -> io::Result<Self> {
         let file = OpenOptions::new().create(true).append(true).open(path)?;
         Ok(Self {
@@ -31,6 +36,11 @@ impl EventLog {
     }
 
     /// Append one event as a JSON line and flush.
+    ///
+    /// # Errors
+    /// If serialization or the write fails. A failed append means this event is not in the recovery
+    /// record, so the caller has to decide whether to continue - which is why it is an `Err` and not
+    /// a panic.
     ///
     /// # Panics
     /// If the writer mutex is poisoned, i.e. a previous caller panicked mid-append. Failing loudly
@@ -47,6 +57,10 @@ impl EventLog {
 
     /// Read all events previously written to the log at `path` (oldest first). Malformed
     /// lines are skipped so a partially-written final line never blocks recovery.
+    ///
+    /// # Errors
+    /// If the file exists but cannot be read. A *missing* file is not an error - it is a first run,
+    /// and returns an empty log.
     pub fn read(path: impl AsRef<Path>) -> io::Result<Vec<MatchEvent>> {
         let file = match File::open(path) {
             Ok(f) => f,

@@ -110,6 +110,11 @@ impl ForecastJournal {
     ///
     /// Existing records are read first so their keys are known: a restart must recognise the calls
     /// it already published, or replaying the event log would duplicate every one of them.
+    ///
+    /// # Errors
+    /// If the existing journal cannot be read, or the path cannot be opened for appending. The read
+    /// failure matters most: opening without the prior keys would silently re-journal every call
+    /// already published, which is the one thing the journal must never do.
     pub fn create(path: impl AsRef<Path>) -> io::Result<Self> {
         let seen = Self::read(&path)?
             .into_iter()
@@ -134,6 +139,10 @@ impl ForecastJournal {
     ///
     /// First write wins rather than last, because the first call is the one that was made without
     /// knowing the result. A later one is at best a recomputation and at worst contaminated.
+    ///
+    /// # Errors
+    /// If the underlying write fails; see [`append`](Self::append). A refused duplicate is `Ok(false)`
+    /// rather than an error, since it is the ordinary replay case and not a failure.
     ///
     /// # Panics
     /// If either internal mutex is poisoned; see [`append`](Self::append).
@@ -172,6 +181,9 @@ impl ForecastJournal {
     /// Prefer [`append_if_new`](Self::append_if_new); this is the lower-level write and does not
     /// enforce first-write-wins.
     ///
+    /// # Errors
+    /// If serialization or the write fails, leaving the call absent from the record.
+    ///
     /// # Panics
     /// If the writer mutex is poisoned, i.e. a previous caller panicked mid-append. Failing loudly
     /// matches [`EventLog::append`](crate::EventLog::append) and for the same reason: continuing to
@@ -201,6 +213,10 @@ impl ForecastJournal {
     ///
     /// Skipping is silent by necessity here, which is why [`read_reporting`](Self::read_reporting)
     /// exists: the count is the only evidence that part of the record did not load.
+    ///
+    /// # Errors
+    /// If the file exists but cannot be read. A missing journal is not an error - it is a first run,
+    /// and reads as empty.
     pub fn read(path: impl AsRef<Path>) -> io::Result<Vec<ForecastRecord>> {
         Ok(Self::read_reporting(path)?.0)
     }
@@ -209,6 +225,9 @@ impl ForecastJournal {
     ///
     /// Splitting this out keeps the common path simple while letting the engine log the fact that a
     /// journal was partially unreadable, rather than that fact vanishing.
+    ///
+    /// # Errors
+    /// If the file exists but cannot be read; see [`read`](Self::read).
     pub fn read_reporting(path: impl AsRef<Path>) -> io::Result<(Vec<ForecastRecord>, usize)> {
         let file = match File::open(path) {
             Ok(f) => f,
