@@ -178,6 +178,11 @@ pub fn router(engine: Arc<Engine>, explorer: ExplorerSlot) -> Router {
 /// platform-as-a-service convention: Render, Heroku, and friends inject it), then an explicit
 /// `$ORACLE_ADDR`, then the default `0.0.0.0:8080`. Pass the raw env values in (so it stays pure
 /// and testable).
+///
+/// # Errors
+/// If the chosen value is not a parseable socket address. Deliberately fatal rather than falling
+/// back to the default: a deploy that set `$PORT` to something unparseable wanted a specific port,
+/// and quietly binding 8080 instead would present as the platform failing to route traffic.
 pub fn resolve_listen_addr(
     port: Option<String>,
     oracle_addr: Option<String>,
@@ -191,6 +196,10 @@ pub fn resolve_listen_addr(
 }
 
 /// Serve the API until `shutdown` resolves (graceful shutdown).
+///
+/// # Errors
+/// If the address cannot be bound - already in use, or not permitted - or the server exits with an
+/// error. A clean shutdown via `shutdown` is `Ok`.
 pub async fn serve<F>(
     engine: Arc<Engine>,
     explorer: ExplorerSlot,

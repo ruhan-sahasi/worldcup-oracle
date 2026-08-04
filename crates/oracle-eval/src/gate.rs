@@ -156,6 +156,11 @@ impl SkillBaseline {
     /// deserialize, so it would load looking valid while dropping whatever the newer version added -
     /// a stricter rule, an extra gated metric - and the gate would pass on a comparison it did not
     /// fully understand.
+    ///
+    /// # Errors
+    /// [`GateError::Malformed`] if the text is not valid baseline JSON, or
+    /// [`GateError::FutureSchema`] if it was written by a newer build. Both mean the comparison
+    /// cannot be made, which is deliberately distinct from the comparison failing.
     pub fn from_json(text: &str) -> Result<Self, GateError> {
         let parsed: Self =
             serde_json::from_str(text).map_err(|e| GateError::Malformed(e.to_string()))?;
@@ -169,6 +174,11 @@ impl SkillBaseline {
     }
 
     /// Load a baseline from disk.
+    ///
+    /// # Errors
+    /// [`GateError::Io`] if the file cannot be read - including when it does not exist, since a gate
+    /// with no baseline cannot reach a verdict and must say so rather than pass. Otherwise as
+    /// [`from_json`](Self::from_json).
     pub fn load(path: impl AsRef<std::path::Path>) -> Result<Self, GateError> {
         let text = std::fs::read_to_string(path).map_err(|e| GateError::Io(e.to_string()))?;
         Self::from_json(&text)

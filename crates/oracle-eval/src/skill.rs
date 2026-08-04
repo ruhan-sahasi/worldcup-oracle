@@ -180,6 +180,11 @@ impl std::error::Error for EvalError {}
 /// Deterministic given the same records and config - no randomness is involved anywhere in the fit
 /// or the scoring - which is what lets a regression gate compare two runs and attribute any
 /// difference to the model rather than to chance.
+///
+/// # Errors
+/// [`EvalError::TooFewMatches`] if there are fewer than [`MIN_MATCHES`] rows. Below that the
+/// three-way split leaves a test set too small for its metrics to mean anything, and returning
+/// confident numbers over a handful of matches would be worse than refusing.
 pub fn evaluate(records: &[MatchRecord], config: EvalConfig) -> Result<SkillReport, EvalError> {
     if records.len() < MIN_MATCHES {
         return Err(EvalError::TooFewMatches {
