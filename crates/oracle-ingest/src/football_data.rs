@@ -365,7 +365,7 @@ struct ApiGoals {
 }
 
 impl ApiMatch {
-    /// The group letter, e.g. "GROUP_A" → 'A'.
+    /// The group letter, e.g. "`GROUP_A`" → 'A'.
     fn group_letter(&self) -> Option<char> {
         self.group.as_ref().and_then(|g| g.chars().last())
     }

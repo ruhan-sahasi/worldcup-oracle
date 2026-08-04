@@ -30,6 +30,9 @@ missing_panics_doc = "warn"
 # propagate or handle needs that, and reading the body to work it out is how a caller ends up
 # handling the wrong thing. Most of the value here is in documenting what is *not* an error.
 missing_errors_doc = "warn"
+# Code identifiers in doc comments belong in backticks. Small, but rustdoc renders an unbackticked
+# type name as prose, so the reader loses the signal that it is a thing they can go and look at.
+doc_markdown = "warn"
 
 [workspace.dependencies]
 # ---- internal crates ----
