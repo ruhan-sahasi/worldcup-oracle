@@ -26,6 +26,10 @@ todo = "warn"
 # cannot fire from outside; documenting them is how a reader tells those apart from the ones a
 # caller can actually trigger.
 missing_panics_doc = "warn"
+# And a public function that can fail has to say what the failure means. A caller deciding whether to
+# propagate or handle needs that, and reading the body to work it out is how a caller ends up
+# handling the wrong thing. Most of the value here is in documenting what is *not* an error.
+missing_errors_doc = "warn"
 
 [workspace.dependencies]
 # ---- internal crates ----
