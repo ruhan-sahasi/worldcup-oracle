@@ -1,7 +1,7 @@
 //! `oracle-server` - standalone binary that boots the engine and serves the API.
 //!
 //! Picks the live football-data.org feed when `FOOTBALL_DATA_API_KEY` is set,
-//! otherwise runs the deterministic simulation. Listen address comes from `$PORT` (the PaaS
+//! otherwise runs the deterministic simulation. Listen address comes from `$PORT` (the `PaaS`
 //! convention), else `$ORACLE_ADDR`, else `0.0.0.0:8080`.
 
 use tokio_util::sync::CancellationToken;

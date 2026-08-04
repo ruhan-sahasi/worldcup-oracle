@@ -118,6 +118,11 @@ pub fn content_hash(bytes: &[u8]) -> String {
 /// Both together, because the gate needs them together: records to evaluate, hash to prove which
 /// dataset was evaluated. Reading the file once for both also removes the chance of hashing one
 /// version and scoring another.
+///
+/// # Errors
+/// If the file cannot be read, or its contents are not a CSV with the required columns. Unlike the
+/// underlying loader a missing file *is* an error here: a fixture is a committed artifact, so its
+/// absence means the checkout is wrong rather than that there is nothing to evaluate yet.
 pub fn load(path: impl AsRef<std::path::Path>) -> std::io::Result<(Vec<MatchRecord>, String)> {
     let path = path.as_ref();
     let bytes = std::fs::read(path)?;

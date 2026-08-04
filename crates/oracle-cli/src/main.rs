@@ -573,7 +573,9 @@ fn cmd_track_record(
     // happened. Replaying only the full-time events is enough to settle calls, and needs no model.
     let mut tournament = data::world_cup_2026();
     let results = match event_log {
-        Some(log) => apply_logged_results(&mut tournament, log)?,
+        Some(log) => {
+            oracle_engine::apply_results(&mut tournament, &oracle_engine::EventLog::read(log)?)
+        }
         None => 0,
     };
     let tr = oracle_engine::track_record(&records, &tournament, unreadable);
@@ -674,33 +676,6 @@ fn cmd_track_record(
         );
     }
     Ok(())
-}
-
-/// Mark every match the event log reports a full-time score for as finished, and return how many.
-///
-/// Deliberately the smallest possible replay: only `FullTime` events are read, and no model is
-/// touched. Settling a journaled call needs the result and nothing else, and reconstructing engine
-/// state here would reintroduce exactly the recomputation the journal exists to avoid.
-fn apply_logged_results(
-    tournament: &mut oracle_domain::Tournament,
-    path: &std::path::Path,
-) -> anyhow::Result<usize> {
-    use oracle_domain::{EventKind, MatchStatus};
-    let mut applied = 0usize;
-    for event in oracle_engine::EventLog::read(path)? {
-        if let EventKind::FullTime { score } = event.kind {
-            if let Some(m) = tournament
-                .matches
-                .iter_mut()
-                .find(|m| m.id == event.match_id)
-            {
-                m.status = MatchStatus::Finished;
-                m.score = score;
-                applied += 1;
-            }
-        }
-    }
-    Ok(applied)
 }
 
 /// Fit the baseline goal model, strength-seeded Elo store, and the learned ensemble.

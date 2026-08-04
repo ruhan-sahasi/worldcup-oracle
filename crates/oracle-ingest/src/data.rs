@@ -651,6 +651,11 @@ pub fn synthetic_history_with_market(n_matches: usize, seed: u64) -> Vec<MatchRe
 /// style CSV. Required columns: `HomeTeam, AwayTeam, FTHG, FTAG`. Optional Bet365 odds
 /// (`B365H, B365D, B365A`) populate the market line. Team names are interned to ids; rows
 /// are assumed oldest-first, so match age is taken from row order for the time decay.
+///
+/// # Errors
+/// If the file cannot be opened, its header cannot be read, or the four required columns are
+/// absent. Individual *rows* that cannot be parsed are skipped rather than failing the load, since
+/// real published datasets carry postponed and abandoned fixtures with blank scores.
 pub fn load_results_csv(path: impl AsRef<Path>) -> Result<Vec<MatchRecord>> {
     let mut reader = csv::ReaderBuilder::new()
         .flexible(true)
@@ -742,9 +747,6 @@ pub fn load_results_csv(path: impl AsRef<Path>) -> Result<Vec<MatchRecord>> {
 /// round. `summer_high_c` is a typical June/July afternoon high, used with the kickoff hour to
 /// model match-time heat.
 struct Venue {
-    /// Host city, kept for readability of the venue table (not used in the adjustment math).
-    #[allow(dead_code)]
-    city: &'static str,
     country: &'static str,
     altitude_m: f64,
     lat: f64,
@@ -755,7 +757,7 @@ struct Venue {
 
 const VENUES: &[Venue] = &[
     Venue {
-        city: "Mexico City",
+        // Mexico City
         country: "MEX",
         altitude_m: 2240.0,
         lat: 19.43,
@@ -764,7 +766,7 @@ const VENUES: &[Venue] = &[
         summer_high_c: 24.0,
     },
     Venue {
-        city: "Guadalajara",
+        // Guadalajara
         country: "MEX",
         altitude_m: 1566.0,
         lat: 20.67,
@@ -773,7 +775,7 @@ const VENUES: &[Venue] = &[
         summer_high_c: 30.0,
     },
     Venue {
-        city: "Monterrey",
+        // Monterrey
         country: "MEX",
         altitude_m: 540.0,
         lat: 25.69,
@@ -782,7 +784,7 @@ const VENUES: &[Venue] = &[
         summer_high_c: 35.0,
     },
     Venue {
-        city: "Denver",
+        // Denver
         country: "USA",
         altitude_m: 1609.0,
         lat: 39.74,
@@ -791,7 +793,7 @@ const VENUES: &[Venue] = &[
         summer_high_c: 31.0,
     },
     Venue {
-        city: "Atlanta",
+        // Atlanta
         country: "USA",
         altitude_m: 320.0,
         lat: 33.75,
@@ -800,7 +802,7 @@ const VENUES: &[Venue] = &[
         summer_high_c: 31.0,
     },
     Venue {
-        city: "Dallas",
+        // Dallas
         country: "USA",
         altitude_m: 130.0,
         lat: 32.78,
@@ -809,7 +811,7 @@ const VENUES: &[Venue] = &[
         summer_high_c: 36.0,
     },
     Venue {
-        city: "Kansas City",
+        // Kansas City
         country: "USA",
         altitude_m: 270.0,
         lat: 39.10,
@@ -818,7 +820,7 @@ const VENUES: &[Venue] = &[
         summer_high_c: 32.0,
     },
     Venue {
-        city: "Los Angeles",
+        // Los Angeles
         country: "USA",
         altitude_m: 93.0,
         lat: 34.05,
@@ -827,7 +829,7 @@ const VENUES: &[Venue] = &[
         summer_high_c: 28.0,
     },
     Venue {
-        city: "New York",
+        // New York
         country: "USA",
         altitude_m: 10.0,
         lat: 40.71,
@@ -836,7 +838,7 @@ const VENUES: &[Venue] = &[
         summer_high_c: 29.0,
     },
     Venue {
-        city: "Miami",
+        // Miami
         country: "USA",
         altitude_m: 2.0,
         lat: 25.76,
@@ -845,7 +847,7 @@ const VENUES: &[Venue] = &[
         summer_high_c: 32.0,
     },
     Venue {
-        city: "Toronto",
+        // Toronto
         country: "CAN",
         altitude_m: 76.0,
         lat: 43.65,
@@ -854,7 +856,7 @@ const VENUES: &[Venue] = &[
         summer_high_c: 27.0,
     },
     Venue {
-        city: "Vancouver",
+        // Vancouver
         country: "CAN",
         altitude_m: 4.0,
         lat: 49.28,

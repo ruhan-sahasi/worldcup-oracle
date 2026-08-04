@@ -19,7 +19,6 @@
 //! is moving the bar *silently*: updating a baseline is an explicit command that rewrites a tracked
 //! file and shows up in review as a diff of the numbers being claimed.
 
-use crate::fixture;
 use crate::skill::{Model, SkillReport};
 use serde::{Deserialize, Serialize};
 
@@ -44,7 +43,7 @@ pub struct SkillBaseline {
     /// The fixture this was measured on, as a repo-relative path, for the error message when a
     /// mismatch is found.
     pub fixture: String,
-    /// [`fixture::content_hash`] of that file's bytes. A mismatch means the comparison is invalid,
+    /// [`crate::fixture::content_hash`] of that file's bytes. A mismatch means the comparison is invalid,
     /// not that the model regressed.
     pub fixture_hash: String,
     /// Matches in each split, recorded so a changed split is caught as a distinct problem from a
@@ -157,6 +156,11 @@ impl SkillBaseline {
     /// deserialize, so it would load looking valid while dropping whatever the newer version added -
     /// a stricter rule, an extra gated metric - and the gate would pass on a comparison it did not
     /// fully understand.
+    ///
+    /// # Errors
+    /// [`GateError::Malformed`] if the text is not valid baseline JSON, or
+    /// [`GateError::FutureSchema`] if it was written by a newer build. Both mean the comparison
+    /// cannot be made, which is deliberately distinct from the comparison failing.
     pub fn from_json(text: &str) -> Result<Self, GateError> {
         let parsed: Self =
             serde_json::from_str(text).map_err(|e| GateError::Malformed(e.to_string()))?;
@@ -170,6 +174,11 @@ impl SkillBaseline {
     }
 
     /// Load a baseline from disk.
+    ///
+    /// # Errors
+    /// [`GateError::Io`] if the file cannot be read - including when it does not exist, since a gate
+    /// with no baseline cannot reach a verdict and must say so rather than pass. Otherwise as
+    /// [`from_json`](Self::from_json).
     pub fn load(path: impl AsRef<std::path::Path>) -> Result<Self, GateError> {
         let text = std::fs::read_to_string(path).map_err(|e| GateError::Io(e.to_string()))?;
         Self::from_json(&text)
@@ -203,11 +212,6 @@ impl std::fmt::Display for GateError {
 }
 
 impl std::error::Error for GateError {}
-
-/// Hash a fixture's bytes the way a baseline records it.
-pub fn fixture_hash(bytes: &[u8]) -> String {
-    fixture::content_hash(bytes)
-}
 
 /// How one metric moved against its recorded value.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize)]

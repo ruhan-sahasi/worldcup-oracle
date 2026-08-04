@@ -8,7 +8,7 @@
 //!
 //! The prediction crates each need the same small pieces of mathematics: a Poisson mass function, a
 //! normal CDF, a reproducible stream of random numbers. Those pieces are individually short enough
-//! that writing them inline is tempting, and the workspace duly grew five copies of SplitMix64,
+//! that writing them inline is tempting, and the workspace duly grew five copies of `SplitMix64`,
 //! three of the Poisson mass, and two of the `erf` approximation. Copies of numerics are worse than
 //! copies of ordinary code: each one is a place where a tolerance can drift out of step with the
 //! test that guards it, and a bug fixed in one is silently still live in the other four.
@@ -18,7 +18,7 @@
 //! costs a crate nothing.
 //!
 //! ## Module map
-//! - [`rng`] - the seeded SplitMix64 generator ([`Rng`]) with uniform, normal, and Poisson draws
+//! - [`rng`] - the seeded `SplitMix64` generator ([`Rng`]) with uniform, normal, and Poisson draws
 //! - [`dist`] - discrete probability masses and the log-space special functions behind them
 //! - [`normal`] - the Gaussian density and CDF, and the `erf` approximation under them
 

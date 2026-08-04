@@ -1,17 +1,17 @@
 //! The workspace's single pseudo-random generator.
 
-/// The SplitMix64 increment: the odd 64-bit fraction of the golden ratio, which is what gives the
+/// The `SplitMix64` increment: the odd 64-bit fraction of the golden ratio, which is what gives the
 /// generator its equidistribution.
 const GOLDEN_GAMMA: u64 = 0x9E37_79B9_7F4A_7C15;
 
-/// A small, fast, fully seeded pseudo-random generator (SplitMix64).
+/// A small, fast, fully seeded pseudo-random generator (`SplitMix64`).
 ///
 /// Every Monte-Carlo path in the oracle - tournament draws, in-play match simulation, Golden Boot
 /// races, HMC momentum, bootstrap resampling - is driven from one of these, because reproducibility
 /// is a correctness property here: a forecast we cannot regenerate is a forecast we cannot debug.
 /// Given a seed, the stream is exactly reproducible across platforms and across runs.
 ///
-/// SplitMix64 is chosen for three reasons: it is a single `u64` of state (cheap to clone per
+/// `SplitMix64` is chosen for three reasons: it is a single `u64` of state (cheap to clone per
 /// worker), it needs no warm-up or seeding ceremony (any seed, including zero, gives a good
 /// stream), and it is short enough to read and verify in place. It is emphatically **not**
 /// cryptographic - it is a simulation generator, and the state is recoverable from a few outputs.
@@ -42,7 +42,7 @@ impl Rng {
     /// untouched by a change draws exactly the same numbers either way, and the difference
     /// isolates the change.
     ///
-    /// The mixing is SplitMix64's finalizer applied to each coordinate in turn, which is a
+    /// The mixing is `SplitMix64`'s finalizer applied to each coordinate in turn, which is a
     /// deliberately cheap choice: a substream costs a few multiplications, so keying per match or
     /// per team is affordable inside the innermost simulation loop.
     pub fn stream(seed: u64, kind: u32, index: u64) -> Self {
@@ -52,7 +52,7 @@ impl Rng {
         Self { state }
     }
 
-    /// SplitMix64's finalizing avalanche: every input bit affects every output bit.
+    /// `SplitMix64`'s finalizing avalanche: every input bit affects every output bit.
     fn mix(mut z: u64) -> u64 {
         z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
         z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);

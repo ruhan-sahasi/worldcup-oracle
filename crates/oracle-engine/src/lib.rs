@@ -24,7 +24,7 @@ pub mod presets;
 pub mod query;
 mod snapshot;
 
-pub use event_log::EventLog;
+pub use event_log::{apply_results, EventLog};
 pub use forecast_journal::{
     settle, track_record, ForecastJournal, ForecastRecord, JournalScore, SettledForecast,
     TrackRecord, SCHEMA_VERSION,
@@ -233,6 +233,12 @@ impl Engine {
 /// Start the engine: load the tournament, compute an initial forecast, then spawn the
 /// data source and the event loop. Returns the shared handle and the loop's join
 /// handle (which completes when the feed ends or `cancel` fires).
+///
+/// # Errors
+/// If the provider cannot load a tournament, or a configured event log or forecast journal cannot be
+/// opened. All three are startup preconditions rather than recoverable states: an engine with no
+/// tournament has nothing to forecast, and one that silently ran without its durable records would
+/// look healthy until the restart that revealed it had kept nothing.
 pub async fn spawn(
     deps: EngineDeps,
     config: EngineConfig,

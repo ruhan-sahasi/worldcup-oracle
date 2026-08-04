@@ -1,6 +1,6 @@
 # Architecture
 
-`worldcup-oracle` is a Cargo **workspace** of thirteen focused crates. Dependencies flow
+`worldcup-oracle` is a Cargo **workspace** of fourteen focused crates. Dependencies flow
 strictly downhill from a zero-dependency numerics floor and a zero-I/O domain core, so the
 prediction math, the data sources, and the transport layers can each change without
 disturbing the others.
@@ -21,16 +21,20 @@ graph TD
     derivatives[oracle-derivatives<br/>totals · handicap · correct score]
     engine[oracle-engine<br/>event loop · pub/sub]
     api[oracle-api<br/>axum REST + WS]
+    eval[oracle-eval<br/>skill evaluation · regression gate]
     cli[oracle-cli<br/>wc-oracle + TUI]
 
     ratings --> numeric
     ratings --> domain
     model --> numeric
     model --> domain
+    sim --> numeric
     sim --> domain
     sim --> model
+    ingest --> numeric
     ingest --> domain
     ingest --> model
+    ingest --> ratings
     market --> domain
     players --> numeric
     live --> numeric
@@ -45,14 +49,23 @@ graph TD
     engine --> players
     engine --> live
     engine --> derivatives
+    eval --> domain
+    eval --> model
+    eval --> ratings
+    eval --> ingest
+    api --> domain
     api --> engine
     api --> market
     api --> players
     api --> derivatives
     cli --> engine
     cli --> api
-    cli --> market
+    cli --> eval
 ```
+
+The CLI's edges are abbreviated: it also depends directly on `oracle-domain`, `oracle-ratings`,
+`oracle-model`, `oracle-sim`, `oracle-ingest` and `oracle-market`, which would add nine lines and no
+information. Every other crate's edges are complete.
 
 There are two roots. `oracle-domain` depends on nothing but `serde`/`chrono`, and
 `oracle-numeric` depends on nothing at all - not even `serde`. Everything points *at* them;
@@ -419,7 +432,7 @@ always training, the rest is split into `N` consecutive future blocks, and each 
 goal model, Elo, and the ensemble on everything *before* its block (so there is never any
 look-ahead) and predicts the block. The out-of-fold predictions are pooled and each model's Brier
 and log-loss are reported with a **bootstrap 95% confidence interval** - resampling driven by a
-seeded SplitMix64 generator, so the intervals are reproducible with no `rand` dependency.
+seeded generator from `oracle-numeric`, so the intervals are reproducible.
 Non-overlapping intervals are the honest test of whether a change is a real improvement or within
 noise; it is also the instrument that makes future model overhauls measurable rather than
 eyeballed.
@@ -451,7 +464,7 @@ goal rates (current score plus remaining Poisson goals, prorated by time left), 
 timeline into a live win-probability path, and prices the exchange tools a trader uses: the hedge
 stake and locked profit, and cash-out value. On top it backtests trading the pre-match favourite in
 play (cash out at a profit target or stop, or hold) over many seeded matches against a
-hold-to-settlement baseline, with its own SplitMix64 generator so it carries no `rand` dependency.
+hold-to-settlement baseline, drawing from `oracle-numeric`'s shared seeded generator.
 `Explorer::inplay_backtest` supplies the goal model's expected goals and returns the study, surfaced
 on `/api/inplay`, the explorer's In-play tab, and `wc-oracle in-play`. At fair odds neither approach
 has an edge, so the honest conclusion is that cash-out reshapes the P&L distribution rather than
@@ -506,7 +519,7 @@ Consequently the record is reconstructible offline from the two durable files al
 `wc-oracle track-record --journal <j> --event-log <e>` scores it with no engine and no fitting,
 which is also what makes it auditable by someone who does not trust the running server.
 
-### On-demand explorer (`oracle-engine::query` + `oracle-api` + `static/explore.html`)
+### On-demand explorer (`oracle-engine::query` + `oracle-api` + `crates/oracle-api/static/explore.html`)
 The live `Engine` tracks one running tournament; the `Explorer` is its complement - a fit-once,
 read-only view that answers *ad-hoc* questions (predict any matchup, its HMC posterior credible
 interval, a custom Monte-Carlo run, the signal-sensitivity ablation, the ratings). It holds its own

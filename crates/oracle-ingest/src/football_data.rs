@@ -50,6 +50,10 @@ pub struct FootballDataProvider {
 impl FootballDataProvider {
     /// Construct from the `FOOTBALL_DATA_API_KEY` env var, targeting the World Cup
     /// competition (`WC`).
+    ///
+    /// # Errors
+    /// If that variable is unset. Deliberately not falling back to a keyless request, which would
+    /// fail later against the live API with a much less obvious message.
     pub fn from_env() -> Result<Self> {
         let api_key = std::env::var(ENV_KEY).map_err(|_| IngestError::MissingConfig(ENV_KEY))?;
         Ok(Self::new(api_key, "WC"))
@@ -361,7 +365,7 @@ struct ApiGoals {
 }
 
 impl ApiMatch {
-    /// The group letter, e.g. "GROUP_A" → 'A'.
+    /// The group letter, e.g. "`GROUP_A`" → 'A'.
     fn group_letter(&self) -> Option<char> {
         self.group.as_ref().and_then(|g| g.chars().last())
     }
