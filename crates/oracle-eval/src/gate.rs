@@ -19,7 +19,6 @@
 //! is moving the bar *silently*: updating a baseline is an explicit command that rewrites a tracked
 //! file and shows up in review as a diff of the numbers being claimed.
 
-use crate::fixture;
 use crate::skill::{Model, SkillReport};
 use serde::{Deserialize, Serialize};
 
@@ -44,7 +43,7 @@ pub struct SkillBaseline {
     /// The fixture this was measured on, as a repo-relative path, for the error message when a
     /// mismatch is found.
     pub fixture: String,
-    /// [`fixture::content_hash`] of that file's bytes. A mismatch means the comparison is invalid,
+    /// [`crate::fixture::content_hash`] of that file's bytes. A mismatch means the comparison is invalid,
     /// not that the model regressed.
     pub fixture_hash: String,
     /// Matches in each split, recorded so a changed split is caught as a distinct problem from a
@@ -203,11 +202,6 @@ impl std::fmt::Display for GateError {
 }
 
 impl std::error::Error for GateError {}
-
-/// Hash a fixture's bytes the way a baseline records it.
-pub fn fixture_hash(bytes: &[u8]) -> String {
-    fixture::content_hash(bytes)
-}
 
 /// How one metric moved against its recorded value.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize)]

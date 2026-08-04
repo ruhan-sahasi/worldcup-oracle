@@ -92,16 +92,6 @@ impl ForecastRecord {
             made_at: Utc::now(),
         }
     }
-
-    /// The identity of a call: one forecast per match per model.
-    ///
-    /// This is what makes the journal immutable in practice. A match is journaled when its result
-    /// lands, and a replay of the event log walks that same result again - so without a key to
-    /// deduplicate on, every restart would append another copy of every call and quietly multiply
-    /// the sample the scores are computed over.
-    pub fn key(&self) -> (MatchId, &str) {
-        (self.match_id, self.model.as_str())
-    }
 }
 
 /// An append-only, newline-delimited-JSON journal of published forecasts.
@@ -481,25 +471,6 @@ mod tests {
         let r: ForecastRecord = serde_json::from_str(line).unwrap();
         assert_eq!(r.schema, 1);
         assert_eq!(r.match_id, MatchId(7));
-    }
-
-    #[test]
-    fn the_key_is_the_match_and_the_model() {
-        let a = sample();
-        let mut b = sample();
-        b.model = "Bradley-Terry".to_string();
-        assert_ne!(a.key(), b.key(), "two models are two distinct calls");
-
-        let mut c = sample();
-        c.match_id = MatchId(43);
-        assert_ne!(a.key(), c.key(), "two matches are two distinct calls");
-
-        // The forecast and the timestamp are not part of the identity: a second call for the same
-        // match and model is the *same* call, however it was computed or whenever it arrived.
-        let mut d = sample();
-        d.forecast = Probabilities::uniform();
-        d.made_at = Utc::now();
-        assert_eq!(a.key(), d.key());
     }
 
     #[test]
