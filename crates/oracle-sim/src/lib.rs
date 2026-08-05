@@ -151,6 +151,9 @@ pub struct SimConfig {
     /// Log-attack penalty carried into a survivor's next knockout tie when its previous tie went
     /// to extra time (a within-tournament fatigue state). 0 disables the carry-over.
     pub ko_fatigue_penalty: f64,
+    /// How the per-iteration team strength shocks are correlated. Defaults to the independence the
+    /// simulator has always assumed, so an unconfigured forecast is unchanged.
+    pub shocks: ShockModel,
 }
 
 impl Default for SimConfig {
@@ -164,6 +167,7 @@ impl Default for SimConfig {
             shootout_skill: 0.10,
             rating_uncertainty: 1.0,
             ko_fatigue_penalty: KO_FATIGUE_PENALTY,
+            shocks: ShockModel::default(),
         }
     }
 }
@@ -505,6 +509,8 @@ struct Prepared {
     dispersion: f64,
     /// Per-team log-space strength SD (indexed by team-index), resampled each iteration.
     team_sigma: Vec<f64>,
+    /// How those per-team shocks are correlated with each other and across attack/defence.
+    shocks: ShockModel,
     /// Per-team penalty-shootout skill (indexed by team-index); tilts the shootout coin flip.
     shootout_rating: Vec<f64>,
     /// Per-team knockout pedigree (indexed by team-index); a knockout-only log-rate tilt.
@@ -582,7 +588,8 @@ struct RemainingMatch {
 /// subtraction. A shared factor only does anything if it is **antisymmetric** - attack up and
 /// defence down - which is exactly a high-scoring tournament. So the two knobs are doing genuinely
 /// different work rather than being two dials on the same effect.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct ShockModel {
     /// Correlation between a team's own attack and defence shocks, in `[-1, 1]`.
     ///
@@ -642,6 +649,8 @@ impl ShockModel {
 mod stream_kind {
     pub const ITERATION: u32 = 0;
     pub const TEAM_STRENGTH: u32 = 1;
+    /// The tournament-wide scoring environment: one draw per iteration, shared by every team.
+    pub const ENVIRONMENT: u32 = 4;
     pub const GROUP_MATCH: u32 = 2;
     pub const KO_TIE: u32 = 3;
 }
@@ -680,6 +689,11 @@ impl Streams {
             stream_kind::TEAM_STRENGTH,
             team_ix as u64,
         )
+    }
+
+    /// The stream for this iteration's single shared scoring-environment draw.
+    fn environment(&self) -> Rng {
+        Rng::stream(self.iteration_seed, stream_kind::ENVIRONMENT, 0)
     }
 
     /// The stream for one group fixture's goal draws this iteration.
@@ -952,6 +966,7 @@ impl Prepared {
             shootout_skill: config.shootout_skill,
             dispersion: sampler.dispersion().max(0.0),
             team_sigma,
+            shocks: config.shocks.sanitized(),
             shootout_rating,
             ko_pedigree,
             ko_fatigue_penalty: config.ko_fatigue_penalty,
@@ -1134,13 +1149,60 @@ impl Prepared {
         if !self.has_uncertainty {
             return (vec![0.0; self.n], vec![0.0; self.n]);
         }
+        let shocks = self.shocks;
+        // The independent path is kept separate rather than falling out of the general formula with
+        // zero parameters. Two reasons: it consumes exactly the draws it always did, so a default
+        // forecast stays bit-identical to every one published before this; and it skips the shared
+        // draw entirely, so the common case pays nothing for a feature it is not using.
+        if shocks.is_independent() {
+            let mut att = vec![0.0; self.n];
+            let mut def = vec![0.0; self.n];
+            for (i, &sigma) in self.team_sigma.iter().enumerate() {
+                if sigma > 0.0 {
+                    let mut rng = streams.team_strength(i);
+                    att[i] = sigma * rng.normal();
+                    def[i] = sigma * rng.normal();
+                }
+            }
+            return (att, def);
+        }
+
+        // ---- The factor model ----
+        //
+        // Each team's pair of shocks is built from a shared draw and two of its own:
+        //
+        //     att[i] = sigma_i * (  sqrt(w) * G + sqrt(1 - w) * a_i )
+        //     def[i] = sigma_i * ( -sqrt(w) * G + sqrt(1 - w) * d_i )
+        //
+        // where `G` is one standard normal for the whole tournament, `a_i` and `d_i` are the team's
+        // own standard normals correlated at `rho` by a 2x2 Cholesky factor, and `w` is the share of
+        // variance the shared factor carries.
+        //
+        // The `sqrt(w)` / `sqrt(1 - w)` split is what keeps each team's *marginal* shock variance at
+        // `sigma_i^2` however the correlation is configured. Without it, adding a factor would
+        // silently make every team more uncertain than its fitted rating says - a change to the
+        // model's confidence disguised as a change to its correlation structure.
+        //
+        // `G` enters attack positively and defence negatively because the rate is
+        // `exp(att[a] - def[b])`: a factor that raised both would cancel in the subtraction and do
+        // nothing at all. Antisymmetric, it reads as a high-scoring tournament for everyone.
+        let w = shocks.environment;
+        let (shared, own) = (w.sqrt(), (1.0 - w).sqrt());
+        let rho = shocks.attack_defence;
+        let rho_c = (1.0 - rho * rho).max(0.0).sqrt();
+        let g = streams.environment().normal();
+
         let mut att = vec![0.0; self.n];
         let mut def = vec![0.0; self.n];
         for (i, &sigma) in self.team_sigma.iter().enumerate() {
             if sigma > 0.0 {
                 let mut rng = streams.team_strength(i);
-                att[i] = sigma * rng.normal();
-                def[i] = sigma * rng.normal();
+                let z1 = rng.normal();
+                let z2 = rng.normal();
+                // Cholesky of [[1, rho], [rho, 1]]: unit variances, correlation rho.
+                let (a_i, d_i) = (z1, rho * z1 + rho_c * z2);
+                att[i] = sigma * (shared * g + own * a_i);
+                def[i] = sigma * (-shared * g + own * d_i);
             }
         }
         (att, def)
@@ -2038,6 +2100,190 @@ mod tests {
             out.worst_champion_std_error > 0.0,
             "a run containing unobserved events cannot have zero error"
         );
+    }
+
+    /// Draw `iters` tournaments' worth of shifts for a field of `n` equally uncertain teams, and
+    /// return the (att, def) pairs so their moments can be checked.
+    fn shift_samples(shocks: ShockModel, n: usize, iters: u64) -> Vec<(Vec<f64>, Vec<f64>)> {
+        let t = full_tournament();
+        let cfg = SimConfig {
+            iterations: iters,
+            seed: 4,
+            shocks,
+            ..Default::default()
+        };
+        // A sampler with a flat, non-zero per-team uncertainty, so every team's sigma is 1.
+        struct UnitSigma;
+        impl MatchSampler for UnitSigma {
+            fn xg(&self, _h: TeamId, _a: TeamId) -> (f64, f64) {
+                (1.3, 1.3)
+            }
+            fn rating_stderr(&self, _t: TeamId) -> f64 {
+                1.0
+            }
+        }
+        let prep = Prepared::build(
+            &t,
+            &UnitSigma,
+            cfg,
+            &LiveInputs::default(),
+            LiveConfig::default(),
+        );
+        assert!(prep.has_uncertainty, "the fixture must actually have sigma");
+        (0..iters)
+            .map(|i| prep.draw_strength_shifts(&Streams::new(cfg.seed, i)))
+            .map(|(a, d)| (a[..n].to_vec(), d[..n].to_vec()))
+            .collect()
+    }
+
+    fn corr(xs: &[f64], ys: &[f64]) -> f64 {
+        let n = xs.len() as f64;
+        let (mx, my) = (xs.iter().sum::<f64>() / n, ys.iter().sum::<f64>() / n);
+        let cov = xs
+            .iter()
+            .zip(ys)
+            .map(|(x, y)| (x - mx) * (y - my))
+            .sum::<f64>()
+            / n;
+        let sx = (xs.iter().map(|x| (x - mx).powi(2)).sum::<f64>() / n).sqrt();
+        let sy = (ys.iter().map(|y| (y - my).powi(2)).sum::<f64>() / n).sqrt();
+        cov / (sx * sy)
+    }
+
+    fn variance(xs: &[f64]) -> f64 {
+        let n = xs.len() as f64;
+        let m = xs.iter().sum::<f64>() / n;
+        xs.iter().map(|x| (x - m).powi(2)).sum::<f64>() / n
+    }
+
+    #[test]
+    fn a_teams_attack_and_defence_shocks_take_the_configured_correlation() {
+        // With no shared factor, the observed within-team correlation is exactly rho.
+        for rho in [-0.6, 0.0, 0.4, 0.9] {
+            let samples = shift_samples(
+                ShockModel {
+                    attack_defence: rho,
+                    environment: 0.0,
+                },
+                1,
+                8000,
+            );
+            let att: Vec<f64> = samples.iter().map(|(a, _)| a[0]).collect();
+            let def: Vec<f64> = samples.iter().map(|(_, d)| d[0]).collect();
+            let got = corr(&att, &def);
+            assert!((got - rho).abs() < 0.04, "rho={rho}: recovered {got:.3}");
+        }
+    }
+
+    #[test]
+    fn the_shared_factor_correlates_different_teams() {
+        // Two different teams' attack shocks are independent under the historical model and
+        // correlated at w once a scoring environment is configured.
+        for w in [0.0, 0.3, 0.8] {
+            let samples = shift_samples(
+                ShockModel {
+                    attack_defence: 0.0,
+                    environment: w,
+                },
+                2,
+                8000,
+            );
+            let a0: Vec<f64> = samples.iter().map(|(a, _)| a[0]).collect();
+            let a1: Vec<f64> = samples.iter().map(|(a, _)| a[1]).collect();
+            let got = corr(&a0, &a1);
+            assert!(
+                (got - w).abs() < 0.05,
+                "w={w}: cross-team attack correlation {got:.3}"
+            );
+
+            // And it is antisymmetric: one team's attack against another's defence is -w.
+            let d1: Vec<f64> = samples.iter().map(|(_, d)| d[1]).collect();
+            let cross = corr(&a0, &d1);
+            assert!(
+                (cross + w).abs() < 0.05,
+                "w={w}: attack vs other defence {cross:.3}, expected {}",
+                -w
+            );
+        }
+    }
+
+    #[test]
+    fn every_configuration_preserves_each_teams_marginal_variance() {
+        // The invariant that makes the factor model honest. A team's shock spread is its *fitted*
+        // uncertainty; if adding correlation also inflated it, the change would be to the model's
+        // confidence disguised as a change to its correlation structure.
+        for (rho, w) in [
+            (0.0, 0.0),
+            (0.7, 0.0),
+            (0.0, 0.6),
+            (0.5, 0.4),
+            (-0.8, 0.9),
+            (1.0, 1.0),
+        ] {
+            let samples = shift_samples(
+                ShockModel {
+                    attack_defence: rho,
+                    environment: w,
+                },
+                1,
+                8000,
+            );
+            let att: Vec<f64> = samples.iter().map(|(a, _)| a[0]).collect();
+            let def: Vec<f64> = samples.iter().map(|(_, d)| d[0]).collect();
+            for (label, v) in [("attack", variance(&att)), ("defence", variance(&def))] {
+                assert!(
+                    (v - 1.0).abs() < 0.06,
+                    "rho={rho} w={w}: {label} variance {v:.3}, expected 1.0"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_two_parameters_combine_as_the_algebra_says() {
+        // With both knobs on, the within-team correlation is (1 - w) * rho - w: the shared factor
+        // pushes attack and defence apart while rho pulls them together. Worth pinning, because a
+        // reader setting rho = 0.5 and w = 0.5 would otherwise reasonably expect 0.5, not 0.
+        for (rho, w) in [(0.5, 0.5), (0.8, 0.2), (0.0, 0.5)] {
+            let samples = shift_samples(
+                ShockModel {
+                    attack_defence: rho,
+                    environment: w,
+                },
+                1,
+                8000,
+            );
+            let att: Vec<f64> = samples.iter().map(|(a, _)| a[0]).collect();
+            let def: Vec<f64> = samples.iter().map(|(_, d)| d[0]).collect();
+            let expected = (1.0 - w) * rho - w;
+            let got = corr(&att, &def);
+            assert!(
+                (got - expected).abs() < 0.05,
+                "rho={rho} w={w}: got {got:.3}, algebra says {expected:.3}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_shocks_stay_finite_at_the_extremes() {
+        // rho = +-1 makes the Cholesky factor's second term zero, and w = 1 makes the team's own
+        // term vanish. Neither may produce a NaN.
+        for (rho, w) in [(1.0, 0.0), (-1.0, 0.0), (0.0, 1.0), (1.0, 1.0), (-1.0, 1.0)] {
+            let samples = shift_samples(
+                ShockModel {
+                    attack_defence: rho,
+                    environment: w,
+                },
+                2,
+                200,
+            );
+            for (a, d) in &samples {
+                assert!(
+                    a.iter().chain(d).all(|x| x.is_finite()),
+                    "rho={rho} w={w} produced a non-finite shock"
+                );
+            }
+        }
     }
 
     #[test]
