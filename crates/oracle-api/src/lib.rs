@@ -392,6 +392,11 @@ struct SimParams {
     /// Target champion-probability standard error. When present the run decides its own length and
     /// `iters` is ignored, so a caller asks for the precision it needs rather than guessing a count.
     precision: Option<f64>,
+    /// Correlation between a team's attack and defence strength shocks. Absent means 0, the
+    /// independence the simulator has always assumed.
+    shock_attack_defence: Option<f64>,
+    /// Share of shock variance carried by a tournament-wide scoring environment. Absent means 0.
+    shock_environment: Option<f64>,
 }
 
 async fn api_simulate(
@@ -404,11 +409,20 @@ async fn api_simulate(
     let iters = p.iters.unwrap_or(20_000);
     let seed = p.seed.unwrap_or(42);
     let precision = p.precision;
+    let shocks = oracle_engine::ShockModel {
+        attack_defence: p.shock_attack_defence.unwrap_or(0.0),
+        environment: p.shock_environment.unwrap_or(0.0),
+    };
     tokio::task::spawn_blocking(move || {
         let ex = explorer.get().unwrap();
         match precision {
+            // Precision targeting and the shock model are not combined: the precision loop decides
+            // its own length from the champion standard error, and letting a caller change the
+            // correlation structure at the same time would make it unclear which knob produced a
+            // longer run. A caller wanting both can target precision at the default and then
+            // re-run with the correlation.
             Some(target) => ex.simulate_to_precision(target, seed),
-            None => ex.simulate(iters, seed),
+            None => ex.simulate_with_shocks(iters, seed, shocks),
         }
     })
     .await
