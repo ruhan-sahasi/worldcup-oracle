@@ -557,6 +557,86 @@ struct RemainingMatch {
     current: Scoreline,
 }
 
+/// How a tournament's per-team strength shocks are correlated.
+///
+/// # The assumption this makes visible
+///
+/// Each iteration already draws a persistent per-team shock: an attack and a defence offset held
+/// fixed across all of that team's matches, so a side that turns out better than its rating is
+/// better all tournament. What was never stated is that those draws are **independent** - a team's
+/// attack shock uncorrelated with its own defence shock, and every team's shock uncorrelated with
+/// every other's.
+///
+/// Neither is obviously right. A squad better than its rating is usually better at both ends, not
+/// at one. And a tournament has conditions of its own - the ball, the refereeing, the heat - that
+/// push scoring the same way for everybody. Independence was an implicit modelling choice that no
+/// configuration could express and no test could vary.
+///
+/// This type makes it a parameter. [`Default`] is exact independence, so a forecast is unchanged
+/// unless a caller asks for something else.
+///
+/// # Why there are two knobs and not one
+///
+/// The rate for team `a` against `b` is `exp(att[a] - def[b])`, which is what makes a single
+/// "global quality" factor useless: raising every team's attack and defence together cancels in the
+/// subtraction. A shared factor only does anything if it is **antisymmetric** - attack up and
+/// defence down - which is exactly a high-scoring tournament. So the two knobs are doing genuinely
+/// different work rather than being two dials on the same effect.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ShockModel {
+    /// Correlation between a team's own attack and defence shocks, in `[-1, 1]`.
+    ///
+    /// Positive means a side better than its rating tends to be better at both ends. Zero is the
+    /// independence the simulator has always assumed.
+    pub attack_defence: f64,
+    /// Share of each team's shock variance carried by a single tournament-wide scoring environment,
+    /// in `[0, 1]`.
+    ///
+    /// The shared draw enters attack positively and defence negatively, so a high draw is a
+    /// high-scoring tournament for everyone rather than a uniformly stronger field. Zero is the
+    /// per-team independence the simulator has always assumed.
+    pub environment: f64,
+}
+
+impl Default for ShockModel {
+    fn default() -> Self {
+        // Exactly the behaviour before this type existed. Defaulting to anything else would change
+        // every published champion probability without a commit saying so.
+        Self {
+            attack_defence: 0.0,
+            environment: 0.0,
+        }
+    }
+}
+
+impl ShockModel {
+    /// Whether any correlation is configured. `false` means the fast, historical path.
+    pub fn is_independent(&self) -> bool {
+        self.attack_defence == 0.0 && self.environment == 0.0
+    }
+
+    /// The parameters clamped to their valid ranges.
+    ///
+    /// Clamped rather than rejected because these arrive from a CLI flag or a query string, where a
+    /// caller experimenting with values should get the nearest sensible model rather than an error -
+    /// and because a correlation outside `[-1, 1]` has no Cholesky factor, so it would otherwise
+    /// produce `NaN` shocks and a silently empty forecast.
+    pub fn sanitized(&self) -> Self {
+        Self {
+            attack_defence: if self.attack_defence.is_finite() {
+                self.attack_defence.clamp(-1.0, 1.0)
+            } else {
+                0.0
+            },
+            environment: if self.environment.is_finite() {
+                self.environment.clamp(0.0, 1.0)
+            } else {
+                0.0
+            },
+        }
+    }
+}
+
 /// Which *kind* of draw a substream carries, so streams serving different purposes can never
 /// collide even when their entity indices coincide (team 3 and bracket slot 3 are unrelated).
 mod stream_kind {
@@ -1958,6 +2038,67 @@ mod tests {
             out.worst_champion_std_error > 0.0,
             "a run containing unobserved events cannot have zero error"
         );
+    }
+
+    #[test]
+    fn the_default_shock_model_is_exact_independence() {
+        // The whole safety property of this type: an unconfigured forecast is the one the simulator
+        // has always produced.
+        let d = ShockModel::default();
+        assert_eq!(d.attack_defence, 0.0);
+        assert_eq!(d.environment, 0.0);
+        assert!(d.is_independent());
+    }
+
+    #[test]
+    fn either_parameter_alone_makes_the_model_non_independent() {
+        assert!(!ShockModel {
+            attack_defence: 0.3,
+            ..Default::default()
+        }
+        .is_independent());
+        assert!(!ShockModel {
+            environment: 0.2,
+            ..Default::default()
+        }
+        .is_independent());
+    }
+
+    #[test]
+    fn parameters_are_clamped_to_their_valid_ranges() {
+        let s = ShockModel {
+            attack_defence: 1.7,
+            environment: 2.5,
+        }
+        .sanitized();
+        assert_eq!(s.attack_defence, 1.0);
+        assert_eq!(s.environment, 1.0);
+
+        let s = ShockModel {
+            attack_defence: -3.0,
+            environment: -0.5,
+        }
+        .sanitized();
+        assert_eq!(s.attack_defence, -1.0);
+        assert_eq!(
+            s.environment, 0.0,
+            "a negative variance share is meaningless"
+        );
+    }
+
+    #[test]
+    fn a_non_finite_parameter_falls_back_to_independence() {
+        // These arrive from a CLI flag or a query string. A NaN correlation has no Cholesky factor,
+        // so letting one through would produce NaN shocks and a silently empty forecast rather than
+        // an obviously wrong one.
+        for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            let s = ShockModel {
+                attack_defence: bad,
+                environment: bad,
+            }
+            .sanitized();
+            assert!(s.is_independent(), "{bad} should sanitize to independence");
+        }
     }
 
     #[test]
