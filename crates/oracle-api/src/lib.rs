@@ -1680,11 +1680,12 @@ mod tests {
         let (status, _) = get(&state, "/api/derivatives?home=Brazil&away=Atlantis").await;
         assert_eq!(status, StatusCode::NOT_FOUND);
 
-        // Sensitivity: nine signals, each a valid total-variation distance, ranked descending.
+        // Sensitivity: nine signal ablations plus the shock-independence assumption row, each a
+        // valid total-variation distance, ranked descending.
         let (status, body) = get(&state, "/api/sensitivity?iters=2000&seed=1").await;
         assert_eq!(status, StatusCode::OK);
         let signals = json(&body)["signals"].as_array().unwrap().clone();
-        assert_eq!(signals.len(), 9);
+        assert_eq!(signals.len(), 10);
         let shifts: Vec<f64> = signals
             .iter()
             .map(|s| s["title_shift"].as_f64().unwrap())

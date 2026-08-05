@@ -345,6 +345,35 @@ within-tournament state the per-tie sampling tracks. Iterations are independent,
 over `rayon`. Each probability carries a Monte-Carlo standard error `sqrt(p(1-p)/N)`, surfaced by
 `simulate`.
 
+**Correlated strength shocks.** Each iteration resamples every team's strength once and holds it
+fixed across that team's whole tournament, so a side better than its rating is better throughout.
+Those draws were *independent* - a team's attack shock uncorrelated with its own defence shock, and
+every team's uncorrelated with every other's - which was a modelling choice no configuration
+expressed and no test varied. `ShockModel` makes it two parameters, defaulting to exactly that
+independence so no published forecast moves unless asked.
+
+Each team's pair is built from a shared draw and two of its own:
+
+```text
+att[i] = sigma_i * (  sqrt(w) * G + sqrt(1 - w) * a_i )
+def[i] = sigma_i * ( -sqrt(w) * G + sqrt(1 - w) * d_i )
+```
+
+`G` is one standard normal per tournament, `a_i` and `d_i` are the team's own normals correlated at
+`rho` by a 2x2 Cholesky factor, and `w` is the variance share the shared factor carries. The
+`sqrt(w)` / `sqrt(1-w)` split keeps each team's marginal shock variance at `sigma_i^2` however the
+correlation is set, so adding a factor cannot silently widen the model's confidence. `G` enters
+defence *negatively* because the rate is `exp(att[a] - def[b])`: a symmetric factor would cancel in
+the subtraction and do nothing, while antisymmetric it reads as a high-scoring tournament.
+
+Measured on the real field, attack/defence correlation opens the title race slightly (favourite
+10.23% → 9.73% at `rho` 0.9) and the scoring environment *narrows* it (→ 10.71% at `w` 0.9), the
+latter because a higher goal rate means less relative Poisson noise and the stronger side wins more
+reliably. In the sensitivity ablation the assumption ranks third of ten, ahead of five of the
+model's named signals. Neither parameter is calibrated - identifying them needs many tournament
+outcomes and there is one - so they are instruments for asking how much the assumption is worth,
+not fitted values. See [`METHODOLOGY.md`](METHODOLOGY.md).
+
 **Randomness is addressed, not sequenced.** Within an iteration, every draw comes from a substream
 named by what it belongs to - a team's strength perturbation by team index, a group fixture's goals
 by its `MatchId`, a knockout tie by its `(round, slot)` bracket position - rather than from one
