@@ -97,6 +97,69 @@ The goal-model parameters progressed deliberately:
 Hyperparameters (`ξ`, ridge, score model) are chosen by **Bayesian optimization** (a Gaussian-process
 surrogate + Expected Improvement) over a continuous space, not a hand-specified grid.
 
+## An assumption that was never written down
+
+The simulator resamples every team's strength once per iteration and holds it fixed across that
+team's whole tournament, so a side that turns out better than its rating is better all the way
+through. That much was already true, and I had assumed it was the missing piece - reading the code
+before designing is what caught it.
+
+What was missing was any *correlation* between those draws. A team's attack shock was independent
+of its own defence shock, and every team's shock was independent of every other team's. Neither is
+obviously right:
+
+- A squad better than its rating is usually better at both ends, not at one.
+- A tournament has conditions of its own - the ball, the refereeing, the heat - that push scoring
+  the same way for everybody.
+
+Independence is a modelling choice, and it was invisible. No configuration expressed it, no test
+varied it, and no output hinted at it. It is now two parameters, defaulting to exactly the
+independence assumed before, so no published forecast changes unless someone asks.
+
+### Why two parameters and not one
+
+The rate for team `a` against `b` is `exp(att[a] - def[b])`, and that subtraction constrains what a
+shared factor can do. Raising every team's attack and defence together cancels exactly - a "global
+quality" factor would be a no-op. A shared factor only bites if it is **antisymmetric**: attack up,
+defence down, which is what a high-scoring tournament actually means. So the two knobs do different
+work rather than being two dials on the same effect.
+
+They also interact in a way worth stating: the observed within-team attack/defence correlation is
+`(1 - w) * rho - w`, because the shared factor pushes the two apart while `rho` pulls them together.
+Setting both to 0.5 gives zero, not 0.5.
+
+### What the parameters do, measured
+
+| ρ (attack/defence) | w (environment) | favourite | entropy | effective contenders |
+|---:|---:|---:|---:|---:|
+| 0.00 | 0.00 | 10.23% | 3.3230 | 27.74 |
+| 0.90 | 0.00 | 9.73% | 3.3708 | 29.10 |
+| −0.50 | 0.00 | 10.56% | 3.2893 | 26.82 |
+| 0.00 | 0.90 | 10.71% | 3.2560 | 25.95 |
+
+Correlating attack and defence **opens** the race, which is the direction I expected: a team whose
+shocks move together is genuinely strong or genuinely weak rather than mixed, so the spread of real
+strength grows. The magnitude is small - half a percentage point on the favourite at an extreme ρ.
+
+The scoring environment **narrows** it, which I did not expect. Adding a source of variance usually
+makes outcomes less certain; this one does the reverse, because a higher goal rate means less
+*relative* Poisson noise per match and the stronger side wins more reliably. Averaged over high-
+and low-scoring draws the effect does not cancel.
+
+In the sensitivity table the assumption ranks third of ten variants, ahead of five of the model's
+named signals. That is the honest case for the feature: it moves the forecast more than most of the
+effects the README advertises, and until now nobody could see it.
+
+### Why the parameters are not calibrated
+
+Because they cannot be, from this data. Identifying a cross-team or cross-facet shock correlation
+needs many tournament outcomes; there is one 2026 World Cup. The skill gate does not help either -
+it scores *match-level* forecasts, and these parameters only affect tournament simulation, so they
+sit outside what it can measure.
+
+So the defaults stay at independence, the sensitivity row is labelled illustrative, and the honest
+claim is narrow: the assumption is now visible, variable, and quantified, not resolved.
+
 ## Enforcing the claim
 
 Claiming skill and measuring skill are different things, and a project can do the second without the
