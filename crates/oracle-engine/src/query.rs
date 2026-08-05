@@ -31,7 +31,7 @@ use oracle_players::{
 use oracle_ratings::{RatingStore, StateSpaceRatings};
 use oracle_sim::{
     champion_indicators, meeting_probabilities, simulate_with_live, LiveInputs, PairedDifference,
-    PrecisionTarget, SimConfig,
+    PrecisionTarget, ShockModel, SimConfig,
 };
 use serde::Serialize;
 use std::collections::HashMap;
@@ -523,6 +523,16 @@ impl Explorer {
     /// Run the full Monte-Carlo tournament simulation (with all the context and knockout factors a
     /// live forecast uses) and return the ranked champion-odds table with Monte-Carlo error bars.
     pub fn simulate(&self, iters: u64, seed: u64) -> SimForecast {
+        self.simulate_with_shocks(iters, seed, ShockModel::default())
+    }
+
+    /// The same forecast under an explicit [`ShockModel`], for asking how much the simulator's
+    /// independence assumption is worth.
+    ///
+    /// The default is exact independence, so `simulate` and this agree when nothing is configured.
+    /// Exposed because the assumption was previously unreachable: a reader could not tell from any
+    /// output whether team shocks were correlated, let alone vary it.
+    pub fn simulate_with_shocks(&self, iters: u64, seed: u64, shocks: ShockModel) -> SimForecast {
         let iters = iters.clamp(1000, SIM_MAX_ITERS);
         let forecast = simulate_with_live(
             &self.tournament,
@@ -530,6 +540,7 @@ impl Explorer {
             SimConfig {
                 iterations: iters,
                 seed,
+                shocks,
                 ..SimConfig::default()
             },
             &self.sim_inputs(),
@@ -1815,6 +1826,50 @@ mod tests {
         let em = ex.explain(a, b, true, Some((1.2, 7.0, 12.0)));
         assert_eq!(em.members.len(), 4);
         assert_eq!(em.members[3].name, "Market");
+    }
+
+    #[test]
+    fn an_explicit_independent_shock_model_matches_the_default() {
+        let ex = Explorer::new();
+        let a = ex.simulate(2000, 42);
+        let b = ex.simulate_with_shocks(2000, 42, ShockModel::default());
+        assert_eq!(a.teams.len(), b.teams.len());
+        for (x, y) in a.teams.iter().zip(&b.teams) {
+            assert_eq!(x.team, y.team);
+            assert_eq!(x.p_champion, y.p_champion, "{} moved", x.team);
+        }
+    }
+
+    #[test]
+    fn a_correlated_shock_model_changes_the_forecast_and_stays_coherent() {
+        // The point of exposing it: a caller can see the assumption matter. And whatever it does, the
+        // result has to remain a probability distribution.
+        let ex = Explorer::new();
+        let base = ex.simulate(4000, 42);
+        let correlated = ex.simulate_with_shocks(
+            4000,
+            42,
+            ShockModel {
+                attack_defence: 0.9,
+                environment: 0.0,
+            },
+        );
+        let total: f64 = correlated.teams.iter().map(|t| t.p_champion).sum();
+        assert!((total - 1.0).abs() < 1e-9, "champion mass {total}");
+        assert!(
+            correlated
+                .teams
+                .windows(2)
+                .all(|w| w[0].p_champion >= w[1].p_champion),
+            "still ranked"
+        );
+        let moved: f64 = base
+            .teams
+            .iter()
+            .zip(&correlated.teams)
+            .map(|(a, b)| (a.p_champion - b.p_champion).abs())
+            .sum();
+        assert!(moved > 0.0, "correlation should change something");
     }
 
     #[test]
