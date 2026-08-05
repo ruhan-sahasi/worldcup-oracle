@@ -1570,6 +1570,22 @@ mod tests {
         }
     }
 
+    /// Like [`RankSampler`] but with a real per-team strength uncertainty, so the shock model has
+    /// something to correlate.
+    ///
+    /// `RankSampler` leaves `rating_stderr` at the trait default of zero, which switches strength
+    /// resampling off entirely - so a shock test written against it passes vacuously with identical
+    /// forecasts either side. That is exactly how the first version of these tests failed.
+    struct UncertainSampler;
+    impl MatchSampler for UncertainSampler {
+        fn xg(&self, home: TeamId, away: TeamId) -> (f64, f64) {
+            RankSampler.xg(home, away)
+        }
+        fn rating_stderr(&self, _team: TeamId) -> f64 {
+            0.25
+        }
+    }
+
     /// A sampler giving every matchup the same expected goals (perfectly even teams).
     struct EvenSampler;
     impl MatchSampler for EvenSampler {
@@ -2375,6 +2391,100 @@ mod tests {
                 "g={g}: exponent {antisymmetric}, expected {expected}"
             );
         }
+    }
+
+    /// Shannon entropy of a champion distribution, and its effective number of contenders.
+    fn openness(f: &TournamentForecast) -> (f64, f64) {
+        let ent: f64 = -f
+            .teams
+            .iter()
+            .map(|t| t.p_champion)
+            .filter(|&p| p > 0.0)
+            .map(|p| p * p.ln())
+            .sum::<f64>();
+        (ent, ent.exp())
+    }
+
+    #[test]
+    fn attack_defence_correlation_widens_the_field() {
+        // Measured, not assumed. A team whose attack and defence shocks move together is genuinely
+        // strong or genuinely weak rather than mixed, so the spread of real team strength grows and
+        // the title race opens up.
+        //
+        // The direction is the robust finding; the magnitude is small. On the real 2026 field a full
+        // sweep from rho = 0 to rho = 0.9 moves the favourite by about half a percentage point and
+        // the effective number of contenders from ~27.7 to ~29.1. Worth knowing before anyone
+        // reaches for this parameter expecting it to reshape a forecast.
+        let t = full_tournament();
+        let run = |rho: f64| {
+            simulate(
+                &t,
+                &UncertainSampler,
+                SimConfig {
+                    iterations: 20_000,
+                    seed: 31,
+                    shocks: ShockModel {
+                        attack_defence: rho,
+                        environment: 0.0,
+                    },
+                    ..Default::default()
+                },
+            )
+        };
+        let (indep, correlated, anti) = (run(0.0), run(0.9), run(-0.9));
+        let (e0, n0) = openness(&indep);
+        let (e_pos, n_pos) = openness(&correlated);
+        let (e_neg, n_neg) = openness(&anti);
+
+        assert!(
+            e_pos > e0,
+            "positive correlation should open the race: entropy {e_pos:.4} vs {e0:.4}"
+        );
+        assert!(
+            e_neg < e0,
+            "negative correlation should narrow it: entropy {e_neg:.4} vs {e0:.4}"
+        );
+        assert!(
+            n_pos > n0 && n0 > n_neg,
+            "effective contenders should order anti < independent < correlated: \
+             {n_neg:.2} / {n0:.2} / {n_pos:.2}"
+        );
+    }
+
+    #[test]
+    fn the_scoring_environment_narrows_the_field_rather_than_widening_it() {
+        // The result I did not expect, kept as a test because it is the one a reader is most likely
+        // to get backwards.
+        //
+        // Adding a source of variance to a model usually makes its outcomes less certain. This one
+        // does the opposite: a shared factor lifts every team's goal rate together, and a higher rate
+        // means less *relative* Poisson noise per match, so the stronger side wins more reliably.
+        // Averaged over high- and low-scoring draws the effect does not cancel, and the net is a
+        // narrower title race - the favourite gains and the effective field shrinks.
+        let t = full_tournament();
+        let run = |w: f64| {
+            simulate(
+                &t,
+                &UncertainSampler,
+                SimConfig {
+                    iterations: 20_000,
+                    seed: 31,
+                    shocks: ShockModel {
+                        attack_defence: 0.0,
+                        environment: w,
+                    },
+                    ..Default::default()
+                },
+            )
+        };
+        let (base, env) = (run(0.0), run(0.9));
+        let (e0, n0) = openness(&base);
+        let (e1, n1) = openness(&env);
+        assert!(
+            e1 < e0,
+            "a scoring environment should narrow the race, not widen it: {e1:.4} vs {e0:.4}"
+        );
+        assert!(n1 < n0, "effective contenders {n1:.2} vs {n0:.2}");
     }
 
     #[test]

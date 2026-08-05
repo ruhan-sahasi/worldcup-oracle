@@ -16,6 +16,7 @@ rayon.workspace = true
 serde.workspace = true
 
 [dev-dependencies]
+oracle-ingest.workspace = true
 criterion = "0.5"
 chrono.workspace = true
 
