@@ -2265,6 +2265,93 @@ mod tests {
     }
 
     #[test]
+    fn a_symmetric_shared_factor_would_cancel_in_the_rate() {
+        // The reason the environment factor enters defence with a minus sign, demonstrated rather
+        // than asserted in a comment.
+        //
+        // The rate for `a` against `b` is `eg * exp(att[a] - def[b])`. Take two equally uncertain
+        // teams and a shared draw `g`. Symmetric (both signs positive), the exponent is
+        //
+        //     (sqrt(w)g + own_a) - (sqrt(w)g + own_b) = own_a - own_b
+        //
+        // with `g` gone entirely - the factor could take any value and change nothing. Antisymmetric,
+        // it survives as `2*sqrt(w)*g`, which is what a high-scoring tournament means.
+        let (w, sigma) = (0.5f64, 1.0f64);
+        let (shared, own_scale) = (w.sqrt(), (1.0f64 - w).sqrt());
+        let (own_a, own_b) = (0.3f64, -0.2f64);
+
+        for g in [-2.0f64, -0.5, 0.0, 0.5, 2.0] {
+            // What the implementation does: attack + shared, defence - shared.
+            let att_a = sigma * (shared * g + own_scale * own_a);
+            let def_b = sigma * (-shared * g + own_scale * own_b);
+            let antisymmetric = att_a - def_b;
+
+            // The rejected alternative: both signs positive.
+            let sym_att_a = sigma * (shared * g + own_scale * own_a);
+            let sym_def_b = sigma * (shared * g + own_scale * own_b);
+            let symmetric = sym_att_a - sym_def_b;
+
+            // The symmetric version is the same number for every g: the factor has no effect.
+            let no_factor = own_scale * (own_a - own_b);
+            assert!(
+                (symmetric - no_factor).abs() < 1e-12,
+                "a symmetric factor should vanish, but g={g} moved the exponent to {symmetric}"
+            );
+            // The antisymmetric one scales with g, which is the point.
+            let expected = own_scale * (own_a - own_b) + 2.0 * shared * g;
+            assert!(
+                (antisymmetric - expected).abs() < 1e-12,
+                "g={g}: exponent {antisymmetric}, expected {expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_environment_factor_moves_total_goals_not_the_winner() {
+        // The behavioural consequence: a shared scoring environment should change how many goals a
+        // tournament produces without systematically favouring anyone, since it lifts every team's
+        // rate together. Both halves matter - if it moved the champion odds much, it would be acting
+        // as a strength factor and the name would be wrong.
+        let t = full_tournament();
+        let run = |w: f64| {
+            simulate(
+                &t,
+                &RankSampler,
+                SimConfig {
+                    iterations: 6000,
+                    seed: 21,
+                    shocks: ShockModel {
+                        attack_defence: 0.0,
+                        environment: w,
+                    },
+                    ..Default::default()
+                },
+            )
+        };
+        let (base, env) = (run(0.0), run(0.9));
+
+        // The strongest team's title odds should barely move.
+        let champ = |f: &TournamentForecast, id: u32| {
+            f.teams
+                .iter()
+                .find(|x| x.team == TeamId(id))
+                .expect("team")
+                .p_champion
+        };
+        let moved = (champ(&env, 0) - champ(&base, 0)).abs();
+        assert!(
+            moved < 0.03,
+            "a scoring-environment factor should not act as a strength factor: the favourite moved \
+             {moved:.4}"
+        );
+        // And the whole field still sums to one champion.
+        for f in [&base, &env] {
+            let total: f64 = f.teams.iter().map(|x| x.p_champion).sum();
+            assert!((total - 1.0).abs() < 1e-9, "champion mass {total}");
+        }
+    }
+
+    #[test]
     fn the_shocks_stay_finite_at_the_extremes() {
         // rho = +-1 makes the Cholesky factor's second term zero, and w = 1 makes the team's own
         // term vanish. Neither may produce a NaN.
