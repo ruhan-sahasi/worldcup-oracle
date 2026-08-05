@@ -1154,7 +1154,7 @@ fn cmd_sensitivity(iters: u64, seed: u64, top: usize) -> anyhow::Result<()> {
         .map(|t| (t.id, t.name.clone()))
         .collect();
 
-    eprintln!("Fitting the baseline and nine signal variants (this runs several simulations)...");
+    eprintln!("Fitting the baseline and ten variants - nine signals plus one assumption (this runs several simulations)...");
     let model = data::fit_baseline_model(seed);
     let unpooled = data::fit_model_unpooled(seed);
 
@@ -1191,7 +1191,7 @@ fn cmd_sensitivity(iters: u64, seed: u64, top: usize) -> anyhow::Result<()> {
 
     println!(
         "Signal sensitivity - how much each unconventional signal moves the title picture\n\
-         ({iters} iterations per variant, seed {seed}; one signal disabled per row)\n"
+         ({iters} iterations per variant, seed {seed}; one signal disabled per row, except the assumption row noted below)\n"
     );
     println!(
         "{:<30}{:>12}   Biggest movers",
@@ -1215,7 +1215,13 @@ fn cmd_sensitivity(iters: u64, seed: u64, top: usize) -> anyhow::Result<()> {
     println!(
         "\nTitle shift = total variation distance between the full-model and ablated champion\n\
          distributions (0 = identical). Each row turns off exactly one signal and re-simulates;\n\
-         the shared seed couples the runs so the delta reflects the signal, not Monte-Carlo noise."
+         the shared seed couples the runs so the delta reflects the signal, not Monte-Carlo noise.\n\
+         \n\
+         The 'Shock independence' row is the exception: independence is what the model currently\n\
+         assumes, so that variant *relaxes* it (attack/defence correlation 0.5) rather than removing\n\
+         a signal. The 0.5 is illustrative - identifying this correlation would need many tournament\n\
+         outcomes and there is one - so read the row as the size of the assumption, not as a fitted\n\
+         value."
     );
     Ok(())
 }
