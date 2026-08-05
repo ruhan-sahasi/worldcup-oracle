@@ -2265,6 +2265,77 @@ mod tests {
     }
 
     #[test]
+    fn the_default_shock_model_consumes_the_historical_draw_sequence() {
+        // The guard on every published forecast. The independent path exists so that an unconfigured
+        // run draws exactly what it drew before the factor model was added; this pins that by
+        // reconstructing the old sequence by hand - two normals per team from the team's own stream,
+        // and no shared draw at all - and asserting the shifts match to the last bit.
+        //
+        // Comparing against a recorded table would catch a change too, but only after someone
+        // noticed the table was stale. This fails in the same commit that breaks it.
+        let t = full_tournament();
+        let cfg = SimConfig {
+            iterations: 1,
+            seed: 99,
+            ..Default::default()
+        };
+        struct UnitSigma;
+        impl MatchSampler for UnitSigma {
+            fn xg(&self, _h: TeamId, _a: TeamId) -> (f64, f64) {
+                (1.3, 1.3)
+            }
+            fn rating_stderr(&self, _t: TeamId) -> f64 {
+                0.7
+            }
+        }
+        let prep = Prepared::build(
+            &t,
+            &UnitSigma,
+            cfg,
+            &LiveInputs::default(),
+            LiveConfig::default(),
+        );
+        assert!(
+            prep.shocks.is_independent(),
+            "the default must be independent"
+        );
+
+        let streams = Streams::new(cfg.seed, 0);
+        let (att, def) = prep.draw_strength_shifts(&streams);
+
+        for i in 0..prep.n {
+            // The pre-factor-model sequence: sigma * normal() twice, from the team's own stream.
+            let mut rng = streams.team_strength(i);
+            let want_att = prep.team_sigma[i] * rng.normal();
+            let want_def = prep.team_sigma[i] * rng.normal();
+            assert_eq!(att[i], want_att, "team {i} attack shift changed");
+            assert_eq!(def[i], want_def, "team {i} defence shift changed");
+        }
+    }
+
+    #[test]
+    fn a_default_forecast_is_unchanged_by_the_shock_model_existing() {
+        // The same property one level up, where a reader would notice it: two configs that differ
+        // only in spelling out the default must give an identical forecast.
+        let t = full_tournament();
+        let implicit = SimConfig {
+            iterations: 3000,
+            seed: 8,
+            ..Default::default()
+        };
+        let explicit = SimConfig {
+            shocks: ShockModel {
+                attack_defence: 0.0,
+                environment: 0.0,
+            },
+            ..implicit
+        };
+        let a = simulate(&t, &RankSampler, implicit);
+        let b = simulate(&t, &RankSampler, explicit);
+        assert_eq!(a.teams, b.teams);
+    }
+
+    #[test]
     fn a_symmetric_shared_factor_would_cancel_in_the_rate() {
         // The reason the environment factor enters defence with a minus sign, demonstrated rather
         // than asserted in a comment.
