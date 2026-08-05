@@ -1342,6 +1342,7 @@ dependencies = [
  "chrono",
  "criterion",
  "oracle-domain",
+ "oracle-ingest",
  "oracle-model",
  "oracle-numeric",
  "rayon",

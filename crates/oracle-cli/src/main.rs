@@ -65,6 +65,16 @@ enum Command {
         /// ±0.2 pp). Overrides `--iters`, which becomes the ceiling.
         #[arg(long)]
         precision: Option<f64>,
+        /// Correlation between a team's attack and defence strength shocks, in [-1, 1]. The
+        /// simulator has always assumed 0 (independent); positive means a side better than its
+        /// rating tends to be better at both ends, which opens up the title race.
+        #[arg(long, default_value_t = 0.0)]
+        shock_attack_defence: f64,
+        /// Share of each team's shock variance carried by a tournament-wide scoring environment, in
+        /// [0, 1]. Always assumed 0. A shared high draw is a high-scoring tournament for everyone -
+        /// which, counter-intuitively, *narrows* the title race.
+        #[arg(long, default_value_t = 0.0)]
+        shock_environment: f64,
     },
     /// Predict a single matchup (pre-match ensemble + exact-score grid).
     Predict {
@@ -275,7 +285,19 @@ async fn main() -> anyhow::Result<()> {
             top,
             stage,
             precision,
-        } => cmd_simulate(iters, seed, top, stage, precision),
+            shock_attack_defence,
+            shock_environment,
+        } => cmd_simulate(
+            iters,
+            seed,
+            top,
+            stage,
+            precision,
+            oracle_sim::ShockModel {
+                attack_defence: shock_attack_defence,
+                environment: shock_environment,
+            },
+        ),
         Command::Predict {
             home,
             away,
@@ -896,6 +918,7 @@ fn cmd_simulate(
     top: usize,
     stage: Option<String>,
     precision: Option<f64>,
+    shocks: oracle_sim::ShockModel,
 ) -> anyhow::Result<()> {
     if let Some(slug) = stage {
         return cmd_simulate_stage(&slug, iters, seed, top);
@@ -927,9 +950,11 @@ fn cmd_simulate(
         ..Default::default()
     };
     let start = Instant::now();
+    let shocks = shocks.sanitized();
     let config = SimConfig {
         iterations: iters,
         seed,
+        shocks,
         ..SimConfig::default()
     };
     // With a precision target the run decides its own length, up to `--iters` as the ceiling.
@@ -980,6 +1005,13 @@ fn cmd_simulate(
             t.p_semi_final * 100.0,
             t.p_quarter_final * 100.0,
             t.p_round_of_16 * 100.0,
+        );
+    }
+    if !shocks.is_independent() {
+        println!(
+            "\n  shock model: attack/defence correlation {:.2}, scoring-environment share {:.2} \
+             (the default is 0 / 0, independent)",
+            shocks.attack_defence, shocks.environment
         );
     }
     let ran = forecast.iterations;
@@ -1122,7 +1154,7 @@ fn cmd_sensitivity(iters: u64, seed: u64, top: usize) -> anyhow::Result<()> {
         .map(|t| (t.id, t.name.clone()))
         .collect();
 
-    eprintln!("Fitting the baseline and nine signal variants (this runs several simulations)...");
+    eprintln!("Fitting the baseline and ten variants - nine signals plus one assumption (this runs several simulations)...");
     let model = data::fit_baseline_model(seed);
     let unpooled = data::fit_model_unpooled(seed);
 
@@ -1159,7 +1191,7 @@ fn cmd_sensitivity(iters: u64, seed: u64, top: usize) -> anyhow::Result<()> {
 
     println!(
         "Signal sensitivity - how much each unconventional signal moves the title picture\n\
-         ({iters} iterations per variant, seed {seed}; one signal disabled per row)\n"
+         ({iters} iterations per variant, seed {seed}; one signal disabled per row, except the assumption row noted below)\n"
     );
     println!(
         "{:<30}{:>12}   Biggest movers",
@@ -1183,7 +1215,13 @@ fn cmd_sensitivity(iters: u64, seed: u64, top: usize) -> anyhow::Result<()> {
     println!(
         "\nTitle shift = total variation distance between the full-model and ablated champion\n\
          distributions (0 = identical). Each row turns off exactly one signal and re-simulates;\n\
-         the shared seed couples the runs so the delta reflects the signal, not Monte-Carlo noise."
+         the shared seed couples the runs so the delta reflects the signal, not Monte-Carlo noise.\n\
+         \n\
+         The 'Shock independence' row is the exception: independence is what the model currently\n\
+         assumes, so that variant *relaxes* it (attack/defence correlation 0.5) rather than removing\n\
+         a signal. The 0.5 is illustrative - identifying this correlation would need many tournament\n\
+         outcomes and there is one - so read the row as the size of the assumption, not as a fitted\n\
+         value."
     );
     Ok(())
 }

@@ -30,6 +30,7 @@ pub use forecast_journal::{
     TrackRecord, SCHEMA_VERSION,
 };
 pub use oracle_model::ReliabilityReport;
+pub use oracle_sim::ShockModel;
 pub use query::{signal_sensitivity, BacktestReport, Explorer, InPlayView, SignalContribution};
 pub use snapshot::{
     AdaptiveState, BracketRound, BracketTie, BtChampion, Call, ChampionTimeline, Consensus,

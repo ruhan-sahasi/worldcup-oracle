@@ -35,20 +35,38 @@ fn crate_names() -> BTreeSet<String> {
         .collect()
 }
 
-/// Each crate's internal dependencies, read from its manifest. Keys and values are the short names
-/// used in the docs' graph (`oracle-sim` becomes `sim`).
+/// Each crate's internal **runtime** dependencies, read from its manifest. Keys and values are the
+/// short names used in the docs' graph (`oracle-sim` becomes `sim`).
+///
+/// Only `[dependencies]` counts. A dev-dependency exists for tests, benchmarks and examples and is
+/// not part of the architecture the graph describes - `oracle-sim` taking `oracle-ingest` so an
+/// example can load the real 2026 field says nothing about what the simulator needs to run. The
+/// first version of this function read every line beginning with `oracle-`, so the first
+/// dev-dependency added after it shipped made the test demand a phantom edge.
 fn internal_deps() -> BTreeMap<String, BTreeSet<String>> {
     let mut out = BTreeMap::new();
     for name in crate_names() {
         let manifest =
             std::fs::read_to_string(repo_root().join("crates").join(&name).join("Cargo.toml"))
                 .expect("a member manifest is readable");
-        let deps: BTreeSet<String> = manifest
-            .lines()
-            .filter_map(|l| l.trim().strip_prefix("oracle-"))
-            .filter_map(|l| l.split(['.', ' ', '=']).next())
-            .map(str::to_string)
-            .collect();
+        let mut deps = BTreeSet::new();
+        let mut in_runtime_deps = false;
+        for line in manifest.lines() {
+            let line = line.trim();
+            if line.starts_with('[') {
+                // Section headers: only `[dependencies]` contributes.
+                in_runtime_deps = line == "[dependencies]";
+                continue;
+            }
+            if !in_runtime_deps {
+                continue;
+            }
+            if let Some(rest) = line.strip_prefix("oracle-") {
+                if let Some(dep) = rest.split(['.', ' ', '=']).next() {
+                    deps.insert(dep.to_string());
+                }
+            }
+        }
         out.insert(
             name.strip_prefix("oracle-").unwrap_or(&name).to_string(),
             deps,

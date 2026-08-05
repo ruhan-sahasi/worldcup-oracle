@@ -31,7 +31,7 @@ use oracle_players::{
 use oracle_ratings::{RatingStore, StateSpaceRatings};
 use oracle_sim::{
     champion_indicators, meeting_probabilities, simulate_with_live, LiveInputs, PairedDifference,
-    PrecisionTarget, SimConfig,
+    PrecisionTarget, ShockModel, SimConfig,
 };
 use serde::Serialize;
 use std::collections::HashMap;
@@ -523,6 +523,16 @@ impl Explorer {
     /// Run the full Monte-Carlo tournament simulation (with all the context and knockout factors a
     /// live forecast uses) and return the ranked champion-odds table with Monte-Carlo error bars.
     pub fn simulate(&self, iters: u64, seed: u64) -> SimForecast {
+        self.simulate_with_shocks(iters, seed, ShockModel::default())
+    }
+
+    /// The same forecast under an explicit [`ShockModel`], for asking how much the simulator's
+    /// independence assumption is worth.
+    ///
+    /// The default is exact independence, so `simulate` and this agree when nothing is configured.
+    /// Exposed because the assumption was previously unreachable: a reader could not tell from any
+    /// output whether team shocks were correlated, let alone vary it.
+    pub fn simulate_with_shocks(&self, iters: u64, seed: u64, shocks: ShockModel) -> SimForecast {
         let iters = iters.clamp(1000, SIM_MAX_ITERS);
         let forecast = simulate_with_live(
             &self.tournament,
@@ -530,6 +540,7 @@ impl Explorer {
             SimConfig {
                 iterations: iters,
                 seed,
+                shocks,
                 ..SimConfig::default()
             },
             &self.sim_inputs(),
@@ -1096,7 +1107,8 @@ pub fn signal_sensitivity(
                  shoot: &HashMap<TeamId, f64>,
                  ped: &HashMap<TeamId, f64>,
                  sampler: &GoalModel,
-                 fatigue: f64|
+                 fatigue: f64,
+                 shocks: ShockModel|
      -> HashMap<TeamId, f64> {
         let inputs = LiveInputs {
             venue: venue.clone(),
@@ -1108,6 +1120,7 @@ pub fn signal_sensitivity(
             iterations: iters,
             seed,
             ko_fatigue_penalty: fatigue,
+            shocks,
             ..SimConfig::default()
         };
         simulate_with_live(tournament, sampler, config, &inputs, LiveConfig::default())
@@ -1118,10 +1131,34 @@ pub fn signal_sensitivity(
     };
     let masked = |m: SignalMask| data::matchup_adjustments_masked(tournament, m);
 
-    let base = champ(&full_venue, shootout, pedigree, model, fat_on);
+    let independent = ShockModel::default();
+    let base = champ(&full_venue, shootout, pedigree, model, fat_on, independent);
 
     // Each entry disables exactly one signal; everything else is the full model.
+    //
+    // One entry is the exception and is labelled to say so. Every other row answers "what if this
+    // signal were absent"; the shock-independence row answers "what if this *assumption* were
+    // false", because independence is the model's current state rather than a signal it applies.
+    // Same underlying question - how far does this modelling choice move the forecast - but the
+    // variant relaxes a constraint instead of removing an effect, so its sign reads the other way.
     let variants: Vec<(&'static str, HashMap<TeamId, f64>)> = vec![
+        (
+            "Shock independence (assumption)",
+            champ(
+                &full_venue,
+                shootout,
+                pedigree,
+                model,
+                fat_on,
+                ShockModel {
+                    // Illustrative, not fitted. Identifying this correlation needs many tournament
+                    // outcomes and there is one; 0.5 is a middling value chosen to show the
+                    // magnitude of the assumption rather than to claim a value for it.
+                    attack_defence: 0.5,
+                    environment: 0.0,
+                },
+            ),
+        ),
         (
             "Crowd composition",
             champ(
@@ -1133,6 +1170,7 @@ pub fn signal_sensitivity(
                 pedigree,
                 model,
                 fat_on,
+                independent,
             ),
         ),
         (
@@ -1146,6 +1184,7 @@ pub fn signal_sensitivity(
                 pedigree,
                 model,
                 fat_on,
+                independent,
             ),
         ),
         (
@@ -1159,6 +1198,7 @@ pub fn signal_sensitivity(
                 pedigree,
                 model,
                 fat_on,
+                independent,
             ),
         ),
         (
@@ -1172,15 +1212,16 @@ pub fn signal_sensitivity(
                 pedigree,
                 model,
                 fat_on,
+                independent,
             ),
         ),
         (
             "Shootout skill",
-            champ(&full_venue, &no_teams, pedigree, model, fat_on),
+            champ(&full_venue, &no_teams, pedigree, model, fat_on, independent),
         ),
         (
             "Knockout pedigree",
-            champ(&full_venue, shootout, &no_teams, model, fat_on),
+            champ(&full_venue, shootout, &no_teams, model, fat_on, independent),
         ),
         (
             "Overdispersion (NB margins)",
@@ -1190,15 +1231,23 @@ pub fn signal_sensitivity(
                 pedigree,
                 &model_no_dispersion,
                 fat_on,
+                independent,
             ),
         ),
         (
             "Extra-time fatigue",
-            champ(&full_venue, shootout, pedigree, model, 0.0),
+            champ(&full_venue, shootout, pedigree, model, 0.0, independent),
         ),
         (
             "Confederation pooling",
-            champ(&full_venue, shootout, pedigree, unpooled, fat_on),
+            champ(
+                &full_venue,
+                shootout,
+                pedigree,
+                unpooled,
+                fat_on,
+                independent,
+            ),
         ),
     ];
 
@@ -1818,6 +1867,50 @@ mod tests {
     }
 
     #[test]
+    fn an_explicit_independent_shock_model_matches_the_default() {
+        let ex = Explorer::new();
+        let a = ex.simulate(2000, 42);
+        let b = ex.simulate_with_shocks(2000, 42, ShockModel::default());
+        assert_eq!(a.teams.len(), b.teams.len());
+        for (x, y) in a.teams.iter().zip(&b.teams) {
+            assert_eq!(x.team, y.team);
+            assert_eq!(x.p_champion, y.p_champion, "{} moved", x.team);
+        }
+    }
+
+    #[test]
+    fn a_correlated_shock_model_changes_the_forecast_and_stays_coherent() {
+        // The point of exposing it: a caller can see the assumption matter. And whatever it does, the
+        // result has to remain a probability distribution.
+        let ex = Explorer::new();
+        let base = ex.simulate(4000, 42);
+        let correlated = ex.simulate_with_shocks(
+            4000,
+            42,
+            ShockModel {
+                attack_defence: 0.9,
+                environment: 0.0,
+            },
+        );
+        let total: f64 = correlated.teams.iter().map(|t| t.p_champion).sum();
+        assert!((total - 1.0).abs() < 1e-9, "champion mass {total}");
+        assert!(
+            correlated
+                .teams
+                .windows(2)
+                .all(|w| w[0].p_champion >= w[1].p_champion),
+            "still ranked"
+        );
+        let moved: f64 = base
+            .teams
+            .iter()
+            .zip(&correlated.teams)
+            .map(|(a, b)| (a.p_champion - b.p_champion).abs())
+            .sum();
+        assert!(moved > 0.0, "correlation should change something");
+    }
+
+    #[test]
     fn a_precision_targeted_forecast_reports_what_it_achieved() {
         let ex = Explorer::new();
         let f = ex.simulate_to_precision(0.006, 42);
@@ -1977,10 +2070,19 @@ mod tests {
     }
 
     #[test]
-    fn sensitivity_reports_nine_ranked_signals() {
+    fn sensitivity_reports_every_variant_ranked() {
         let ex = Explorer::new();
         let s = ex.sensitivity(2000, 42);
-        assert_eq!(s.signals.len(), 9);
+        // Nine signal ablations plus the shock-independence assumption row. Asserted as a count
+        // rather than a name list because the point is that adding a variant and forgetting to
+        // surface it should fail here.
+        assert_eq!(s.signals.len(), 10);
+        assert!(
+            s.signals
+                .iter()
+                .any(|v| v.signal.contains("Shock independence")),
+            "the independence assumption should be one of the variants"
+        );
         // Ranked by title shift descending, each a valid total-variation distance in [0, 1].
         for w in s.signals.windows(2) {
             assert!(w[0].title_shift >= w[1].title_shift);
